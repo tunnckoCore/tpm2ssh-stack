@@ -23,13 +23,13 @@ const REGISTRY_PATH_ENV: &str = "TPM2SSH_PRFD_REGISTRY";
 const DEFAULT_PORT: u16 = 2222;
 
 const SIGNATURE_NAMESPACE: &str = "tpm2ssh-prfd";
-const SIGNATURE_MESSAGE: &[u8] = b"tpm2ssh-prfd-register-v1";
+const SIGNATURE_MESSAGE: &[u8] = b"register-v1";
 
 #[derive(Clone)]
 struct PrfServer {
     registry: Arc<Mutex<CredentialRegistry>>,
     service_secret: [u8; 32],
-    clients: Arc<Mutex<HashMap<usize, ()>>>,
+    clients: Arc<Mutex<HashMap<usize, Option<String>>>>,
     id: usize,
 }
 
@@ -47,13 +47,19 @@ impl PrfServer {
         }
     }
 
-    fn derive_pre_prf_seed(&self, fingerprint: &str, signature: &[u8]) -> [u8; 32] {
+    fn derive_pre_prf_seed(
+        &self,
+        fingerprint: &str,
+        signature: &[u8],
+        pubkey_bytes: &[u8],
+    ) -> [u8; 32] {
         let hkdf = Hkdf::<Sha256>::new(None, &self.service_secret);
         let mut pre_prf_seed = [0u8; 32];
         let info = format!(
-            "tpm2ssh-prfd:{}:{}",
+            "tpm2ssh-prfd:{}:{}:{}",
             fingerprint,
-            base64::engine::general_purpose::STANDARD.encode(signature)
+            base64::engine::general_purpose::STANDARD.encode(signature),
+            base64::engine::general_purpose::STANDARD.encode(pubkey_bytes)
         );
         hkdf.expand(info.as_bytes(), &mut pre_prf_seed)
             .expect("HKDF expand should not fail with 32-byte output");
@@ -81,15 +87,29 @@ impl server::Handler for PrfServer {
     type Error = anyhow::Error;
 
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        let mut clients = self.clients.lock().await;
+        clients.insert(self.id, None);
         Ok(Auth::Accept)
     }
 
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        _public_key: &russh::keys::ssh_key::PublicKey,
+        public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
+
+        let registry = self.registry.lock().await;
+        if registry.get(&fingerprint).is_some() {
+            let mut clients = self.clients.lock().await;
+            clients.insert(self.id, Some(fingerprint));
+            return Ok(Auth::Accept);
+        }
+
+        Ok(Auth::Reject {
+            proceed_with_methods: None,
+            partial_success: false,
+        })
     }
 
     async fn channel_open_session(
@@ -121,6 +141,164 @@ impl server::Handler for PrfServer {
         }
 
         match parts[0] {
+            "register" => {
+                if parts.len() < 2 {
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"Usage: register <pubkey_b64>\n"),
+                    )?;
+                } else {
+                    let pubkey_b64 = parts[1];
+                    let pubkey_bytes =
+                        match base64::engine::general_purpose::STANDARD.decode(pubkey_b64) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                session.data(
+                                    channel,
+                                    CryptoVec::from_slice(
+                                        format!("Error: invalid base64 pubkey: {}\n", e).as_bytes(),
+                                    ),
+                                )?;
+                                session.eof(channel)?;
+                                session.close(channel)?;
+                                return Ok(());
+                            }
+                        };
+
+                    let pubkey = match russh::keys::ssh_key::PublicKey::from_bytes(&pubkey_bytes) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(
+                                    format!("Error: invalid public key: {}\n", e).as_bytes(),
+                                ),
+                            )?;
+                            session.eof(channel)?;
+                            session.close(channel)?;
+                            return Ok(());
+                        }
+                    };
+
+                    let fingerprint = pubkey.fingerprint(HashAlg::Sha256);
+                    let fingerprint_str = fingerprint.to_string();
+
+                    let mut registry = self.registry.lock().await;
+                    let credential = Credential {
+                        pubkey_b64: pubkey_b64.to_string(),
+                        signature_b64: None,
+                        verified: false,
+                        registered_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    registry.register(fingerprint_str.clone(), credential)?;
+
+                    info!("Registered unverified credential: {}", fingerprint_str);
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(
+                            format!("Registered: {} (unverified)\n", fingerprint_str).as_bytes(),
+                        ),
+                    )?;
+                }
+            }
+            "verify" => {
+                let clients = self.clients.lock().await;
+                let auth_fingerprint = clients.get(&self.id).cloned();
+                drop(clients);
+
+                let Some(Some(fingerprint)) = auth_fingerprint else {
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"Error: pubkey auth required\n"),
+                    )?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                };
+
+                if parts.len() < 2 {
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"Usage: verify <sshsig_pem>\n"),
+                    )?;
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(
+                            b"Signature must be SshSig PEM over message 'tpm2ssh-prfd-register-v1' with namespace 'tpm2ssh-prfd'\n",
+                        ),
+                    )?;
+                } else {
+                    let sshsig_pem = parts[1];
+
+                    let mut registry = self.registry.lock().await;
+                    let Some(cred) = registry.get_mut(&fingerprint) else {
+                        session.data(
+                            channel,
+                            CryptoVec::from_slice(b"Error: credential not found\n"),
+                        )?;
+                        session.eof(channel)?;
+                        session.close(channel)?;
+                        return Ok(());
+                    };
+
+                    let pubkey = match russh::keys::ssh_key::PublicKey::from_bytes(
+                        &base64::engine::general_purpose::STANDARD
+                            .decode(&cred.pubkey_b64)
+                            .unwrap_or_default(),
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(
+                                    format!("Error: stored pubkey invalid: {}\n", e).as_bytes(),
+                                ),
+                            )?;
+                            session.eof(channel)?;
+                            session.close(channel)?;
+                            return Ok(());
+                        }
+                    };
+
+                    let sshsig = match SshSig::from_pem(sshsig_pem.as_bytes()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(
+                                    format!("Error: invalid SshSig PEM: {}\n", e).as_bytes(),
+                                ),
+                            )?;
+                            session.eof(channel)?;
+                            session.close(channel)?;
+                            return Ok(());
+                        }
+                    };
+
+                    if pubkey
+                        .verify(SIGNATURE_NAMESPACE, SIGNATURE_MESSAGE, &sshsig)
+                        .is_err()
+                    {
+                        session.data(
+                            channel,
+                            CryptoVec::from_slice(b"Error: signature verification failed\n"),
+                        )?;
+                        session.eof(channel)?;
+                        session.close(channel)?;
+                        return Ok(());
+                    }
+
+                    cred.signature_b64 = Some(sshsig_pem.to_string());
+                    cred.verified = true;
+                    registry.save()?;
+
+                    info!("Verified credential: {}", fingerprint);
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(format!("Verified: {}\n", fingerprint).as_bytes()),
+                    )?;
+                }
+            }
             "prf" => {
                 if parts.len() < 2 {
                     session.data(channel, CryptoVec::from_slice(b"Usage: prf <pubkey_b64>\n"))?;
@@ -157,22 +335,33 @@ impl server::Handler for PrfServer {
                         }
                     };
 
-                    let fingerprint = pubkey.fingerprint(russh::keys::ssh_key::HashAlg::Sha256);
+                    let fingerprint = pubkey.fingerprint(HashAlg::Sha256);
                     let fingerprint_str = fingerprint.to_string();
 
                     let registry = self.registry.lock().await;
                     if let Some(cred) = registry.get(&fingerprint_str) {
-                        let signature_bytes = base64::engine::general_purpose::STANDARD
-                            .decode(&cred.signature_b64)
-                            .unwrap_or_default();
+                        if !cred.verified {
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"Error: credential not verified\n"),
+                            )?;
+                        } else if let Some(sig_b64) = &cred.signature_b64 {
+                            let pre_prf_seed = self.derive_pre_prf_seed(
+                                &fingerprint_str,
+                                sig_b64.as_bytes(),
+                                &pubkey_bytes,
+                            );
+                            let response =
+                                base64::engine::general_purpose::STANDARD.encode(&pre_prf_seed);
 
-                        let pre_prf_seed =
-                            self.derive_pre_prf_seed(&fingerprint_str, &signature_bytes);
-                        let response =
-                            base64::engine::general_purpose::STANDARD.encode(&pre_prf_seed);
-
-                        info!("Generated pre_prf_seed for {}", fingerprint_str);
-                        session.data(channel, CryptoVec::from_slice(response.as_bytes()))?;
+                            info!("Generated pre_prf_seed for {}", fingerprint_str);
+                            session.data(channel, CryptoVec::from_slice(response.as_bytes()))?;
+                        } else {
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"Error: no signature on record\n"),
+                            )?;
+                        }
                     } else {
                         session.data(
                             channel,
@@ -181,123 +370,15 @@ impl server::Handler for PrfServer {
                     }
                 }
             }
-            "register" => {
-                if parts.len() < 3 {
-                    session.data(
-                        channel,
-                        CryptoVec::from_slice(b"Usage: register <pubkey_b64> <signature_b64>\n"),
-                    )?;
-                    session.data(
-                        channel,
-                        CryptoVec::from_slice(
-                            b"Signature must be over message: 'tpm2ssh-prfd-register-v1'\n",
-                        ),
-                    )?;
-                } else {
-                    let pubkey_b64 = parts[1];
-                    let signature_b64 = parts[2];
-
-                    let pubkey_bytes =
-                        match base64::engine::general_purpose::STANDARD.decode(pubkey_b64) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                session.data(
-                                    channel,
-                                    CryptoVec::from_slice(
-                                        format!("Error: invalid base64 pubkey: {}\n", e).as_bytes(),
-                                    ),
-                                )?;
-                                session.eof(channel)?;
-                                session.close(channel)?;
-                                return Ok(());
-                            }
-                        };
-
-                    let signature_bytes = match base64::engine::general_purpose::STANDARD
-                        .decode(signature_b64)
-                    {
-                        Ok(b) => b,
-                        Err(e) => {
-                            session.data(
-                                channel,
-                                CryptoVec::from_slice(
-                                    format!("Error: invalid base64 signature: {}\n", e).as_bytes(),
-                                ),
-                            )?;
-                            session.eof(channel)?;
-                            session.close(channel)?;
-                            return Ok(());
-                        }
-                    };
-
-                    let pubkey = match russh::keys::ssh_key::PublicKey::from_bytes(&pubkey_bytes) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            session.data(
-                                channel,
-                                CryptoVec::from_slice(
-                                    format!("Error: invalid public key: {}\n", e).as_bytes(),
-                                ),
-                            )?;
-                            session.eof(channel)?;
-                            session.close(channel)?;
-                            return Ok(());
-                        }
-                    };
-
-                    let signature =
-                        match Signature::new(pubkey.algorithm(), signature_bytes.clone()) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                session.data(
-                                    channel,
-                                    CryptoVec::from_slice(
-                                        format!("Error: invalid signature format: {:?}\n", e)
-                                            .as_bytes(),
-                                    ),
-                                )?;
-                                session.eof(channel)?;
-                                session.close(channel)?;
-                                return Ok(());
-                            }
-                        };
-
-                    if !pubkey.verify(REGISTRATION_MESSAGE, &signature) {
-                        session.data(
-                            channel,
-                            CryptoVec::from_slice(b"Error: signature verification failed\n"),
-                        )?;
-                        session.eof(channel)?;
-                        session.close(channel)?;
-                        return Ok(());
-                    }
-
-                    let fingerprint = pubkey.fingerprint(russh::keys::ssh_key::HashAlg::Sha256);
-                    let fingerprint_str = fingerprint.to_string();
-
-                    let mut registry = self.registry.lock().await;
-                    let credential = Credential {
-                        pubkey_b64: pubkey_b64.to_string(),
-                        signature_b64: signature_b64.to_string(),
-                        registered_at: chrono::Utc::now().to_rfc3339(),
-                    };
-                    registry.register(fingerprint_str.clone(), credential)?;
-
-                    info!("Registered credential: {}", fingerprint_str);
-                    session.data(
-                        channel,
-                        CryptoVec::from_slice(
-                            format!("Registered: {}\n", fingerprint_str).as_bytes(),
-                        ),
-                    )?;
-                }
-            }
             "help" => {
                 let help = concat!(
                     "Commands:\n",
-                    "  register <pubkey_b64> <signature_b64>  - Register with signature over 'tpm2ssh-prfd-register-v1'\n",
-                    "  prf <pubkey_b64>                        - Get pre_prf_seed for registered pubkey\n",
-                    "  help                                    - Show this help\n",
+                    "  register <pubkey_b64>     - Register pubkey (auth-none, unverified)\n",
+                    "  verify <sshsig_pem>       - Verify registration (auth-pubkey required)\n",
+                    "  prf <pubkey_b64>          - Get pre_prf_seed for verified pubkey\n",
+                    "  help                      - Show this help\n",
+                    "\n",
+                    "Signature for verify: SshSig PEM over 'tpm2ssh-prfd-register-v1' with namespace 'tpm2ssh-prfd'\n",
                 );
                 session.data(channel, CryptoVec::from_slice(help.as_bytes()))?;
             }

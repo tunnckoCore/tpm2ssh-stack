@@ -6,7 +6,8 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Credential {
     pub pubkey_b64: String,
-    pub signature_b64: String,
+    pub signature_b64: Option<String>,
+    pub verified: bool,
     pub registered_at: String,
 }
 
@@ -40,7 +41,7 @@ impl CredentialRegistry {
         Ok(registry)
     }
 
-    fn save(&self) -> Result<()> {
+    pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }

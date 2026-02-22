@@ -18,7 +18,7 @@ Browser (WebAuthn) → Virtual USB → tpm2ssh-authenticator → SSH to tpm2ssh-
 
 ## Security Model
 
-1. **VPS Side**: `pre_prf_seed = HKDF(service_secret + user_id + user_reg_sig)`
+1. **VPS Side**: `pre_prf_seed = HKDF(service_secret + fingerprint + signature + pubkey)`
 2. **User Side**: `final_prf = HKDF(pre_prf_seed + user_secret)`
 3. Neither side knows the complete secret
 
@@ -33,7 +33,7 @@ cargo build --release
 ### Start the Server
 
 ```bash
-# With random service secret (generates one on startup and outputs it for us on next runs)
+# With random service secret (generates one on startup and outputs it for use on next runs)
 ./target/release/tpm2ssh-prfd
 
 # With custom service secret (32 bytes hex)
@@ -42,7 +42,7 @@ TPM2SSH_PRFD_SECRET=0123456789abcdef... ./target/release/tpm2ssh-prfd
 # Custom port (default: 2222)
 TPM2SSH_PRFD_PORT=22 ./target/release/tpm2ssh-prfd
 
-# Custom registry path (defaults to ~/.config/tmp2ssh-prfd/registry.json)
+# Custom registry path (defaults to ~/.config/tpm2ssh-prfd/registry.json)
 TPM2SSH_PRFD_REGISTRY=/var/lib/tpm2ssh-prfd/registry.json ./target/release/tpm2ssh-prfd
 ```
 
@@ -54,36 +54,66 @@ TPM2SSH_PRFD_REGISTRY=/var/lib/tpm2ssh-prfd/registry.json ./target/release/tpm2s
 | `TPM2SSH_PRFD_PORT` | Server port | `2222` |
 | `TPM2SSH_PRFD_REGISTRY` | Path to credentials registry | `~/.config/tpm2ssh-prfd/registry.json` |
 
-## SSH Commands
+## Protocol
 
-### Registration (Two-Phase)
+### Phase 1: Register (auth-none)
 
-**Phase 1 - Register public key (unverified):**
+Register a pubkey without verification:
+
 ```bash
-# Using auth_none with pubkey as username (base64 encoded)
+# Connect with auth-none, register pubkey
 ssh -o PreferredAuthentications=none -o PubkeyAuthentication=no \
-    <pubkey_base64>@localhost -p 2222
+    user@localhost -p 2222 "register <pubkey_base64>"
 ```
 
-**Phase 2 - Authenticate and verify:**
+Output: `Registered: SHA256:abc123... (unverified)`
+
+### Phase 2: Verify (auth-pubkey)
+
+Verify ownership by signing the static message `tpm2ssh-prfd-register-v1` with namespace `tpm2ssh-prfd`:
+
 ```bash
-# Using publickey authentication
-ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222
+# Create signature using ssh-keygen
+echo -n "tpm2ssh-prfd-register-v1" | ssh-keygen -Y sign -n tpm2ssh-prfd -f ~/.ssh/tpm2/id_user_ed25519_tpm2 - > /tmp/sig.pem
+
+# Connect with pubkey auth and verify
+ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222 "verify $(cat /tmp/sig.pem)"
 ```
 
-### Exec Commands
+Output: `Verified: SHA256:abc123...`
 
-Once authenticated:
+### Phase 3: Get PRF Seed
+
+Once verified, retrieve the pre_prf_seed:
 
 ```bash
-# Get PRF seed
-ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222 "prf"
+ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222 "prf <pubkey_base64>"
+```
 
-# Check status
-ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222 "status"
+Output: `<base64-encoded-32-byte-seed>`
 
-# Register a key via exec
-ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222 "register <pubkey_base64>"
+## Commands
+
+| Command | Auth | Description |
+|---------|------|-------------|
+| `register <pubkey_b64>` | none | Register pubkey (unverified) |
+| `verify <sshsig_pem>` | pubkey | Verify with signature over `tpm2ssh-prfd-register-v1` |
+| `prf <pubkey_b64>` | any | Get pre_prf_seed for verified pubkey |
+| `help` | any | Show usage |
+
+## Signature Format
+
+Signatures must be [SshSig](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.sshsig) PEM format:
+
+```
+-----BEGIN SSH SIGNATURE-----
+...
+-----END SSH SIGNATURE-----
+```
+
+Created with:
+```bash
+echo -n "tpm2ssh-prfd-register-v1" | ssh-keygen -Y sign -n tpm2ssh-prfd -f <keyfile> -
 ```
 
 ## Registry Format
@@ -95,6 +125,7 @@ Credentials are stored in JSON format:
   "credentials": {
     "SHA256:abc123...": {
       "pubkey_b64": "base64-encoded-public-key",
+      "signature_b64": "-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----",
       "verified": true,
       "registered_at": "2026-01-15T10:30:00Z"
     }
@@ -106,5 +137,6 @@ Credentials are stored in JSON format:
 
 The `tpm2ssh-authenticator` daemon connects to this server to:
 1. Register user's TPM-backed public key
-2. Retrieve `pre_prf_seed` for WebAuthn PRF operations
-3. Combine with local `user_secret` to derive `final_prf`
+2. Verify ownership with TPM-signed signature
+3. Retrieve `pre_prf_seed` for WebAuthn PRF operations
+4. Combine with local `user_secret` to derive `final_prf`
