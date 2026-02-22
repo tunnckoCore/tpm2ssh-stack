@@ -85,15 +85,24 @@ Register a pubkey. Use the username `anonymous` to connect without a key:
 
 ```bash
 # Extract raw public key bytes as hex
-PUBKEY_HEX=$(cat ~/.ssh/id_ed25519.pub | awk '{print $2}' | base64 -d | xxd -p -c0)
+PUBKEY_HEX="$(cat ./ed-testkey.pub \
+    | awk '{print $2}' \
+    | base64 -d \
+    | xxd -p -c0
+)"
 
-ssh -o PreferredAuthentications=none -o PubkeyAuthentication=no \
-    anonymous@localhost -p 2222 "register $PUBKEY_HEX"
+# returns USER_ID which is sha256(pubkey_bytes)
+ssh -p 2222 \
+    -o PreferredAuthentications=none \
+    "anonymous@localhost" \
+    "register $PUBKEY_HEX"
+
+# SUCCESS: 5c9440e8dee499a6af99d9de5a67a983cf0cb5294d71e061b2da3d41a9dd3b2c
 ```
 
 **Response:** `SUCCESS: <user_id>`
 
-The `user_id` returned is `sha256(pubkey)` as hex. Client should verify this matches their derivation.
+The `user_id` returned is `sha256(pubkey)` as hex. Client MUST verify this matches their derivation.
 
 ### Phase 2: Verify (auth-pubkey)
 
@@ -101,15 +110,27 @@ Verify ownership by signing the message `register-v1` with namespace `tpm2ssh-pr
 
 ```bash
 # Extract user_id (SHA256 of pubkey as hex)
-USER_ID=$(cat ~/.ssh/id_ed25519.pub | awk '{print $2}' | base64 -d | sha256sum | cut -d' ' -f1)
+USER_ID=$(cat ./ed-testkey.pub \
+    | \awk '{print $2}' \
+    | base64 -d \
+    | sha256sum \
+    | cut -d' ' -f1
+)
 
 # Create signature and hex-encode the PEM
-echo -n "register-v1" | ssh-keygen -Y sign -n tpm2ssh-prfd- -f ~/.ssh/id_ed25519 - > /tmp/sig.pem
-SIG_HEX=$(cat /tmp/sig.pem | xxd -p -c0)
+SIG_HEX="$(echo -n "register-v1" \
+    | ssh-keygen -Y sign -n tpm2ssh-prfd- -f ./ed-testkey - \
+    | xxd -p -c0
+)"
 
 # Connect with pubkey auth using user_id as username
-ssh -i ~/.ssh/id_ed25519 -o PreferredAuthentications=publickey \
-    $USER_ID@localhost -p 2222 "verify $SIG_HEX"
+ssh -p 2222 \
+    -i ./ed-testkey \
+    -o PreferredAuthentications=publickey \
+    "$USER_ID@localhost" \
+    "verify $SIG_HEX"
+
+# SUCCESS: true
 ```
 
 **Response:** `SUCCESS: true`
@@ -120,15 +141,23 @@ ssh -i ~/.ssh/id_ed25519 -o PreferredAuthentications=publickey \
 
 ### Phase 3: Get PRF Seed (auth-pubkey)
 
-Once verified, retrieve the pre_prf_seed. Requires auth-pubkey with username=`user_id` and signature over `<pubkey_hex>-<user_id>`:
+Once verified, retrieve the pre_prf_seed. Requires auth-pubkey with username=`{your_user_id}` and signature over `{pubkey_hex}-{user_id}`:
 
 ```bash
 # Create PRF signature over message: {pubkey_hex}-{user_id}
-echo -n "$PUBKEY_HEX-$USER_ID" | ssh-keygen -Y sign -n tpm2ssh-prfd- -f ~/.ssh/id_ed25519 - > /tmp/prf_sig.pem
-PRF_SIG_HEX=$(cat /tmp/prf_sig.pem | xxd -p -c0)
+PRF_SIG_HEX=$(echo -n "$PUBKEY_HEX-$USER_ID" \
+    | ssh-keygen -Y sign -n tpm2ssh-prfd- -f ./ed-testkey - \
+    | xxd -p -c0
+)
 
-ssh -i ~/.ssh/id_ed25519 -o PreferredAuthentications=publickey \
-    $USER_ID@localhost -p 2222 "prf $PRF_SIG_HEX"
+# Returns `pre_prf_seed` in hex
+ssh -p 2222 \
+    -i ./ed-testkey \
+    -o PreferredAuthentications=publickey \
+    "$USER_ID@localhost" \
+    "prf $PRF_SIG_HEX"
+
+# SUCCESS: 79d5a6e634e56a8a3e8a1b09d49ea114438b9914ed1c0dea1430d03a92e9efc6
 ```
 
 **Response:** `SUCCESS: <pre_prf_seed_hex>`
@@ -143,8 +172,8 @@ ssh -i ~/.ssh/id_ed25519 -o PreferredAuthentications=publickey \
 | Command | Auth | Username | Description |
 |---------|------|----------|-------------|
 | `register <pubkey_hex>` | none | `anonymous` | Register pubkey, returns `user_id` |
-| `verify <sig_hex>` | pubkey | `user_id` | Verify with signature over `register-v1` |
-| `prf <sig_hex>` | pubkey | `user_id` | Get pre_prf_seed (verified only, sig over `{pubkey_hex}-{user_id}`) |
+| `verify <sig_hex>` | pubkey | `your_user_id` | Verify with signature over `register-v1` |
+| `prf <sig_hex>` | pubkey | `your_user_id` | Get pre_prf_seed (verified only, sig over `{pubkey_hex}-{user_id}`) |
 | `help` | any | `any` | Show usage |
 
 ## Signature Format
