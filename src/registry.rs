@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Credential {
-    pub signature_b64: Option<String>,
+    pub pubkey_hex: String,
+    pub signature_sha: Option<String>,
     pub verified: bool,
     pub created_at: String,
     pub verified_at: Option<String>,
@@ -50,22 +51,22 @@ impl CredentialRegistry {
         Ok(())
     }
 
-    pub fn register(&mut self, fingerprint: String, credential: Credential) -> Result<()> {
-        self.credentials.insert(fingerprint, credential);
+    pub fn register(&mut self, user_id: String, credential: Credential) -> Result<()> {
+        self.credentials.insert(user_id, credential);
         self.save()
     }
 
-    pub fn get(&self, fingerprint: &str) -> Option<&Credential> {
-        self.credentials.get(fingerprint)
+    pub fn get(&self, user_id: &str) -> Option<&Credential> {
+        self.credentials.get(user_id)
     }
 
-    pub fn get_mut(&mut self, fingerprint: &str) -> Option<&mut Credential> {
-        self.credentials.get_mut(fingerprint)
+    pub fn get_mut(&mut self, user_id: &str) -> Option<&mut Credential> {
+        self.credentials.get_mut(user_id)
     }
 
     #[allow(dead_code)]
-    pub fn remove(&mut self, fingerprint: &str) -> Option<Credential> {
-        let cred = self.credentials.remove(fingerprint);
+    pub fn remove(&mut self, user_id: &str) -> Option<Credential> {
+        let cred = self.credentials.remove(user_id);
         if cred.is_some() {
             let _ = self.save();
         }

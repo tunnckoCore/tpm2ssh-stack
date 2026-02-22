@@ -1,12 +1,11 @@
 use anyhow::Result;
-use base64::Engine;
 use hkdf::Hkdf;
 use rand::Rng;
+use russh::keys::ssh_key::SshSig;
 use russh::keys::ssh_key::rand_core::OsRng as SshOsRng;
-use russh::keys::ssh_key::{HashAlg, SshSig};
 use russh::server::{Auth, Msg, Server as _, Session};
 use russh::*;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,13 +21,25 @@ const SERVICE_SECRET_ENV: &str = "TPM2SSH_PRFD_SECRET";
 const REGISTRY_PATH_ENV: &str = "TPM2SSH_PRFD_REGISTRY";
 const DEFAULT_PORT: u16 = 2222;
 
-const SIGNATURE_NAMESPACE: &str = "tpm2ssh-prfd";
-const SIGNATURE_MESSAGE: &[u8] = b"register-v1";
+const SIGNATURE_NAMESPACE: &str = "tpm2ssh-prfd-";
+const REGISTER_MESSAGE: &[u8] = b"register-v1";
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    format!("0x{}", hex::encode(result))
+}
+
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(s).ok()
+}
 
 #[derive(Clone)]
 struct ClientAuth {
-    fingerprint: String,
-    pubkey_b64: String,
+    user_id: String,
+    pubkey_hex: String,
 }
 
 #[derive(Clone)]
@@ -53,14 +64,19 @@ impl PrfServer {
         }
     }
 
-    fn derive_pre_prf_seed(&self, fingerprint: &str, signature: &[u8], pubkey_bytes: &[u8]) -> [u8; 32] {
+    fn derive_pre_prf_seed(
+        &self,
+        user_id: &str,
+        signature_sha: &[u8],
+        pubkey_bytes: &[u8],
+    ) -> [u8; 32] {
         let hkdf = Hkdf::<Sha256>::new(None, &self.service_secret);
         let mut pre_prf_seed = [0u8; 32];
         let info = format!(
             "tpm2ssh-prfd:{}:{}:{}",
-            fingerprint,
-            base64::engine::general_purpose::STANDARD.encode(signature),
-            base64::engine::general_purpose::STANDARD.encode(pubkey_bytes)
+            user_id,
+            hex::encode(signature_sha),
+            hex::encode(pubkey_bytes)
         );
         hkdf.expand(info.as_bytes(), &mut pre_prf_seed)
             .expect("HKDF expand should not fail with 32-byte output");
@@ -98,13 +114,20 @@ impl server::Handler for PrfServer {
         _user: &str,
         public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
-        let pubkey_b64 = base64::engine::general_purpose::STANDARD.encode(public_key.to_bytes()?);
+        let pubkey_bytes = public_key.to_bytes()?;
+        let user_id = sha256_hex(&pubkey_bytes);
+        let pubkey_hex = format!("0x{}", hex::encode(&pubkey_bytes));
 
         let registry = self.registry.lock().await;
-        if registry.get(&fingerprint).is_some() {
+        if registry.get(&user_id).is_some() {
             let mut clients = self.clients.lock().await;
-            clients.insert(self.id, Some(ClientAuth { fingerprint, pubkey_b64 }));
+            clients.insert(
+                self.id,
+                Some(ClientAuth {
+                    user_id,
+                    pubkey_hex,
+                }),
+            );
             return Ok(Auth::Accept);
         }
 
@@ -135,7 +158,10 @@ impl server::Handler for PrfServer {
         let parts: Vec<&str> = command.split_whitespace().collect();
 
         if parts.is_empty() {
-            session.data(channel, CryptoVec::from_slice(b"FAILURE 400 empty command\n"))?;
+            session.data(
+                channel,
+                CryptoVec::from_slice(b"FAILURE 400: empty command\n"),
+            )?;
             session.eof(channel)?;
             session.close(channel)?;
             return Ok(());
@@ -144,44 +170,52 @@ impl server::Handler for PrfServer {
         match parts[0] {
             "register" => {
                 if parts.len() < 2 {
-                    session.data(channel, CryptoVec::from_slice(b"FAILURE 400 usage: register <pubkey_b64>\n"))?;
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"FAILURE 400: usage: register <pubkey_hex>\n"),
+                    )?;
                 } else {
-                    let pubkey_b64 = parts[1];
-                    let pubkey_bytes = match base64::engine::general_purpose::STANDARD.decode(pubkey_b64) {
-                        Ok(b) => b,
-                        Err(_) => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 400 invalid base64 pubkey\n"))?;
+                    let pubkey_hex = parts[1];
+                    let pubkey_bytes = match parse_hex(pubkey_hex) {
+                        Some(b) => b,
+                        None => {
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"FAILURE 400: invalid hex pubkey\n"),
+                            )?;
                             session.eof(channel)?;
                             session.close(channel)?;
                             return Ok(());
                         }
                     };
 
-                    let pubkey = match russh::keys::ssh_key::PublicKey::from_bytes(&pubkey_bytes) {
-                        Ok(p) => p,
-                        Err(_) => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 400 invalid public key\n"))?;
-                            session.eof(channel)?;
-                            session.close(channel)?;
-                            return Ok(());
-                        }
-                    };
+                    if russh::keys::ssh_key::PublicKey::from_bytes(&pubkey_bytes).is_err() {
+                        session.data(
+                            channel,
+                            CryptoVec::from_slice(b"FAILURE 400: invalid public key\n"),
+                        )?;
+                        session.eof(channel)?;
+                        session.close(channel)?;
+                        return Ok(());
+                    }
 
-                    let fingerprint = pubkey.fingerprint(HashAlg::Sha256).to_string();
+                    let user_id = sha256_hex(&pubkey_bytes);
+                    let pubkey_hex_stored = format!("0x{}", hex::encode(&pubkey_bytes));
 
                     let mut registry = self.registry.lock().await;
                     let credential = Credential {
-                        signature_b64: None,
+                        pubkey_hex: pubkey_hex_stored,
+                        signature_sha: None,
                         verified: false,
                         created_at: chrono::Utc::now().to_rfc3339(),
                         verified_at: None,
                     };
-                    registry.register(fingerprint.clone(), credential)?;
+                    registry.register(user_id.clone(), credential)?;
 
-                    info!("Registered unverified credential: {}", fingerprint);
+                    info!("Registered unverified credential: {}", user_id);
                     session.data(
                         channel,
-                        CryptoVec::from_slice(format!("SUCCESS {}\n", fingerprint).as_bytes()),
+                        CryptoVec::from_slice(format!("SUCCESS: {}\n", user_id).as_bytes()),
                     )?;
                 }
             }
@@ -190,25 +224,36 @@ impl server::Handler for PrfServer {
                 let auth = clients.get(&self.id).cloned();
                 drop(clients);
 
-                let Some(Some(ClientAuth { fingerprint, pubkey_b64 })) = auth else {
-                    session.data(channel, CryptoVec::from_slice(b"FAILURE 403 pubkey auth required\n"))?;
+                let Some(Some(ClientAuth {
+                    user_id,
+                    pubkey_hex,
+                })) = auth
+                else {
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"FAILURE 403: pubkey auth required\n"),
+                    )?;
                     session.eof(channel)?;
                     session.close(channel)?;
                     return Ok(());
                 };
 
                 if parts.len() < 2 {
-                    session.data(channel, CryptoVec::from_slice(b"FAILURE 400 usage: verify <sshsig_pem>\n"))?;
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"FAILURE 400: usage: verify <sshsig_pem>\n"),
+                    )?;
                 } else {
                     let sshsig_pem = parts[1];
 
-                    let pubkey_bytes = base64::engine::general_purpose::STANDARD
-                        .decode(&pubkey_b64)
-                        .unwrap_or_default();
+                    let pubkey_bytes = parse_hex(&pubkey_hex).unwrap_or_default();
                     let pubkey = match russh::keys::ssh_key::PublicKey::from_bytes(&pubkey_bytes) {
                         Ok(p) => p,
                         Err(_) => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 400 invalid public key\n"))?;
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"FAILURE 400: invalid public key\n"),
+                            )?;
                             session.eof(channel)?;
                             session.close(channel)?;
                             return Ok(());
@@ -218,85 +263,156 @@ impl server::Handler for PrfServer {
                     let sshsig = match SshSig::from_pem(sshsig_pem.as_bytes()) {
                         Ok(s) => s,
                         Err(_) => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 400 invalid sshsig pem\n"))?;
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"FAILURE 400: invalid sshsig pem\n"),
+                            )?;
                             session.eof(channel)?;
                             session.close(channel)?;
                             return Ok(());
                         }
                     };
 
-                    if pubkey.verify(SIGNATURE_NAMESPACE, SIGNATURE_MESSAGE, &sshsig).is_err() {
-                        session.data(channel, CryptoVec::from_slice(b"FAILURE 400 signature verification failed\n"))?;
+                    if pubkey
+                        .verify(SIGNATURE_NAMESPACE, REGISTER_MESSAGE, &sshsig)
+                        .is_err()
+                    {
+                        session.data(
+                            channel,
+                            CryptoVec::from_slice(b"FAILURE 400: signature verification failed\n"),
+                        )?;
                         session.eof(channel)?;
                         session.close(channel)?;
                         return Ok(());
                     }
 
+                    let signature_sha = sha256_hex(sshsig_pem.as_bytes());
+
                     let mut registry = self.registry.lock().await;
-                    let Some(cred) = registry.get_mut(&fingerprint) else {
-                        session.data(channel, CryptoVec::from_slice(b"FAILURE 400 credential not found\n"))?;
+                    let Some(cred) = registry.get_mut(&user_id) else {
+                        session.data(
+                            channel,
+                            CryptoVec::from_slice(b"FAILURE 400: credential not found\n"),
+                        )?;
                         session.eof(channel)?;
                         session.close(channel)?;
                         return Ok(());
                     };
 
-                    cred.signature_b64 = Some(sshsig_pem.to_string());
+                    cred.signature_sha = Some(signature_sha);
                     cred.verified = true;
                     cred.verified_at = Some(chrono::Utc::now().to_rfc3339());
                     registry.save()?;
 
-                    info!("Verified credential: {}", fingerprint);
-                    session.data(channel, CryptoVec::from_slice(b"SUCCESS true\n"))?;
+                    info!("Verified credential: {}", user_id);
+                    session.data(channel, CryptoVec::from_slice(b"SUCCESS: true\n"))?;
                 }
             }
             "prf" => {
-                if parts.len() < 2 {
-                    session.data(channel, CryptoVec::from_slice(b"FAILURE 400 usage: prf <pubkey_b64>\n"))?;
-                } else {
-                    let pubkey_b64 = parts[1];
-                    let pubkey_bytes = match base64::engine::general_purpose::STANDARD.decode(pubkey_b64) {
-                        Ok(b) => b,
-                        Err(_) => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 400 invalid base64 pubkey\n"))?;
-                            session.eof(channel)?;
-                            session.close(channel)?;
-                            return Ok(());
-                        }
-                    };
+                let clients = self.clients.lock().await;
+                let auth = clients.get(&self.id).cloned();
+                drop(clients);
 
+                let Some(Some(ClientAuth {
+                    user_id,
+                    pubkey_hex,
+                })) = auth
+                else {
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"FAILURE 403: pubkey auth required\n"),
+                    )?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                };
+
+                if parts.len() < 2 {
+                    session.data(
+                        channel,
+                        CryptoVec::from_slice(b"FAILURE 400: usage: prf <sshsig_pem>\n"),
+                    )?;
+                } else {
+                    let sshsig_pem = parts[1];
+
+                    let pubkey_bytes = parse_hex(&pubkey_hex).unwrap_or_default();
                     let pubkey = match russh::keys::ssh_key::PublicKey::from_bytes(&pubkey_bytes) {
                         Ok(p) => p,
                         Err(_) => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 400 invalid public key\n"))?;
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"FAILURE 400: invalid public key\n"),
+                            )?;
                             session.eof(channel)?;
                             session.close(channel)?;
                             return Ok(());
                         }
                     };
 
-                    let fingerprint = pubkey.fingerprint(HashAlg::Sha256).to_string();
+                    let sshsig = match SshSig::from_pem(sshsig_pem.as_bytes()) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"FAILURE 400: invalid sshsig pem\n"),
+                            )?;
+                            session.eof(channel)?;
+                            session.close(channel)?;
+                            return Ok(());
+                        }
+                    };
+
+                    let prf_message = format!("{}-{}", pubkey_hex, user_id);
+                    if pubkey
+                        .verify(SIGNATURE_NAMESPACE, prf_message.as_bytes(), &sshsig)
+                        .is_err()
+                    {
+                        session.data(
+                            channel,
+                            CryptoVec::from_slice(b"FAILURE 400: signature verification failed\n"),
+                        )?;
+                        session.eof(channel)?;
+                        session.close(channel)?;
+                        return Ok(());
+                    }
 
                     let registry = self.registry.lock().await;
-                    match registry.get(&fingerprint) {
+                    match registry.get(&user_id) {
                         Some(cred) if !cred.verified => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 403 credential not verified\n"))?;
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"FAILURE 403: credential not verified\n"),
+                            )?;
                         }
                         Some(cred) => {
-                            if let Some(sig_b64) = &cred.signature_b64 {
-                                let pre_prf_seed = self.derive_pre_prf_seed(&fingerprint, sig_b64.as_bytes(), &pubkey_bytes);
-                                let response = base64::engine::general_purpose::STANDARD.encode(&pre_prf_seed);
+                            if let Some(sig_sha) = &cred.signature_sha {
+                                let sig_sha_bytes = parse_hex(sig_sha).unwrap_or_default();
+                                let pre_prf_seed = self.derive_pre_prf_seed(
+                                    &user_id,
+                                    &sig_sha_bytes,
+                                    &pubkey_bytes,
+                                );
+                                let response = format!("0x{}", hex::encode(&pre_prf_seed));
 
-                                info!("Generated pre_prf_seed for {}", fingerprint);
+                                info!("Generated pre_prf_seed for {}", user_id);
                                 session.data(
                                     channel,
-                                    CryptoVec::from_slice(format!("SUCCESS {}\n", response).as_bytes()),
+                                    CryptoVec::from_slice(
+                                        format!("SUCCESS: {}\n", response).as_bytes(),
+                                    ),
                                 )?;
                             } else {
-                                session.data(channel, CryptoVec::from_slice(b"FAILURE 400 no signature on record\n"))?;
+                                session.data(
+                                    channel,
+                                    CryptoVec::from_slice(b"FAILURE 400: no signature on record\n"),
+                                )?;
                             }
                         }
                         None => {
-                            session.data(channel, CryptoVec::from_slice(b"FAILURE 403 credential not registered\n"))?;
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(b"FAILURE 403: credential not registered\n"),
+                            )?;
                         }
                     }
                 }
@@ -304,22 +420,27 @@ impl server::Handler for PrfServer {
             "help" => {
                 let help = concat!(
                     "Commands:\n",
-                    "  register <pubkey_b64>  - Register pubkey (auth-none)\n",
-                    "  verify <sshsig_pem>    - Verify registration (auth-pubkey required)\n",
-                    "  prf <pubkey_b64>       - Get pre_prf_seed (verified only)\n",
-                    "  help                   - Show this help\n",
+                    "  register <pubkey_hex>        - Register pubkey (auth-none)\n",
+                    "  verify <sshsig_pem>          - Verify registration (auth-pubkey required)\n",
+                    "  prf <sshsig_pem>             - Get pre_prf_seed (auth-pubkey required, verified only)\n",
+                    "  help                         - Show this help\n",
                     "\n",
-                    "Responses: SUCCESS <result> | FAILURE <code> <message>\n",
+                    "Responses: SUCCESS: <result> | FAILURE <code>: <message>\n",
                     "Codes: 400=bad request, 403=forbidden\n",
                     "\n",
-                    "Signature: SshSig PEM over 'register-v1' with namespace 'tpm2ssh-prfd'\n",
+                    "All hex values are 0x-prefixed.\n",
+                    "Namespace: tpm2ssh-prfd-\n",
+                    "Signature for 'verify': SshSig over 'register-v1'\n",
+                    "Signature for 'prf': SshSig over '{pubkey_hex}-{user_id}'\n",
                 );
                 session.data(channel, CryptoVec::from_slice(help.as_bytes()))?;
             }
             _ => {
                 session.data(
                     channel,
-                    CryptoVec::from_slice(format!("FAILURE 400 unknown command: {}\n", parts[0]).as_bytes()),
+                    CryptoVec::from_slice(
+                        format!("FAILURE 400: unknown command: {}\n", parts[0]).as_bytes(),
+                    ),
                 )?;
             }
         }
@@ -356,7 +477,7 @@ async fn main() -> Result<()> {
             info!("No service secret provided, generating random one");
             let mut secret = [0u8; 32];
             rand::rngs::OsRng.fill(&mut secret);
-            info!("Generated service secret: {}", hex::encode(&secret));
+            info!("Generated service secret: 0x{}", hex::encode(&secret));
             secret
         });
 
@@ -379,7 +500,8 @@ async fn main() -> Result<()> {
         auth_rejection_time: std::time::Duration::from_secs(1),
         auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
         keys: vec![
-            russh::keys::PrivateKey::random(&mut SshOsRng, russh::keys::Algorithm::Ed25519).unwrap(),
+            russh::keys::PrivateKey::random(&mut SshOsRng, russh::keys::Algorithm::Ed25519)
+                .unwrap(),
         ],
         ..Default::default()
     };
