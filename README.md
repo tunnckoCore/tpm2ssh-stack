@@ -54,6 +54,19 @@ TPM2SSH_PRFD_REGISTRY=/var/lib/tpm2ssh-prfd/registry.json ./target/release/tpm2s
 | `TPM2SSH_PRFD_PORT` | Server port | `2222` |
 | `TPM2SSH_PRFD_REGISTRY` | Path to credentials registry | `~/.config/tpm2ssh-prfd/registry.json` |
 
+## Response Format
+
+All commands return standardized responses:
+
+```
+SUCCESS <result>
+FAILURE <code> <message>
+```
+
+**Error codes:**
+- `400` - Bad request (invalid input, verification failed)
+- `403` - Forbidden (auth required, credential not verified)
+
 ## Protocol
 
 ### Phase 1: Register (auth-none)
@@ -61,44 +74,53 @@ TPM2SSH_PRFD_REGISTRY=/var/lib/tpm2ssh-prfd/registry.json ./target/release/tpm2s
 Register a pubkey without verification:
 
 ```bash
-# Connect with auth-none, register pubkey
 ssh -o PreferredAuthentications=none -o PubkeyAuthentication=no \
     user@localhost -p 2222 "register <pubkey_base64>"
 ```
 
-Output: `Registered: SHA256:abc123... (unverified)`
+**Response:** `SUCCESS SHA256:abc123...`
+
+The fingerprint returned should match what the client/requester can derive from their pubkey.
 
 ### Phase 2: Verify (auth-pubkey)
 
-Verify ownership by signing the static message `tpm2ssh-prfd-register-v1` with namespace `tpm2ssh-prfd`:
+Verify ownership by signing the message `register-v1` with namespace `tpm2ssh-prfd`:
 
 ```bash
 # Create signature using ssh-keygen
-echo -n "tpm2ssh-prfd-register-v1" | ssh-keygen -Y sign -n tpm2ssh-prfd -f ~/.ssh/tpm2/id_user_ed25519_tpm2 - > /tmp/sig.pem
+echo -n "register-v1" | ssh-keygen -Y sign -n tpm2ssh-prfd -f ~/.ssh/tpm2/id_user_ed25519_tpm2 - > /tmp/sig.pem
 
 # Connect with pubkey auth and verify
 ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222 "verify $(cat /tmp/sig.pem)"
 ```
 
-Output: `Verified: SHA256:abc123...`
+**Response:** `SUCCESS true`
+
+**Errors:**
+- `FAILURE 403 pubkey auth required` - auth-none connection
+- `FAILURE 400 signature verification failed` - invalid signature
 
 ### Phase 3: Get PRF Seed
 
 Once verified, retrieve the pre_prf_seed:
 
 ```bash
-ssh -i ~/.ssh/tpm2/id_user_ed25519_tpm2 user@localhost -p 2222 "prf <pubkey_base64>"
+ssh user@localhost -p 2222 "prf <pubkey_base64>"
 ```
 
-Output: `<base64-encoded-32-byte-seed>`
+**Response:** `SUCCESS <base64-encoded-32-byte-seed>`
+
+**Errors:**
+- `FAILURE 403 credential not registered` - unknown pubkey
+- `FAILURE 403 credential not verified` - not yet verified
 
 ## Commands
 
 | Command | Auth | Description |
 |---------|------|-------------|
-| `register <pubkey_b64>` | none | Register pubkey (unverified) |
-| `verify <sshsig_pem>` | pubkey | Verify with signature over `tpm2ssh-prfd-register-v1` |
-| `prf <pubkey_b64>` | any | Get pre_prf_seed for verified pubkey |
+| `register <pubkey_b64>` | none | Register pubkey, returns fingerprint |
+| `verify <sshsig_pem>` | pubkey | Verify with signature, returns `true` |
+| `prf <pubkey_b64>` | any | Get pre_prf_seed (verified only) |
 | `help` | any | Show usage |
 
 ## Signature Format
@@ -113,21 +135,21 @@ Signatures must be [SshSig](https://github.com/openssh/openssh-portable/blob/mas
 
 Created with:
 ```bash
-echo -n "tpm2ssh-prfd-register-v1" | ssh-keygen -Y sign -n tpm2ssh-prfd -f <keyfile> -
+echo -n "register-v1" | ssh-keygen -Y sign -n tpm2ssh-prfd -f <keyfile> -
 ```
 
 ## Registry Format
 
-Credentials are stored in JSON format:
+Credentials are stored in JSON format, keyed by fingerprint:
 
 ```json
 {
   "credentials": {
     "SHA256:abc123...": {
-      "pubkey_b64": "base64-encoded-public-key",
       "signature_b64": "-----BEGIN SSH SIGNATURE-----\n...\n-----END SSH SIGNATURE-----",
       "verified": true,
-      "registered_at": "2026-01-15T10:30:00Z"
+      "created_at": "2026-01-15T10:30:00Z",
+      "verified_at": "2026-01-15T10:35:00Z"
     }
   }
 }

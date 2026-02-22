@@ -5,10 +5,10 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Credential {
-    pub pubkey_b64: String,
     pub signature_b64: Option<String>,
     pub verified: bool,
-    pub registered_at: String,
+    pub created_at: String,
+    pub verified_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
