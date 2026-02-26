@@ -79,30 +79,24 @@ FAILURE <code>: <message>
 
 ## Protocol
 
-### Phase 1: Register (anonymous)
+### Phase 1: Register (auth-pubkey)
 
-Register a pubkey. Use the username `anonymous` to connect without a key:
+Register your pubkey. Connect with your `user_id` as username and use public key authentication:
 
 ```bash
-# Extract raw public key bytes as hex
-PUBKEY_HEX="$(cat ./ed-testkey.pub \
-    | awk '{print $2}' \
-    | base64 -d \
-    | xxd -p -c0
-)"
+# Extract user_id (SHA256 of pubkey as hex)
+USER_ID=$(cat ~/.ssh/id_ed25519.pub | awk '{print $2}' | base64 -d | sha256sum | cut -d' ' -f1)
 
-# returns USER_ID which is sha256(pubkey_bytes)
 ssh -p 2222 \
-    -o PreferredAuthentications=none \
-    "anonymous@localhost" \
-    "register $PUBKEY_HEX"
+    -i ~/.ssh/id_ed25519 \
+    -o PreferredAuthentications=publickey \
+    "$USER_ID@localhost" \
+    "register"
 
 # SUCCESS: 5c9440e8dee499a6af99d9de5a67a983cf0cb5294d71e061b2da3d41a9dd3b2c
 ```
 
-**Response:** `SUCCESS: <user_id>`
-
-The `user_id` returned is `sha256(pubkey)` as hex. Client MUST verify this matches their derivation.
+**Response:** `SUCCESS: <user_id>` - registration is successful but you are unverified.
 
 ### Phase 2: Verify (auth-pubkey)
 
@@ -171,7 +165,7 @@ ssh -p 2222 \
 
 | Command | Auth | Username | Description |
 |---------|------|----------|-------------|
-| `register <pubkey_hex>` | none | `anonymous` | Register pubkey, returns `user_id` |
+| `register` | pubkey | `your_user_id` | Register your pubkey, returns `user_id` |
 | `verify <sig_hex>` | pubkey | `your_user_id` | Verify with signature over `register-v1` |
 | `prf <sig_hex>` | pubkey | `your_user_id` | Get pre_prf_seed (verified only, sig over `{pubkey_hex}-{user_id}`) |
 | `help` | any | `any` | Show usage |

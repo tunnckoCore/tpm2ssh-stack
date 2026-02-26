@@ -100,19 +100,13 @@ impl server::Server for PrfServer {
 impl server::Handler for PrfServer {
     type Error = anyhow::Error;
 
-    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        if user == "anonymous" {
-            let mut clients = self.clients.lock().await;
-            clients.insert(self.id, None);
-            Ok(Auth::Accept)
-        } else {
-            let mut methods = MethodSet::empty();
-            methods.push(MethodKind::PublicKey);
-            Ok(Auth::Reject {
-                proceed_with_methods: Some(methods),
-                partial_success: false,
-            })
-        }
+    async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
+        let mut methods = MethodSet::empty();
+        methods.push(MethodKind::PublicKey);
+        Ok(Auth::Reject {
+            proceed_with_methods: Some(methods),
+            partial_success: false,
+        })
     }
 
     async fn auth_publickey(
@@ -135,23 +129,15 @@ impl server::Handler for PrfServer {
             });
         }
 
-        let registry = self.registry.lock().await;
-        if registry.get(&user_id).is_some() {
-            let mut clients = self.clients.lock().await;
-            clients.insert(
-                self.id,
-                Some(ClientAuth {
-                    user_id,
-                    pubkey_hex,
-                }),
-            );
-            return Ok(Auth::Accept);
-        }
-
-        Ok(Auth::Reject {
-            proceed_with_methods: None,
-            partial_success: false,
-        })
+        let mut clients = self.clients.lock().await;
+        clients.insert(
+            self.id,
+            Some(ClientAuth {
+                user_id,
+                pubkey_hex,
+            }),
+        );
+        Ok(Auth::Accept)
     }
 
     async fn channel_open_session(
@@ -184,58 +170,44 @@ impl server::Handler for PrfServer {
         } else {
             match parts[0] {
                 "register" => {
-                    if parts.len() < 2 {
-                        session.data(
-                            channel,
-                            CryptoVec::from_slice(b"FAILURE 400: usage: register <pubkey_hex>\n"),
-                        )?;
-                        exit_status = 1;
-                    } else {
-                        let pubkey_hex = parts[1];
-                        if let Some(pubkey_bytes) = parse_hex(pubkey_hex) {
-                            if russh::keys::ssh_key::PublicKey::from_bytes(&pubkey_bytes).is_ok() {
-                                let user_id = sha256_hex(&pubkey_bytes);
-                                let pubkey_hex_stored = hex::encode(&pubkey_bytes);
+                    let clients = self.clients.lock().await;
+                    let auth = clients.get(&self.id).cloned();
+                    drop(clients);
 
-                                let mut registry = self.registry.lock().await;
-                                if registry.get(&user_id).is_some() {
-                                    session.data(
-                                        channel,
-                                        CryptoVec::from_slice(b"FAILURE 400: already registered\n"),
-                                    )?;
-                                    exit_status = 1;
-                                } else {
-                                    let credential = Credential {
-                                        pubkey_hex: pubkey_hex_stored,
-                                        signature_sha: None,
-                                        verified: false,
-                                        created_at: chrono::Utc::now().to_rfc3339(),
-                                        verified_at: None,
-                                    };
-                                    registry.register(user_id.clone(), credential)?;
-
-                                    info!("Registered unverified credential: {}", user_id);
-                                    session.data(
-                                        channel,
-                                        CryptoVec::from_slice(
-                                            format!("SUCCESS: {}\n", user_id).as_bytes(),
-                                        ),
-                                    )?;
-                                }
-                            } else {
-                                session.data(
-                                    channel,
-                                    CryptoVec::from_slice(b"FAILURE 400: invalid public key\n"),
-                                )?;
-                                exit_status = 1;
-                            }
-                        } else {
+                    if let Some(Some(ClientAuth {
+                        user_id,
+                        pubkey_hex,
+                    })) = auth
+                    {
+                        let mut registry = self.registry.lock().await;
+                        if registry.get(&user_id).is_some() {
                             session.data(
                                 channel,
-                                CryptoVec::from_slice(b"FAILURE 400: invalid hex pubkey\n"),
+                                CryptoVec::from_slice(b"FAILURE 400: already registered\n"),
                             )?;
                             exit_status = 1;
+                        } else {
+                            let credential = Credential {
+                                pubkey_hex,
+                                signature_sha: None,
+                                verified: false,
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                                verified_at: None,
+                            };
+                            registry.register(user_id.clone(), credential)?;
+
+                            info!("Registered unverified credential: {}", user_id);
+                            session.data(
+                                channel,
+                                CryptoVec::from_slice(format!("SUCCESS: {}\n", user_id).as_bytes()),
+                            )?;
                         }
+                    } else {
+                        session.data(
+                            channel,
+                            CryptoVec::from_slice(b"FAILURE 403: pubkey auth required\n"),
+                        )?;
+                        exit_status = 1;
                     }
                 }
                 "verify" => {
@@ -459,7 +431,7 @@ impl server::Handler for PrfServer {
                 "help" => {
                     let help = concat!(
                         "SUCCESS: Commands:\n",
-                        "  register <pubkey_hex>        - Register pubkey (auth-none, username 'anonymous')\n",
+                        "  register                     - Register your pubkey (auth-pubkey required)\n",
                         "  verify <sig_hex>             - Verify registration (auth-pubkey required)\n",
                         "  prf <sig_hex>                - Get pre_prf_seed (auth-pubkey required, verified only)\n",
                         "  help                         - Show this help\n",
@@ -467,6 +439,7 @@ impl server::Handler for PrfServer {
                         "Responses: SUCCESS: <result> | FAILURE <code>: <message>\n",
                         "Codes: 400=bad request, 403=forbidden\n",
                         "\n",
+                        "Username must be your user_id (sha256 of pubkey as hex).\n",
                         "All hex values are raw hex strings (no 0x).\n",
                         "sig_hex is the hex-encoded SSH Signature PEM.\n",
                         "Namespace: tpm2ssh-prfd-\n",
