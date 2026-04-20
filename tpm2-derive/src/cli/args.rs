@@ -126,6 +126,8 @@ pub struct ExportArgs {
     pub kind: ExportKindArg,
     #[arg(long)]
     pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

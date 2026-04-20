@@ -90,6 +90,28 @@ pub struct ExportRequest {
     pub profile: String,
     pub kind: ExportKind,
     pub output: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExportFormat {
+    SpkiDer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ExportArtifact {
+    pub format: ExportFormat,
+    pub path: PathBuf,
+    pub bytes_written: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ExportResult {
+    pub profile: String,
+    pub mode: Mode,
+    pub kind: ExportKind,
+    pub artifact: ExportArtifact,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

@@ -108,13 +108,7 @@ pub fn run(cli: Cli) -> Result<String> {
             "decrypt",
             decrypt_summary(&args),
         ),
-        Command::Export(args) => run_placeholder(
-            cli.json,
-            CommandPath::from_segments(["export"]),
-            args.profile.clone(),
-            "export",
-            export_summary(&args),
-        ),
+        Command::Export(args) => run_export(cli.json, args),
         Command::Ssh(SshCommand::Agent(SshAgentCommand::Add(args))) => run_placeholder(
             cli.json,
             CommandPath::from_segments(["ssh-agent", "add"]),
@@ -189,6 +183,29 @@ fn run_derive(json: bool, args: DeriveArgs) -> Result<String> {
                 ),
             }
         }
+        Err(error) => failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn run_export(json: bool, args: ExportArgs) -> Result<String> {
+    let command = export_command_path(args.kind.into());
+    let request = ExportRequest {
+        profile: args.profile,
+        kind: args.kind.into(),
+        output: args.output,
+        state_dir: args.state_dir,
+    };
+
+    match ops::export(&request) {
+        Ok(result) => success(json, command, result),
         Err(error) => failure(
             json,
             command,
@@ -283,6 +300,15 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
             diagnostics,
             "sign is not wired for seed-mode profiles yet",
         ),
+    }
+}
+
+fn export_command_path(kind: ExportKind) -> CommandPath {
+    match kind {
+        ExportKind::PublicKey => CommandPath::from_segments(["export", "public-key"]),
+        ExportKind::RecoveryBundle => {
+            CommandPath::from_segments(["export", "recovery-bundle"])
+        }
     }
 }
 
@@ -522,6 +548,7 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
             profile,
             kind: ExportKind::PublicKey,
             output: None,
+            state_dir: None,
         })
         .unwrap_or_default(),
         "ssh-agent add" => serde_json::to_value(SshAgentAddRequest {
@@ -540,12 +567,6 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
     }
 }
 
-fn derive_summary(args: &DeriveArgs) -> String {
-    format!(
-        "profile={} purpose={} namespace={} length={} state=planned",
-        args.profile, args.purpose, args.namespace, args.length
-    )
-}
 
 fn verify_summary(args: &VerifyArgs) -> String {
     format!(
@@ -560,18 +581,6 @@ fn encrypt_summary(args: &EncryptArgs) -> String {
 
 fn decrypt_summary(args: &DecryptArgs) -> String {
     format!("profile={} input={} state=planned", args.profile, args.input)
-}
-
-fn export_summary(args: &ExportArgs) -> String {
-    format!(
-        "profile={} kind={:?} output={} state=planned",
-        args.profile,
-        args.kind,
-        args.output
-            .as_ref()
-            .map(|path| path.as_path().display().to_string())
-            .unwrap_or_else(|| "stdout".to_string())
-    )
 }
 
 fn ssh_agent_add_summary(args: &SshAgentAddArgs) -> String {
