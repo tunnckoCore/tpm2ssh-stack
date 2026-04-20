@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     version,
     about = "TPM-backed key operations with native, PRF, and seed modes",
     long_about = "TPM-backed key operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'setup' to provision persistent state, 'import' to reseal an exported seed bundle into fresh TPM-backed state, and the operational subcommands ('derive', 'sign', 'verify', 'export', 'ssh agent add') to use an existing profile.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh agent add' path currently supports seed Ed25519 and seed P-256 profiles, while higher-level wrappers such as 'tpm2ssh' can provide broader user-facing SSH/Git flows.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive setup --profile prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive sign --profile prod-signer --input message.bin\n  tpm2-derive derive --profile app-prf --purpose session --namespace com.example\n  tpm2-derive ssh agent add --profile seed-user\n  tpm2-derive export --profile prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --profile seed-user --kind recovery-bundle --output backup.json --reason 'hardware migration' --confirm --confirm-phrase 'I understand this export weakens TPM-only protection'\n  tpm2-derive import --bundle backup.json --profile restored-user --confirm\n\nSSH quick guide:\n  - Want a direct tpm2-derive ssh-agent flow today? Use a seed/ed25519 or seed/p256 profile.\n  - Want a TPM-native signer? Use p256 + native for sign/verify.\n  - Want a broader OpenSSH user-key flow? The tpm2ssh wrapper is still the higher-level path."
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive setup --profile prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive sign --profile prod-signer --input message.bin\n  tpm2-derive derive --profile app-prf --purpose session --namespace com.example\n  tpm2-derive ssh agent add --profile seed-user\n  tpm2-derive export --profile prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --profile seed-user --kind recovery-bundle --output backup.json --reason 'hardware migration' --confirm --confirm-phrase 'I understand this export weakens TPM-only protection'\n  tpm2-derive import --bundle backup.json --profile restored-user --confirm\n\nSSH quick guide:\n  - Want a direct tpm2-derive ssh-agent flow today? Use a seed/ed25519 or seed/p256 profile.\n  - Want a TPM-native signer? Use p256 + native for sign/verify."
 )]
 pub struct Cli {
     #[arg(
@@ -131,12 +131,12 @@ pub struct DeriveArgs {
         help = "Override the state root directory instead of the default local state path"
     )]
     pub state_dir: Option<PathBuf>,
+    #[arg(long, help = "After deriving, also add the material to ssh-agent")]
+    pub ssh_agent_add: bool,
     #[arg(
         long,
-        help = "After deriving, also add the material to ssh-agent"
+        help = "Optional ssh-agent comment for the added key (used with --ssh-agent-add)"
     )]
-    pub ssh_agent_add: bool,
-    #[arg(long, help = "Optional ssh-agent comment for the added key (used with --ssh-agent-add)")]
     pub ssh_agent_comment: Option<String>,
     #[arg(
         long,
@@ -226,7 +226,11 @@ pub struct DecryptArgs {
 #[derive(Debug, Args)]
 #[command(about = "Derive a keypair (secret key + public key) from a persisted profile")]
 pub struct KeygenArgs {
-    #[arg(long = "from-profile", visible_alias = "profile", help = "Profile name to derive the keypair from")]
+    #[arg(
+        long = "from-profile",
+        visible_alias = "profile",
+        help = "Profile name to derive the keypair from"
+    )]
     pub from_profile: String,
     #[arg(
         long,

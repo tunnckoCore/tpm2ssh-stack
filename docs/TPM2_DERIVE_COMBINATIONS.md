@@ -127,7 +127,11 @@ tpm2-derive derive \
 ### SSH agent
 
 ```bash
-tpm2-derive ssh agent add --profile seed-user
+tpm2-derive ssh-agent add --profile seed-user
+
+# or with derive command
+
+tpm2-derive derive --ssh-agent-add --profile seed-user
 ```
 
 Supported today for `ed25519` and `p256` seed profiles.
@@ -140,9 +144,8 @@ tpm2-derive export \
   --kind recovery-bundle \
   --output seed-user.recovery.json \
   --reason "hardware migration" \
-  --confirm-recovery-export \
-  --confirm-sealed-at-rest-boundary \
-  --confirmation-phrase "I understand this export weakens TPM-only protection"
+  --confirm \
+  --confirm-phrase "I understand this export weakens TPM-only protection"
 ```
 
 ### Recovery import
