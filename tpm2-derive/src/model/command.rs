@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Algorithm, ModePreference, Profile, UseCase};
+use crate::model::{Algorithm, Mode, ModePreference, Profile, UseCase};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct InspectRequest {
@@ -42,6 +42,15 @@ pub struct DeriveRequest {
     pub profile: String,
     pub context: DerivationContext,
     pub length: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DeriveResult {
+    pub profile: String,
+    pub mode: Mode,
+    pub length: u16,
+    pub encoding: String,
+    pub material: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

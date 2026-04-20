@@ -3,15 +3,14 @@ mod render;
 
 use std::collections::BTreeMap;
 
-pub use args::{Cli, Command};
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
-    ModeArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg,
-    VerifyArgs,
+    ModeArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
 };
+pub use args::{Cli, Command};
 use render::{failure, success};
 
-use crate::backend::{CapabilityProbe, default_probe};
+use crate::backend::{CapabilityProbe, ProcessCommandRunner, default_probe};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CommandPath, DecryptRequest, DerivationContext, DeriveRequest, EncryptRequest,
@@ -71,13 +70,7 @@ pub fn run(cli: Cli) -> Result<String> {
     match cli.command {
         Command::Inspect(args) => run_inspect(cli.json, &probe, args),
         Command::Setup(args) => run_setup(cli.json, &probe, args),
-        Command::Derive(args) => run_placeholder(
-            cli.json,
-            CommandPath::from_segments(["derive"]),
-            args.profile.clone(),
-            "derive",
-            derive_summary(&args),
-        ),
+        Command::Derive(args) => run_derive(cli.json, args),
         Command::Sign(args) => run_placeholder(
             cli.json,
             CommandPath::from_segments(["sign"]),
@@ -148,6 +141,48 @@ fn run_setup(json: bool, probe: &dyn CapabilityProbe, args: SetupArgs) -> Result
         Err(error) => failure(
             json,
             CommandPath::from_segments(["setup"]),
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn run_derive(json: bool, args: DeriveArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["derive"]);
+    let request = DeriveRequest {
+        profile: args.profile.clone(),
+        context: DerivationContext {
+            version: 1,
+            purpose: args.purpose,
+            namespace: args.namespace,
+            label: args.label,
+            context: args.context.into_iter().collect(),
+        },
+        length: args.length,
+    };
+
+    match ops::load_profile(&request.profile, args.state_dir) {
+        Ok(profile) => {
+            let runner = ProcessCommandRunner;
+            match ops::derive::execute_with_defaults(&profile, &request, &runner) {
+                Ok(result) => success(json, command, result),
+                Err(error) => failure(
+                    json,
+                    command,
+                    ErrorEnvelope {
+                        code: error.code().as_str().to_string(),
+                        message: error.to_string(),
+                    },
+                    Vec::new(),
+                ),
+            }
+        }
+        Err(error) => failure(
+            json,
+            command,
             ErrorEnvelope {
                 code: error.code().as_str().to_string(),
                 message: error.to_string(),
@@ -237,15 +272,11 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
     }
 }
 
-fn derive_summary(args: &DeriveArgs) -> String {
-    format!(
-        "profile={} purpose={} namespace={} length={} state=planned",
-        args.profile, args.purpose, args.namespace, args.length
-    )
-}
-
 fn sign_summary(args: &SignArgs) -> String {
-    format!("profile={} input={} state=planned", args.profile, args.input)
+    format!(
+        "profile={} input={} state=planned",
+        args.profile, args.input
+    )
 }
 
 fn verify_summary(args: &VerifyArgs) -> String {
@@ -256,11 +287,17 @@ fn verify_summary(args: &VerifyArgs) -> String {
 }
 
 fn encrypt_summary(args: &EncryptArgs) -> String {
-    format!("profile={} input={} state=planned", args.profile, args.input)
+    format!(
+        "profile={} input={} state=planned",
+        args.profile, args.input
+    )
 }
 
 fn decrypt_summary(args: &DecryptArgs) -> String {
-    format!("profile={} input={} state=planned", args.profile, args.input)
+    format!(
+        "profile={} input={} state=planned",
+        args.profile, args.input
+    )
 }
 
 fn export_summary(args: &ExportArgs) -> String {

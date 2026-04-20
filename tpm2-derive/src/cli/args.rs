@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(name = "tpm2-derive", version, about = "TPM-backed key operations with native, PRF, and seed modes")]
+#[command(
+    name = "tpm2-derive",
+    version,
+    about = "TPM-backed key operations with native, PRF, and seed modes"
+)]
 pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
@@ -74,6 +78,8 @@ pub struct DeriveArgs {
     pub context: Vec<(String, String)>,
     #[arg(long, default_value_t = 32)]
     pub length: u16,
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

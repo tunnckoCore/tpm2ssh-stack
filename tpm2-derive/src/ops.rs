@@ -1,3 +1,4 @@
+pub mod derive;
 pub mod native;
 pub mod prf;
 pub mod seed;
