@@ -1,5 +1,6 @@
 # develop loop/cycle
 
+- read progress to get what's left to be done
 - spawn 5 minion subagents (always, AND ALL, in openai-codex gpt-5.4 on high thinking) with their own job and own `git worktree` for the task.
 - git worktrees should be on `~/code/tpm2ssh-stack-worktrees/` - no suffixes or etc.
 - when agents are done, they should commit
