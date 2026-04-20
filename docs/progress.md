@@ -102,27 +102,34 @@ _As of 2026-04-20._
 - `cargo check` passed
 
 ## Next cycle targets
-1. add seed-mode `sign` / `verify` for `ed25519`, `p256`, and `secp256k1`
-2. simplify recovery import/export UX:
-   - prefer `import` over `recovery import`
-   - reduce confirmation flags to `--confirm` AND `--confirm-phrase` - both required
-   - the `--reason` remains required
-3. enforce use-case boundaries:
-   - `derive` should fail for profiles without `use=derive`
-   - `ssh-agent add` should require ssh/ssh-agent use, not derive use
-   - add tests for both directions
-4. clean `docs/TPM2_DERIVE_COMBINATIONS.md`:
+1. drop `tpm2ssh` from workspace members in root `Cargo.toml` (do NOT touch `tpm2ssh/` directory)
+2. add seed-mode `sign` / `verify` for `ed25519`, `p256`, and `secp256k1`
+3. rename `recovery import` to top-level `import` (no alias, no compatibility shim)
+4. simplify recovery export confirmations:
+   - require `--confirm`, `--confirm-phrase`, and `--reason`
+   - drop `--confirm-recovery-export`, `--confirm-sealed-at-rest-boundary`, `--confirm-imported-seed-material`
+   - import requires `--confirm` only
+5. enforce use-case boundaries:
+   - valid uses: `sign`, `verify`, `ssh-agent`, `derive`, `encrypt`, `decrypt` (drop `ssh` / `ethereum`)
+   - `derive` must fail for profiles without `use=derive`
+   - `ssh-agent add` must require `use=ssh-agent`
+   - mode/use enforcement:
+     - `prf` mode allows: `ssh-agent`, `derive`, `encrypt`, `decrypt`; throw on `sign` and `verify`
+     - `seed` mode allows: everything
+     - `native` mode allows: `sign`, `verify` (and public-key export)
+   - add tests for all enforcement directions
+6. SSH UX: keep dedicated `ssh-agent add` command AND add `derive --ssh-agent-add` flag (both work)
+7. clean `docs/TPM2_DERIVE_COMBINATIONS.md`:
    - add `Recovery Import` column
-   - remove user-specific PRF troubleshooting AND the meta-talk
+   - remove PRF troubleshooting section
+   - remove all meta-talk ("important distinction", "SSH doesn't mean ed25519", "higher-level wrapper" etc)
    - make `seed` the default practical framing
-5. review state layout and on-disk permissions:
-   - document exactly what is stored under `profiles/`, `objects/`, `exports/`
-   - tighten permissions where appropriate
-6. decide and implement SSH UX direction:
-   - rename toward `ssh-agent add`, or
-   - fold agent-loading UX into another command if that stays coherent
-7. implement `encrypt` / `decrypt`
-8. design and add `keygen`:
-   - accept derived material from our `derive` command, or direct input
-   - emit secret/public keypair with format selection, and optional output location
-   - optionally support a structured envelope from `derive`, but do not pretend stdin provenance can be strongly enforced without extra cryptographic design
+8. tighten state layout on-disk permissions:
+   - dirs `0700`, files `0600`
+   - document what lives under `profiles/`, `objects/`, `exports/`
+9. implement `encrypt` / `decrypt`
+10. add `keygen` command:
+    - no stdin; accepts `--from-profile` (`--profile` as alias) and `--kind auto|prf|seed`
+    - `--kind` defaults to `auto` which tries `prf` first, then `seed`, otherwise throws
+    - emits secret/public keypair with format selection and optional output location
+    - this is our architecture-specific keygen, not a general-purpose keygen
