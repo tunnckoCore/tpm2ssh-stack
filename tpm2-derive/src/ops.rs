@@ -12,6 +12,8 @@ mod enforcement;
 
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
@@ -1330,7 +1332,17 @@ fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
             "failed to write public key export to '{}': {error}",
             path.display()
         ))
-    })
+    })?;
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        Error::State(format!(
+            "failed to set permissions on '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    Ok(())
 }
 
 fn write_recovery_bundle_output(path: &Path, bundle: &SeedRecoveryBundleV1) -> Result<usize> {
@@ -1353,6 +1365,14 @@ fn write_recovery_bundle_output(path: &Path, bundle: &SeedRecoveryBundleV1) -> R
     fs::write(path, payload.as_bytes()).map_err(|error| {
         Error::State(format!(
             "failed to write recovery-bundle export to '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        Error::State(format!(
+            "failed to set permissions on '{}': {error}",
             path.display()
         ))
     })?;

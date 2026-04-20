@@ -5,6 +5,8 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::{Builder as TempfileBuilder, NamedTempFile, TempDir};
 
@@ -810,7 +812,11 @@ where
                 staging_path.display(),
                 layout.object_dir.display()
             ))
-        })
+        })?;
+
+        lock_down_sealed_objects(layout)?;
+
+        Ok(())
     }
 
     fn run_checked(&self, invocation: &CommandInvocation) -> Result<CommandOutput> {
@@ -1000,6 +1006,37 @@ fn ensure_layout_exists(layout: &SeedSealedObjectLayout) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Set directory to 0700 and each blob file to 0600.
+#[cfg(unix)]
+fn lock_down_sealed_objects(layout: &SeedSealedObjectLayout) -> Result<()> {
+    fs::set_permissions(&layout.object_dir, fs::Permissions::from_mode(0o700)).map_err(
+        |error| {
+            Error::State(format!(
+                "failed to set permissions on '{}': {error}",
+                layout.object_dir.display()
+            ))
+        },
+    )?;
+
+    for path in [&layout.public_blob, &layout.private_blob] {
+        if path.is_file() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+                Error::State(format!(
+                    "failed to set permissions on '{}': {error}",
+                    path.display()
+                ))
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_down_sealed_objects(_layout: &SeedSealedObjectLayout) -> Result<()> {
     Ok(())
 }
 

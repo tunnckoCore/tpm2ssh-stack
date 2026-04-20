@@ -1,5 +1,7 @@
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,16 @@ impl StateLayout {
                     path.display()
                 ))
             })?;
+
+            #[cfg(unix)]
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    Error::State(format!(
+                        "failed to set permissions on '{}': {error}",
+                        path.display()
+                    ))
+                },
+            )?;
         }
 
         Ok(())
@@ -103,5 +115,31 @@ mod tests {
         assert!(layout.exports_dir.is_dir());
 
         fs::remove_dir_all(root_dir).expect("temporary state layout should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dirs_sets_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root_dir = unique_temp_path("state-perms");
+        let layout = StateLayout::new(root_dir.clone());
+        layout.ensure_dirs().expect("dirs created");
+
+        for path in [
+            &layout.root_dir,
+            &layout.profiles_dir,
+            &layout.objects_dir,
+            &layout.exports_dir,
+        ] {
+            let mode = fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "directory {} should be 0700", path.display());
+        }
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
     }
 }

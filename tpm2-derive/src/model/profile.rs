@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -152,16 +154,17 @@ fn write_json_atomically(path: &Path, profile: &Profile) -> Result<()> {
     let temp_path = temporary_profile_path(path);
     let payload = format!("{}\n", serde_json::to_string_pretty(profile)?);
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|error| {
-            Error::State(format!(
-                "failed to create temporary profile file '{}': {error}",
-                temp_path.display()
-            ))
-        })?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(&temp_path).map_err(|error| {
+        Error::State(format!(
+            "failed to create temporary profile file '{}': {error}",
+            temp_path.display()
+        ))
+    })?;
 
     if let Err(error) = file.write_all(payload.as_bytes()) {
         let _ = fs::remove_file(&temp_path);
@@ -239,5 +242,36 @@ mod tests {
         assert_eq!(loaded, profile);
 
         fs::remove_dir_all(root_dir).expect("temporary profile state should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_creates_profile_file_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root_dir = unique_temp_path("profile-perms");
+        let state_layout = StateLayout::new(root_dir.clone());
+        let profile = Profile::new(
+            "perm-test".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign],
+            ModeResolution {
+                requested: ModePreference::Auto,
+                resolved: Mode::Native,
+                reasons: vec!["test".to_string()],
+            },
+            state_layout,
+        );
+
+        profile.persist().expect("persist");
+
+        let mode = fs::metadata(&profile.storage.profile_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "profile file should be 0600");
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
     }
 }

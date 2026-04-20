@@ -1,61 +1,37 @@
-# TPM2 Derive Combinations Guide
+# tpm2-derive Combinations Guide
 
-_User-facing guide for which combinations currently make sense._
+_Which algorithm × mode × use combinations work today._
 
-## Short version
+## Quick default
 
-If you just want a safe default:
+| Goal | Algorithm | Mode | Uses |
+| --- | --- | --- | --- |
+| TPM-native P-256 signer | `p256` | `native` | `sign`, `verify` |
+| Deterministic app secrets | any | `prf` | `derive` |
+| SSH identity (Ed25519) | `ed25519` | `seed` | `derive`, `ssh-agent` |
+| SSH identity (P-256) | `p256` | `seed` | `derive`, `ssh-agent` |
+| Recovery-friendly profile | any | `seed` | `derive` (+ export) |
 
-- **TPM-native P-256 signing / verification** → use **`p256 + native`**
-- **Deterministic app secrets / labeled bytes** → use **`prf`** if your TPM/tooling path works
-- **SSH user key via `tpm2ssh`** → you can choose **`p256` _or_ `ed25519`**
-- **Direct `tpm2-derive ssh agent add`** → today that supports **`seed + ed25519`** and **`seed + p256`**
-- **Recovery export** → only meaningful for **`seed`**
-
-The important distinction is:
-
-- **SSH does not mean Ed25519 only** in this project
-- but **the direct `tpm2-derive ssh agent add` command is still narrower than the higher-level `tpm2ssh` wrapper**
+**Seed mode** is the most versatile default — it supports all three algorithms,
+SSH agent integration, recovery export/import, and software key derivation.
 
 ---
 
-## Mental model
+## Modes
 
-There are 3 modes:
-
-- **`native`** = TPM-native keys and TPM-native operations
-- **`prf`** = TPM-backed deterministic byte derivation via TPM HMAC/PRF-style flow
-- **`seed`** = one TPM-sealed seed, then software derivation at use time
+| Mode | What it does |
+| --- | --- |
+| **`native`** | TPM-native key; signing & verification happen inside the TPM |
+| **`prf`** | TPM HMAC/PRF-backed deterministic byte derivation |
+| **`seed`** | One TPM-sealed seed → software derivation at use time |
 
 They do **not** all support the same operations.
 
-There are also **two different SSH stories** right now:
-
-1. **Direct `tpm2-derive ssh agent add`**
-   - a narrower vertical slice in this CLI
-   - currently wired for **seed-mode Ed25519** and **seed-mode P-256**
-2. **`tpm2ssh` managed SSH/Git identity flow**
-   - higher-level wrapper built on `tpm2-derive`
-   - currently supports **OpenSSH P-256** and **Ed25519** user keys
-
-That distinction is the main reason older docs could read like “SSH means Ed25519”.
-
 ---
 
-## What works today
+## 1. Native mode
 
-### 1. Native mode
-
-Best for:
-
-- `p256`
-- `sign`
-- `verify`
-- public-key export
-
-### Currently usable native combination
-
-#### P-256 TPM-native signer
+Best for hardware-bound P-256 signing where the private key never leaves the TPM.
 
 ```bash
 tpm2-derive setup \
@@ -66,10 +42,8 @@ tpm2-derive setup \
   --use verify
 ```
 
-Then:
-
 ```bash
-tpm2-derive sign --profile prod-signer --input message.bin
+tpm2-derive sign   --profile prod-signer --input message.bin
 tpm2-derive verify --profile prod-signer --input message.bin --signature signature.der
 tpm2-derive export --profile prod-signer --kind public-key --output prod-signer.spki.der
 ```
@@ -80,36 +54,18 @@ tpm2-derive export --profile prod-signer --kind public-key --output prod-signer.
 - `p256 + native + sign`
 - `p256 + native + export public-key`
 
-### Important native clarification
+### Not useful / not wired
 
-This is the best-supported **P-256 signing** path, but it is **not** the same thing as the current direct `tpm2-derive ssh agent add` path.
-
-If what you want is:
-
-- a TPM-native non-exportable signer → use **`p256 + native`** in `tpm2-derive`
-- an OpenSSH user key loaded into `ssh-agent` for SSH/Git use → use **`tpm2ssh`**, where **P-256 is still a valid option**
-
-### Bad / not-useful native combos
-
-- `ed25519 + native`
-- `secp256k1 + native`
+- `ed25519 + native` — no TPM-native Ed25519
+- `secp256k1 + native` — no TPM-native secp256k1
 - `native + derive`
-- direct `native + ssh-agent add`
+- `native + ssh-agent`
 
 ---
 
 ## 2. PRF mode
 
-Best for:
-
-- deterministic derived bytes
-- app secrets
-- software child-key inputs
-- future broader non-native workflows
-
-### Currently usable PRF combination
-
-Setup:
+Best for deterministic derived bytes: app secrets, child-key material, labeled contexts.
 
 ```bash
 tpm2-derive setup \
@@ -118,8 +74,6 @@ tpm2-derive setup \
   --mode prf \
   --use derive
 ```
-
-Then:
 
 ```bash
 tpm2-derive derive \
@@ -130,76 +84,27 @@ tpm2-derive derive \
   --length 32
 ```
 
-### Good PRF combos today
+### Good PRF combos
 
 - `p256 + prf + derive`
 - `ed25519 + prf + derive`
 - `secp256k1 + prf + derive`
 
-### PRF combinations that are still partial / not wired
+### Not wired yet
 
 - `prf + sign`
 - `prf + verify`
-- direct `prf + ssh-agent add`
+- `prf + ssh-agent`
 - `prf + export public-key`
-
-### Important note about your PRF error
-
-If `--dry-run` works but real `setup --mode prf` fails, that usually means:
-
-- profile validation and mode resolution succeeded
-- the failure happened only when `tpm2-tools` actually tried to talk to the TPM
-
-Your error:
-
-- mentions **`com.intel.tss2.Tabrmd`**
-- mentions DBus service lookup failure
-
-That means the failure is **not really “PRF is unsupported” in the abstract**.
-It means the subprocess TPM tool invocation tried to use the **abrmd/tabrmd TCTI path**, but that service was not available in the environment where the command ran.
-
-So this is really closer to:
-
-- **TPM access / TCTI transport configuration failure**
-- not a semantic “bad algorithm/mode combination” failure
-
-Why dry-run succeeded:
-
-- dry-run never provisions the TPM object
-- no actual `tpm2_create` / `tpm2_load` call was made
-
-Why non-dry-run failed:
-
-- it actually ran `tpm2_create`
-- that subprocess hit a TCTI/service mismatch
-
-Practical interpretation:
-
-- the combination itself may be valid
-- the runtime TPM transport path for root / `sudo` is what failed
-
-Typical things to try manually:
-
-```bash
-sudo env TPM2TOOLS_TCTI=device ./target/debug/tpm2-derive setup ...
-```
-
-or preserve your TPM-related env when using sudo if your system already exports a working TCTI.
 
 ---
 
 ## 3. Seed mode
 
-Best for:
+The practical default for most workflows. One TPM-sealed seed supports
+Ed25519/P-256/secp256k1 software identities, SSH agent, recovery export & import.
 
-- Ed25519 / P-256 / secp256k1 software identities
-- SSH-oriented deterministic identities
-- recovery-friendly flows
-- fallback when PRF/native is not what you want
-
-### Currently usable seed combinations
-
-#### Seed setup + derive
+### Setup + derive
 
 ```bash
 tpm2-derive setup \
@@ -210,8 +115,6 @@ tpm2-derive setup \
   --use ssh-agent
 ```
 
-Then:
-
 ```bash
 tpm2-derive derive \
   --profile seed-user \
@@ -221,7 +124,15 @@ tpm2-derive derive \
   --length 32
 ```
 
-#### Seed recovery export
+### SSH agent
+
+```bash
+tpm2-derive ssh agent add --profile seed-user
+```
+
+Supported today for `ed25519` and `p256` seed profiles.
+
+### Recovery export
 
 ```bash
 tpm2-derive export \
@@ -234,18 +145,16 @@ tpm2-derive export \
   --confirmation-phrase "I understand this export weakens TPM-only protection"
 ```
 
-#### Seed ssh-agent add
-
-Currently the direct CLI path is:
-
-- `seed + ed25519 + ssh-agent`
-- `seed + p256 + ssh-agent`
+### Recovery import
 
 ```bash
-tpm2-derive ssh agent add --profile seed-user
+tpm2-derive import \
+  --kind recovery-bundle \
+  --input seed-user.recovery.json \
+  --target-profile seed-user-restored
 ```
 
-### Good seed combos today
+### Good seed combos
 
 - `ed25519 + seed + derive`
 - `ed25519 + seed + ssh-agent`
@@ -258,204 +167,96 @@ tpm2-derive ssh agent add --profile seed-user
 - `secp256k1 + seed + derive`
 - `secp256k1 + seed + export public-key`
 
-### Seed combos that are partial / not wired
+### Partial / not wired
 
-- seed sign as a first-class CLI signing flow
-- seed verify exists for `ed25519`, but broader seed verify coverage is still partial
-- direct `ssh-agent add` coverage is still incomplete beyond seed `ed25519` / seed `p256`
-
----
-
-## 4. SSH identity flows
-
-This is the easiest place to get confused, so here is the explicit version.
-
-### A. Want a direct `tpm2-derive ssh agent add` flow?
-
-Use today:
-
-- `algorithm=ed25519` or `algorithm=p256`
-- `mode=seed`
-- `use=ssh-agent`
-- `use=derive`
-
-This is the currently wired direct CLI SSH path.
-
-### B. Want an SSH/Git identity through `tpm2ssh`?
-
-Use `tpm2ssh` and choose whichever algorithm you want:
-
-- **P-256** if you want an OpenSSH ECDSA NIST P-256 user key
-- **Ed25519** if you want an OpenSSH Ed25519 user key
-
-Interactive flow:
-
-```bash
-tpm2ssh --setup
-tpm2ssh --login
-```
-
-When prompted, choose either:
-
-- `1` → **NIST P-256**
-- `2` → **Ed25519**
-
-### Practical recommendation
-
-If you are deciding between the two:
-
-- choose **P-256** when you want the most explicit, user-friendly path for **P-256 SSH/Git signing identities** in this repo today
-- choose **Ed25519** when you specifically want the currently wired direct `tpm2-derive ssh agent add` slice
-
----
-
-## Recommended presets
-
-### A. Hardware-backed signer
-
-Use when:
-
-- you want TPM-native P-256 signing
-
-Use:
-
-- `algorithm=p256`
-- `mode=native`
-- `use=sign`
-- `use=verify`
-
-### B. Deterministic app secret / app derivation
-
-Use when:
-
-- you want deterministic bytes from labeled context
-
-Prefer:
-
-- `mode=prf`
-- `use=derive`
-
-Fallback:
-
-- `mode=seed`
-- `use=derive`
-
-### C. SSH / Git identity through `tpm2ssh`
-
-Use when:
-
-- you want an OpenSSH user key in `ssh-agent`
-- you want to use the same public key for SSH auth and Git SSH signing
-
-Choose either:
-
-- `algorithm=p256` for OpenSSH ECDSA NIST P-256
-- `algorithm=ed25519` for OpenSSH Ed25519
-
-Then run:
-
-```bash
-tpm2ssh --setup
-tpm2ssh --login
-```
-
-### D. Direct `tpm2-derive` SSH agent flow
-
-Use when:
-
-- you want to stay in `tpm2-derive` directly
-- today’s seed-based ssh-agent flow is sufficient
-
-Use:
-
-- `algorithm=ed25519` or `algorithm=p256`
-- `mode=seed`
-- `use=ssh-agent`
-- `use=derive`
-
-### E. Recovery-friendly profile
-
-Use when:
-
-- you need a break-glass backup/export path
-
-Use:
-
-- `mode=seed`
-- explicit recovery export workflow
+- Seed `sign` as a first-class CLI signing flow
+- Seed `verify` beyond Ed25519 is still partial
+- `ssh-agent add` is not wired for secp256k1
 
 ---
 
 ## Combinations matrix
 
-This matrix is about **current `tpm2-derive` CLI coverage**, not every higher-level wrapper built on top of it.
-
-| Algorithm | Mode | Derive | Sign | Verify | Export public key | Recovery export | Direct `tpm2-derive ssh agent add` | Status |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| p256 | native | no | yes | yes | yes | no | no | best-supported native signer path |
-| p256 | prf | yes | no | no | no | no | no | derive-only useful today; can still feed downstream SSH/Git wrappers |
-| p256 | seed | yes | partial/no | partial/no | yes | yes | yes | useful seed fallback path; SSH/export support now exists |
-| ed25519 | native | no | no | no | no | no | no | not a real target |
-| ed25519 | prf | yes | no | no | no | no | no | useful derive root |
-| ed25519 | seed | yes | limited | yes | yes | yes | yes | strong current direct seed SSH-style path |
-| secp256k1 | native | no | no | no | no | no | no | not a real target |
-| secp256k1 | prf | yes | no | no | no | no | no | derive-only useful today |
-| secp256k1 | seed | yes | limited | limited | yes | yes | limited | fallback path with public export |
-
-### Matrix footnote
-
-If you are thinking “but I want **P-256 SSH**”, the answer is:
-
-- yes, that is a valid project flow
-- use **`tpm2ssh`** for that user-facing SSH/Git identity today
-- do **not** read the direct `ssh agent add` column as “SSH in this repo only works with Ed25519”
+| Algorithm | Mode | Derive | Sign | Verify | Export pub | Recovery export | Recovery import | SSH agent add | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| p256 | native | no | yes | yes | yes | no | no | no | best native signer |
+| p256 | prf | yes | no | no | no | no | no | no | derive-only |
+| p256 | seed | yes | — | — | yes | yes | yes | yes | seed fallback; SSH/export support |
+| ed25519 | native | no | no | no | no | no | no | no | not a target |
+| ed25519 | prf | yes | no | no | no | no | no | no | derive root |
+| ed25519 | seed | yes | limited | yes | yes | yes | yes | yes | primary seed SSH path |
+| secp256k1 | native | no | no | no | no | no | no | no | not a target |
+| secp256k1 | prf | yes | no | no | no | no | no | no | derive-only |
+| secp256k1 | seed | yes | limited | limited | yes | yes | yes | limited | fallback with public export |
 
 ---
 
-## If you’re unsure what to do
+## Recommended presets
 
-### Want a TPM-native signer?
-Use:
+### Hardware-backed signer
 
-- `p256`
-- `native`
-- `sign`, `verify`
+```
+algorithm = p256, mode = native, uses = sign + verify
+```
 
-### Want deterministic app secrets?
-Use:
+### Deterministic app secrets
 
-- `prf`
-- `derive`
+```
+mode = prf (preferred) or seed (fallback), uses = derive
+```
 
-### Want P-256 SSH / Git signing identity?
-Use:
+### SSH / Git identity
 
-- `tpm2ssh --setup`
-- `tpm2ssh --login`
-- choose **P-256** when prompted
+```
+algorithm = ed25519 or p256, mode = seed, uses = derive + ssh-agent
+```
 
-### Want SSH identity directly from `tpm2-derive`?
-Use:
+### Recovery-friendly profile
 
-- `ed25519` or `p256`
-- `seed`
-- `ssh-agent`, `derive`
+```
+mode = seed, uses = derive
+# then: tpm2-derive export --kind recovery-bundle …
+```
 
-### Want backup / migration export?
-Use:
+---
 
-- `seed`
-- `export --kind recovery-bundle`
+## State layout
+
+`tpm2-derive` stores all persistent state under a single root directory
+(default: `$XDG_STATE_HOME/tpm2-derive` or `~/.local/state/tpm2-derive`).
+
+```
+<state-root>/
+├── profiles/          # per-profile JSON metadata
+│   ├── prod-signer.json
+│   └── seed-user.json
+├── objects/           # TPM-sealed blobs & key handles
+│   ├── prod-signer/
+│   │   └── handle.ctx
+│   └── seed-user/
+│       ├── sealed.pub
+│       └── sealed.priv
+└── exports/           # exported public keys & recovery bundles
+    ├── prod-signer.spki.der
+    └── seed-user.recovery.json
+```
+
+| Directory | Contents | Permissions |
+| --- | --- | --- |
+| `profiles/` | JSON profile metadata (algorithm, mode, uses, storage pointers) | `0700` dir, `0600` files |
+| `objects/` | TPM object blobs (`sealed.pub`, `sealed.priv`, `handle.ctx`) | `0700` dir, `0600` files |
+| `exports/` | Public-key DER files, recovery-bundle JSON | `0700` dir, `0600` files |
+
+All directories are created with mode `0700` and all files with mode `0600`.
 
 ---
 
 ## Current rough edges
 
-- direct `tpm2-derive ssh agent add` is still narrower than the broader `tpm2ssh` wrapper
-- some commands still report unsupported for certain mode/algorithm combinations
-- PRF provisioning can fail because of TPM transport/TCTI environment, especially under `sudo`
-- recovery import now has a CLI path, but is still a high-friction restore flow rather than a broader migration UX
-- encrypt/decrypt are placeholders right now
+- Some commands still report unsupported for certain mode/algorithm combinations
+- PRF provisioning can fail due to TPM transport / TCTI environment issues (especially under `sudo`)
+- Recovery import is a high-friction restore flow, not a broader migration UX
+- `encrypt` / `decrypt` are placeholders
 
 ---
 
@@ -463,4 +264,3 @@ Use:
 
 - `docs/TPM2_DERIVE_PLAN.md`
 - `docs/progress.md`
-- `tpm2ssh/README.md`
