@@ -1,3 +1,5 @@
+pub mod subprocess;
+
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
