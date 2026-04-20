@@ -138,6 +138,9 @@ where
 {
     ensure_ssh_use(profile)?;
 
+    // Enforce mode/use compatibility at operation dispatch time.
+    UseCase::validate_for_mode(&profile.uses, profile.mode.resolved)?;
+
     if !matches!(profile.algorithm, Algorithm::Ed25519 | Algorithm::P256) {
         return Err(Error::Unsupported(format!(
             "profile '{}' resolved to seed mode, but ssh-agent add currently supports only ed25519 and p256 seed profiles; found {:?}",
@@ -340,13 +343,13 @@ fn ensure_ssh_use(profile: &Profile) -> Result<()> {
     if profile
         .uses
         .iter()
-        .any(|use_case| matches!(use_case, UseCase::Ssh | UseCase::SshAgent))
+        .any(|use_case| matches!(use_case, UseCase::SshAgent))
     {
         return Ok(());
     }
 
-    Err(Error::Unsupported(format!(
-        "profile '{}' is not configured with ssh or ssh-agent use",
+    Err(Error::PolicyRefusal(format!(
+        "profile '{}' is not configured with use=ssh-agent",
         profile.name
     )))
 }
@@ -540,10 +543,10 @@ mod tests {
         )
         .expect_err("ssh use should be required");
 
-        assert_eq!(error.code(), crate::ErrorCode::Unsupported);
+        assert_eq!(error.code(), crate::ErrorCode::PolicyRefusal);
         assert!(error
             .to_string()
-            .contains("not configured with ssh or ssh-agent use"));
+            .contains("not configured with use=ssh-agent"));
     }
 
     #[test]

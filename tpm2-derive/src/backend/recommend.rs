@@ -282,7 +282,7 @@ fn needs_deterministic_output(uses: &[UseCase]) -> bool {
     uses.iter().any(|use_case| {
         matches!(
             use_case,
-            UseCase::Derive | UseCase::Ssh | UseCase::SshAgent | UseCase::Ethereum
+            UseCase::Derive | UseCase::SshAgent
         )
     })
 }
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn detects_deterministic_workflows() {
         assert!(needs_deterministic_output(&[UseCase::Derive]));
-        assert!(needs_deterministic_output(&[UseCase::Ssh]));
+        assert!(needs_deterministic_output(&[UseCase::SshAgent]));
         assert!(!needs_deterministic_output(&[UseCase::Sign]));
     }
 

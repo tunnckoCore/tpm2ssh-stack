@@ -67,7 +67,7 @@ impl CapabilityProbe for HeuristicProbe {
         if uses.iter().any(|use_case| {
             matches!(
                 use_case,
-                UseCase::SshAgent | UseCase::Derive | UseCase::Ethereum
+                UseCase::SshAgent | UseCase::Derive
             )
         }) {
             recommendation_reasons.push(

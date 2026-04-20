@@ -129,6 +129,18 @@ pub struct DeriveArgs {
         help = "Override the state root directory instead of the default local state path"
     )]
     pub state_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "After deriving, also add the material to ssh-agent"
+    )]
+    pub ssh_agent_add: bool,
+    #[arg(long, help = "Optional ssh-agent comment for the added key (used with --ssh-agent-add)")]
+    pub ssh_agent_comment: Option<String>,
+    #[arg(
+        long,
+        help = "Explicit ssh-agent socket path; otherwise SSH_AUTH_SOCK is used (used with --ssh-agent-add)"
+    )]
+    pub ssh_agent_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -307,12 +319,8 @@ pub enum UseArg {
     Verify,
     /// Allow deterministic derivation operations.
     Derive,
-    /// Intended for SSH/OpenSSH identity usage; this can mean Ed25519 or P-256 depending on the consuming flow.
-    Ssh,
-    /// Intended for ssh-agent loading; direct tpm2-derive support is currently narrow even though downstream wrappers may support more.
+    /// Intended for ssh-agent loading.
     SshAgent,
-    /// Intended for Ethereum/secp256k1-style usage.
-    Ethereum,
     /// Placeholder for future encryption usage.
     Encrypt,
     /// Placeholder for future decryption usage.

@@ -8,6 +8,7 @@ pub mod native;
 pub mod prf;
 pub mod seed;
 pub mod ssh;
+mod enforcement;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -162,6 +163,10 @@ fn build_setup_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> R
         &uses,
         &report,
     )?;
+
+    // Enforce mode/use compatibility at setup time.
+    UseCase::validate_for_mode(&uses, resolved_mode)?;
+
     let reasons = if let Some(explicit) = request.requested_mode.explicit() {
         vec![format!("mode explicitly requested as {explicit:?}")]
     } else {
@@ -593,7 +598,7 @@ fn seed_public_key_derivation_spec(profile: &Profile) -> Result<DerivationSpec> 
             if profile
                 .uses
                 .iter()
-                .any(|use_case| matches!(use_case, UseCase::Ssh | UseCase::SshAgent)) =>
+                .any(|use_case| matches!(use_case, UseCase::SshAgent)) =>
         {
             crate::ops::ssh::ssh_ed25519_derivation_spec()
         }

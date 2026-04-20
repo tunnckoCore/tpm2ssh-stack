@@ -69,9 +69,7 @@ impl From<UseArg> for UseCase {
             UseArg::Sign => Self::Sign,
             UseArg::Verify => Self::Verify,
             UseArg::Derive => Self::Derive,
-            UseArg::Ssh => Self::Ssh,
             UseArg::SshAgent => Self::SshAgent,
-            UseArg::Ethereum => Self::Ethereum,
             UseArg::Encrypt => Self::Encrypt,
             UseArg::Decrypt => Self::Decrypt,
         }
@@ -176,6 +174,9 @@ fn run_setup(json: bool, probe: &dyn CapabilityProbe, args: SetupArgs) -> Result
 
 fn run_derive(json: bool, args: DeriveArgs) -> Result<String> {
     let command = CommandPath::from_segments(["derive"]);
+    let ssh_agent_add = args.ssh_agent_add;
+    let ssh_agent_comment = args.ssh_agent_comment.clone();
+    let ssh_agent_socket = args.ssh_agent_socket.clone();
     let request = DeriveRequest {
         profile: args.profile.clone(),
         context: DerivationContext {
@@ -188,11 +189,32 @@ fn run_derive(json: bool, args: DeriveArgs) -> Result<String> {
         length: args.length,
     };
 
-    match ops::load_profile(&request.profile, args.state_dir) {
+    match ops::load_profile(&request.profile, args.state_dir.clone()) {
         Ok(profile) => {
             let runner = ProcessCommandRunner;
             match ops::derive::execute_with_defaults(&profile, &request, &runner) {
-                Ok(result) => success(json, command, result),
+                Ok(result) => {
+                    if ssh_agent_add {
+                        let agent_request = crate::model::SshAgentAddRequest {
+                            profile: profile.name.clone(),
+                            comment: ssh_agent_comment,
+                            socket: ssh_agent_socket,
+                            state_dir: args.state_dir,
+                        };
+                        if let Err(error) = ops::ssh::add_with_defaults(&profile, &agent_request) {
+                            return failure(
+                                json,
+                                command,
+                                ErrorEnvelope {
+                                    code: error.code().as_str().to_string(),
+                                    message: format!("derive succeeded but ssh-agent add failed: {error}"),
+                                },
+                                Vec::new(),
+                            );
+                        }
+                    }
+                    success(json, command, result)
+                }
                 Err(error) => failure(
                     json,
                     command,

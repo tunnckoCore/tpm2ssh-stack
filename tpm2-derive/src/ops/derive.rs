@@ -49,6 +49,17 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
+    // Enforce use=derive at operation dispatch time.
+    if !profile.uses.contains(&crate::model::UseCase::Derive) {
+        return Err(Error::PolicyRefusal(format!(
+            "profile '{}' is not configured with use=derive",
+            profile.name
+        )));
+    }
+
+    // Enforce mode/use compatibility at operation dispatch time.
+    crate::model::UseCase::validate_for_mode(&profile.uses, profile.mode.resolved)?;
+
     let spec = derive_spec(request)?;
 
     match profile.mode.resolved {
@@ -569,5 +580,96 @@ mod tests {
         ) -> Result<super::super::seed::SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.derived.clone())))
         }
+    }
+
+    // ── enforcement tests ──────────────────────────────────────────────
+
+    #[test]
+    fn derive_fails_when_profile_lacks_derive_use() {
+        let root_dir = unique_temp_path("derive-no-use");
+        let object_dir = root_dir.join("objects").join("no-derive");
+        fs::create_dir_all(&object_dir).expect("create object dir");
+        fs::write(object_dir.join("sealed.pub"), b"pub").expect("pub");
+        fs::write(object_dir.join("sealed.priv"), b"priv").expect("priv");
+
+        // Profile with only SshAgent, not Derive
+        let mut profile = test_profile(root_dir.clone(), "no-derive", Mode::Seed);
+        profile.uses = vec![UseCase::SshAgent];
+
+        let request = test_request("no-derive", 16);
+        let runner = FakePrfRunner::new(b"unused".to_vec());
+        let seed_backend = FakeSeedBackend::new(vec![7_u8; 32]);
+        let seed_deriver = FakeSeedDeriver::new(vec![9_u8; 16]);
+
+        let error = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+            .expect_err("derive should fail without use=derive");
+
+        assert_eq!(error.code(), crate::error::ErrorCode::PolicyRefusal);
+        assert!(error.to_string().contains("not configured with use=derive"));
+
+        let _ = fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn derive_fails_for_native_mode_profile() {
+        let root_dir = unique_temp_path("derive-native-enforcement");
+        // Profile with derive + native mode should fail mode/use enforcement
+        let mut profile = test_profile(root_dir.clone(), "native-derive", Mode::Native);
+        profile.uses = vec![UseCase::Derive];
+
+        let request = test_request("native-derive", 16);
+        let runner = FakePrfRunner::new(b"unused".to_vec());
+        let seed_backend = FakeSeedBackend::default();
+        let seed_deriver = FakeSeedDeriver::default();
+
+        let error = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+            .expect_err("native mode should refuse derive");
+
+        assert_eq!(error.code(), crate::error::ErrorCode::PolicyRefusal);
+        assert!(error.to_string().contains("not allowed in Native mode"));
+
+        let _ = fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn derive_succeeds_for_prf_mode_with_derive_use() {
+        let root_dir = unique_temp_path("derive-prf-ok");
+        let object_dir = root_dir.join("objects").join("prf-ok");
+        fs::create_dir_all(&object_dir).expect("create object dir");
+        fs::write(object_dir.join("prf-root.ctx"), b"ctx").expect("write context");
+
+        let profile = test_profile(root_dir.clone(), "prf-ok", Mode::Prf);
+        let request = test_request("prf-ok", 16);
+        let runner = FakePrfRunner::new(b"raw-prf-material".to_vec());
+        let seed_backend = FakeSeedBackend::default();
+        let seed_deriver = FakeSeedDeriver::default();
+
+        let result = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+            .expect("prf + derive should succeed");
+
+        assert_eq!(result.mode, Mode::Prf);
+
+        let _ = fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn derive_fails_for_prf_mode_with_sign_use() {
+        let root_dir = unique_temp_path("derive-prf-sign");
+        let mut profile = test_profile(root_dir.clone(), "prf-sign", Mode::Prf);
+        profile.uses = vec![UseCase::Sign];
+
+        let request = test_request("prf-sign", 16);
+        let runner = FakePrfRunner::new(b"unused".to_vec());
+        let seed_backend = FakeSeedBackend::default();
+        let seed_deriver = FakeSeedDeriver::default();
+
+        let error = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+            .expect_err("prf + sign should fail derive");
+
+        // First error: missing use=derive
+        assert_eq!(error.code(), crate::error::ErrorCode::PolicyRefusal);
+        assert!(error.to_string().contains("not configured with use=derive"));
+
+        let _ = fs::remove_dir_all(root_dir);
     }
 }
