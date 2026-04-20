@@ -1,3 +1,4 @@
+pub mod native;
 pub mod prf;
 
 use crate::backend::CapabilityProbe;
