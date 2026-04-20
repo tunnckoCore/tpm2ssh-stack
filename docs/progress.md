@@ -127,7 +127,10 @@ _As of 2026-04-20._
 8. tighten state layout on-disk permissions:
    - dirs `0700`, files `0600`
    - document what lives under `profiles/`, `objects/`, `exports/`
-9. implement `encrypt` / `decrypt` for the modes: `native` and `seed` only (prf cannot, you must derive keypair from the returned prf, or just use `keygen --from-profile`)
+9. implement `encrypt` / `decrypt` for all modes:
+    - `seed` mode: unseal seed, derive symmetric key, software AEAD
+    - `native` mode: TPM-backed encrypt/decrypt
+    - `prf` mode: implicitly derive key material from the PRF internally, then encrypt/decrypt with it
 10. add `keygen` command:
     - no stdin; accepts `--from-profile` (`--profile` as alias) and `--kind auto|prf|seed`
     - `--kind` defaults to `auto` which tries `prf` first, then `seed`, otherwise throws
