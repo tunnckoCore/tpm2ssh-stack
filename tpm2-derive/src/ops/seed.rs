@@ -246,9 +246,8 @@ pub struct SeedExportRequest {
     pub destination: SeedExportDestination,
     pub format: SeedExportFormat,
     pub reason: String,
-    pub confirm_recovery_export: bool,
-    pub confirm_sealed_at_rest_boundary: bool,
-    pub confirmation_phrase: Option<String>,
+    pub confirm: bool,
+    pub confirm_phrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -439,15 +438,9 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
         ));
     }
 
-    if !request.confirm_recovery_export {
+    if !request.confirm {
         return Err(Error::Validation(
-            "seed export requires explicit recovery-export confirmation".to_string(),
-        ));
-    }
-
-    if !request.confirm_sealed_at_rest_boundary {
-        return Err(Error::Validation(
-            "seed export requires acknowledgement that exported material no longer benefits from TPM sealed-at-rest protection".to_string(),
+            "seed export requires --confirm to acknowledge this is a break-glass recovery operation and exported material leaves TPM protection".to_string(),
         ));
     }
 
@@ -458,7 +451,7 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
     }
 
     if policy.require_confirmation_phrase {
-        let provided = request.confirmation_phrase.as_deref().unwrap_or_default();
+        let provided = request.confirm_phrase.as_deref().unwrap_or_default();
         if provided != policy.confirmation_phrase {
             return Err(Error::Validation(
                 "seed export confirmation phrase did not match policy".to_string(),
@@ -1306,14 +1299,12 @@ fn seed_mode_usage_warnings(profile: &SeedProfile) -> Vec<Diagnostic> {
 
 fn required_export_confirmations(policy: &SeedExportPolicy) -> Vec<String> {
     let mut confirmations = vec![
-        "confirm this is a break-glass recovery operation".to_string(),
-        "acknowledge exported material is no longer protected by TPM sealed-at-rest policy"
-            .to_string(),
+        "--confirm: acknowledge this is a break-glass recovery operation and exported material leaves TPM protection".to_string(),
     ];
 
     if policy.require_confirmation_phrase {
         confirmations.push(format!(
-            "repeat confirmation phrase exactly: {}",
+            "--confirm-phrase: repeat confirmation phrase exactly: {}",
             policy.confirmation_phrase
         ));
     }
@@ -1504,9 +1495,8 @@ mod tests {
             ),
             format: SeedExportFormat::RecoveryBundleV1,
             reason: "hardware migration".to_string(),
-            confirm_recovery_export: true,
-            confirm_sealed_at_rest_boundary: true,
-            confirmation_phrase: Some("wrong phrase".to_string()),
+            confirm: true,
+            confirm_phrase: Some("wrong phrase".to_string()),
         };
 
         let error = plan_export(&request).expect_err("expected validation failure");
@@ -1523,9 +1513,8 @@ mod tests {
             ),
             format: SeedExportFormat::RecoveryBundleV1,
             reason: "hardware migration".to_string(),
-            confirm_recovery_export: true,
-            confirm_sealed_at_rest_boundary: true,
-            confirmation_phrase: Some(DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string()),
+            confirm: true,
+            confirm_phrase: Some(DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string()),
         };
 
         let seed = sample_seed();

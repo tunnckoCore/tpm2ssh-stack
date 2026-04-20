@@ -524,9 +524,8 @@ where
             destination: SeedExportDestination::ExplicitPath(destination.display().to_string()),
             format: SeedExportFormat::RecoveryBundleV1,
             reason: request.reason.clone().unwrap_or_default(),
-            confirm_recovery_export: request.confirm_recovery_export,
-            confirm_sealed_at_rest_boundary: request.confirm_sealed_at_rest_boundary,
-            confirmation_phrase: request.confirmation_phrase.clone(),
+            confirm: request.confirm,
+            confirm_phrase: request.confirm_phrase.clone(),
         },
     )?;
 
@@ -2005,9 +2004,8 @@ mod tests {
             public_key_format: None,
             state_dir: Some(root_dir.clone()),
             reason: None,
-            confirm_recovery_export: false,
-            confirm_sealed_at_rest_boundary: false,
-            confirmation_phrase: None,
+            confirm: false,
+            confirm_phrase: None,
         })
         .expect_err("prf export should refuse");
 
@@ -2280,9 +2278,8 @@ mod tests {
                 public_key_format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
-                confirm_recovery_export: true,
-                confirm_sealed_at_rest_boundary: true,
-                confirmation_phrase: Some(
+                confirm: true,
+                confirm_phrase: Some(
                     crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
                 ),
             },
@@ -2328,9 +2325,8 @@ mod tests {
                 public_key_format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
-                confirm_recovery_export: true,
-                confirm_sealed_at_rest_boundary: true,
-                confirmation_phrase: Some(
+                confirm: true,
+                confirm_phrase: Some(
                     crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
                 ),
             },

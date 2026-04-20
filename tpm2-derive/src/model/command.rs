@@ -93,9 +93,8 @@ pub struct ExportRequest {
     pub public_key_format: Option<PublicKeyExportFormat>,
     pub state_dir: Option<PathBuf>,
     pub reason: Option<String>,
-    pub confirm_recovery_export: bool,
-    pub confirm_sealed_at_rest_boundary: bool,
-    pub confirmation_phrase: Option<String>,
+    pub confirm: bool,
+    pub confirm_phrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]

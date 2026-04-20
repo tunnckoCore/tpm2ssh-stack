@@ -10,7 +10,7 @@ use tempfile::Builder as TempfileBuilder;
 
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
-    ModeArg, PublicKeyExportFormatArg, RecoveryCommand, RecoveryImportArgs, SetupArgs,
+    ImportArgs, ModeArg, PublicKeyExportFormatArg, SetupArgs,
     SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
@@ -132,7 +132,7 @@ pub fn run(cli: Cli) -> Result<String> {
             decrypt_summary(&args),
         ),
         Command::Export(args) => run_export(cli.json, args),
-        Command::Recovery(RecoveryCommand::Import(args)) => run_recovery_import(cli.json, args),
+        Command::Import(args) => run_import(cli.json, args),
         Command::Ssh(SshCommand::Agent(SshAgentCommand::Add(args))) => {
             run_ssh_agent_add(cli.json, args)
         }
@@ -224,9 +224,8 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
         public_key_format: args.public_key_format.map(Into::into),
         state_dir: args.state_dir,
         reason: args.reason,
-        confirm_recovery_export: args.confirm_recovery_export,
-        confirm_sealed_at_rest_boundary: args.confirm_sealed_at_rest_boundary,
-        confirmation_phrase: args.confirmation_phrase,
+        confirm: args.confirm,
+        confirm_phrase: args.confirm_phrase,
     };
 
     match ops::export(&request) {
@@ -243,12 +242,12 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
     }
 }
 
-fn run_recovery_import(json: bool, args: RecoveryImportArgs) -> Result<String> {
-    let command = CommandPath::from_segments(["recovery", "import"]);
+fn run_import(json: bool, args: ImportArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["import"]);
 
-    if !args.confirm_imported_seed_material {
+    if !args.confirm {
         let error = Error::Validation(
-            "recovery import requires --confirm-imported-seed-material because the bundle contains exported seed material until it is resealed into TPM-backed state"
+            "import requires --confirm because the bundle contains exported seed material until it is resealed into TPM-backed state"
                 .to_string(),
         );
         return failure(
@@ -1336,9 +1335,8 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
             public_key_format: None,
             state_dir: None,
             reason: None,
-            confirm_recovery_export: false,
-            confirm_sealed_at_rest_boundary: false,
-            confirmation_phrase: None,
+            confirm: false,
+            confirm_phrase: None,
         })
         .unwrap_or_default(),
         "ssh-agent add" => serde_json::to_value(SshAgentAddRequest {
@@ -1545,16 +1543,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_import_requires_explicit_seed_material_confirmation() {
+    fn import_requires_explicit_confirmation() {
         let output = run(Cli {
             json: false,
-            command: Command::Recovery(RecoveryCommand::Import(RecoveryImportArgs {
+            command: Command::Import(ImportArgs {
                 bundle: PathBuf::from("backup.json"),
                 profile: Some("restored-user".to_string()),
                 state_dir: None,
                 overwrite_existing: false,
-                confirm_imported_seed_material: false,
-            })),
+                confirm: false,
+            }),
         })
         .expect("cli output");
         let value: Value = serde_json::from_str(&output).expect("json output");
@@ -1563,7 +1561,6 @@ mod tests {
         assert_eq!(
             value["command"]["segments"],
             Value::Array(vec![
-                Value::String("recovery".to_string()),
                 Value::String("import".to_string()),
             ])
         );
@@ -1574,26 +1571,25 @@ mod tests {
         assert!(value["error"]["message"]
             .as_str()
             .expect("error message")
-            .contains("--confirm-imported-seed-material"));
+            .contains("--confirm"));
     }
 
     #[test]
-    fn recovery_restore_alias_parses_to_import_command() {
+    fn import_parses_confirm_flag() {
         let cli = Cli::try_parse_from([
             "tpm2-derive",
-            "recovery",
-            "restore",
+            "import",
             "--bundle",
             "backup.json",
-            "--confirm-imported-seed-material",
+            "--confirm",
         ])
-        .expect("recovery restore alias should parse");
+        .expect("import should parse");
 
-        let Command::Recovery(RecoveryCommand::Import(args)) = cli.command else {
-            panic!("expected recovery import command");
+        let Command::Import(args) = cli.command else {
+            panic!("expected import command");
         };
         assert_eq!(args.bundle, PathBuf::from("backup.json"));
-        assert!(args.confirm_imported_seed_material);
+        assert!(args.confirm);
         assert!(!args.overwrite_existing);
     }
 
