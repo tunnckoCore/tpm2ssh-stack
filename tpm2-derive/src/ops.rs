@@ -34,8 +34,8 @@ use crate::model::{
     StateLayout, UseCase,
 };
 use crate::ops::native::subprocess::{
-    NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
-    NativeSetupArtifacts, plan_export_public_key, plan_setup,
+    plan_export_public_key, plan_setup, NativeCommandSpec, NativeKeyLocator,
+    NativePersistentHandle, NativePublicKeyExportOptions, NativeSetupArtifacts,
 };
 use crate::ops::native::{
     NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativeKeyRef, NativeKeyUse,
@@ -267,6 +267,8 @@ pub fn load_profile(profile: &str, state_dir: Option<PathBuf>) -> Result<Profile
 }
 
 pub fn import_recovery_bundle(request: &RecoveryImportRequest) -> Result<RecoveryImportResult> {
+    validate_recovery_bundle_input_path(&request.bundle_path)?;
+
     let payload = fs::read(&request.bundle_path).map_err(|error| {
         Error::State(format!(
             "failed to read recovery bundle '{}': {error}",
@@ -289,11 +291,22 @@ fn import_recovery_bundle_with_backend<B>(
 where
     B: SeedBackend,
 {
+    let target_profile = request
+        .profile
+        .clone()
+        .unwrap_or_else(|| bundle.profile.name.clone());
+    validate_profile_name(&target_profile)?;
+    ensure_recovery_import_target_available(
+        &target_profile,
+        &state_layout,
+        request.overwrite_existing,
+    )?;
+
     let restored = restore_seed_recovery_bundle(
         backend,
         &SeedRecoveryImportRequest {
             bundle,
-            target_profile: request.profile.clone(),
+            target_profile: Some(target_profile),
             overwrite_existing: request.overwrite_existing,
         },
     )?;
@@ -319,6 +332,45 @@ where
         restored_from_profile: restored.restored_from_profile,
         seed_bytes: restored.seed_bytes,
     })
+}
+
+fn validate_recovery_bundle_input_path(path: &Path) -> Result<()> {
+    if path == Path::new("-") {
+        return Err(Error::Validation(
+            "recovery import requires --bundle to be a file path; stdin is intentionally unsupported for secret-bearing recovery material"
+                .to_string(),
+        ));
+    }
+
+    if path.is_dir() {
+        return Err(Error::Validation(format!(
+            "recovery import bundle '{}' must be a file path, not a directory",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn ensure_recovery_import_target_available(
+    target_profile: &str,
+    state_layout: &StateLayout,
+    overwrite_existing: bool,
+) -> Result<()> {
+    if overwrite_existing {
+        return Ok(());
+    }
+
+    let profile_path = state_layout.profile_path(target_profile);
+    let object_dir = state_layout.objects_dir.join(target_profile);
+    if profile_path.exists() || object_dir.exists() {
+        return Err(Error::State(format!(
+            "recovery import target '{}' already exists; pass --overwrite-existing to replace the persisted profile and sealed seed state",
+            target_profile
+        )));
+    }
+
+    Ok(())
 }
 
 fn apply_prf_root_metadata(profile: &mut Profile, layout: &PrfRootLayout) -> Result<()> {
@@ -1463,14 +1515,12 @@ mod tests {
             result.profile.metadata.get("native.persistent_handle"),
             Some(&"0x81010002".to_string())
         );
-        assert!(
-            !root_dir
-                .join("objects")
-                .join("prod-signer")
-                .join("native")
-                .join("setup-work")
-                .exists()
-        );
+        assert!(!root_dir
+            .join("objects")
+            .join("prod-signer")
+            .join("native")
+            .join("setup-work")
+            .exists());
 
         let loaded = load_profile("prod-signer", Some(root_dir.clone())).expect("profile loads");
         assert_eq!(loaded, result.profile);
@@ -2294,30 +2344,53 @@ mod tests {
     }
 
     #[test]
+    fn recovery_import_requires_overwrite_when_target_profile_state_exists() {
+        let root_dir = unique_temp_path("import-seed-recovery-existing-target");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let existing = Profile::new(
+            "restored-profile".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Derive],
+            ModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            state_layout.clone(),
+        );
+        existing.persist().expect("persist existing profile");
+
+        let seed = vec![0x24; 32];
+        let backend = FakeSeedImportBackend::default();
+        let error = import_recovery_bundle_with_backend(
+            &RecoveryImportRequest {
+                bundle_path: root_dir.join("backup").join("seed.recovery.json"),
+                profile: Some("restored-profile".to_string()),
+                state_dir: Some(root_dir.clone()),
+                overwrite_existing: false,
+            },
+            sample_recovery_bundle("old-profile", &seed),
+            state_layout,
+            &backend,
+        )
+        .expect_err("existing target should require overwrite");
+
+        assert!(matches!(error, Error::State(message) if message.contains("--overwrite-existing")));
+        assert!(backend.last_request_opt().is_none());
+
+        fs::remove_dir_all(root_dir).expect("temporary import state should be removed");
+    }
+
+    #[test]
     fn recovery_import_persists_restored_seed_profile_metadata() {
         let root_dir = unique_temp_path("import-seed-recovery-bundle");
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
         let seed = vec![0x42; 32];
-        let bundle = SeedRecoveryBundleV1 {
-            schema_version: crate::ops::seed::SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
-            kind: crate::ops::seed::SEED_RECOVERY_BUNDLE_KIND.to_string(),
-            exported_at_unix_seconds: 1,
-            reason: "hardware migration".to_string(),
-            profile: crate::ops::seed::SeedRecoveryBundleProfile {
-                name: "old-profile".to_string(),
-                algorithm: Algorithm::Ed25519,
-                uses: vec![UseCase::Derive, UseCase::SshAgent],
-                derivation: crate::ops::seed::SeedDerivation::hkdf_sha256_v1(),
-            },
-            seed: crate::ops::seed::SeedRecoveryBundleSecret {
-                encoding: "hex".to_string(),
-                bytes: seed.len(),
-                sha256: seed_sha256_hex(&seed),
-                material: seed_hex_encode(&seed),
-            },
-        };
+        let bundle = sample_recovery_bundle("old-profile", &seed);
         let backend = FakeSeedImportBackend::default();
 
         let result = import_recovery_bundle_with_backend(
@@ -2388,6 +2461,10 @@ mod tests {
                 .expect("last request")
                 .clone()
                 .expect("recorded seed import")
+        }
+
+        fn last_request_opt(&self) -> Option<RecordedSeedImport> {
+            self.last_request.lock().expect("last request").clone()
         }
     }
 
@@ -2583,6 +2660,27 @@ mod tests {
                 .expect("p256 public key DER")
                 .as_bytes()
                 .to_vec(),
+        }
+    }
+
+    fn sample_recovery_bundle(profile_name: &str, seed: &[u8]) -> SeedRecoveryBundleV1 {
+        SeedRecoveryBundleV1 {
+            schema_version: crate::ops::seed::SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
+            kind: crate::ops::seed::SEED_RECOVERY_BUNDLE_KIND.to_string(),
+            exported_at_unix_seconds: 1,
+            reason: "hardware migration".to_string(),
+            profile: crate::ops::seed::SeedRecoveryBundleProfile {
+                name: profile_name.to_string(),
+                algorithm: Algorithm::Ed25519,
+                uses: vec![UseCase::Derive, UseCase::SshAgent],
+                derivation: crate::ops::seed::SeedDerivation::hkdf_sha256_v1(),
+            },
+            seed: crate::ops::seed::SeedRecoveryBundleSecret {
+                encoding: "hex".to_string(),
+                bytes: seed.len(),
+                sha256: seed_sha256_hex(seed),
+                material: seed_hex_encode(seed),
+            },
         }
     }
 

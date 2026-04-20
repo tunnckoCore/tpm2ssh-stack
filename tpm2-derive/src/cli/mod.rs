@@ -10,8 +10,8 @@ use tempfile::Builder as TempfileBuilder;
 
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
-    ModeArg, PublicKeyExportFormatArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand,
-    SshCommand, UseArg, VerifyArgs,
+    ModeArg, PublicKeyExportFormatArg, RecoveryCommand, RecoveryImportArgs, SetupArgs,
+    SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
 use ed25519_dalek::{Signature as Ed25519Signature, SigningKey as Ed25519SigningKey};
@@ -24,21 +24,21 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::backend::{
-    CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner,
-    default_probe,
+    default_probe, CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner,
+    ProcessCommandRunner,
 };
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CommandPath, DecryptRequest, DerivationContext, DeriveRequest, EncryptRequest,
     ErrorEnvelope, ExportKind, ExportRequest, InputSource, InspectRequest, Mode, ModePreference,
-    PendingOperation, Profile, PublicKeyExportFormat, SetupRequest, SignRequest,
-    SshAgentAddRequest, UseCase, VerifyRequest,
+    PendingOperation, Profile, PublicKeyExportFormat, RecoveryImportRequest, SetupRequest,
+    SignRequest, SshAgentAddRequest, UseCase, VerifyRequest,
 };
 use crate::ops;
 use crate::ops::native::subprocess::{
-    NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
-    NativeSignOptions, NativeSignPlan, plan_sign,
+    plan_sign, NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
+    NativeSignOptions, NativeSignPlan,
 };
 use crate::ops::native::{
     DigestAlgorithm, NativeKeyRef, NativeSignRequest, NativeSignatureFormat, NativeSignatureScheme,
@@ -132,6 +132,7 @@ pub fn run(cli: Cli) -> Result<String> {
             decrypt_summary(&args),
         ),
         Command::Export(args) => run_export(cli.json, args),
+        Command::Recovery(RecoveryCommand::Import(args)) => run_recovery_import(cli.json, args),
         Command::Ssh(SshCommand::Agent(SshAgentCommand::Add(args))) => {
             run_ssh_agent_add(cli.json, args)
         }
@@ -229,6 +230,46 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
     };
 
     match ops::export(&request) {
+        Ok(result) => success(json, command, result),
+        Err(error) => failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn run_recovery_import(json: bool, args: RecoveryImportArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["recovery", "import"]);
+
+    if !args.confirm_imported_seed_material {
+        let error = Error::Validation(
+            "recovery import requires --confirm-imported-seed-material because the bundle contains exported seed material until it is resealed into TPM-backed state"
+                .to_string(),
+        );
+        return failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        );
+    }
+
+    let request = RecoveryImportRequest {
+        bundle_path: args.bundle,
+        profile: args.profile,
+        state_dir: args.state_dir,
+        overwrite_existing: args.overwrite_existing,
+    };
+
+    match ops::import_recovery_bundle(&request) {
         Ok(result) => success(json, command, result),
         Err(error) => failure(
             json,
@@ -1337,6 +1378,7 @@ mod tests {
 
     use std::cell::RefCell;
 
+    use clap::Parser as _;
     use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
     use p256::ecdsa::signature::Signer as _;
     use p256::ecdsa::SigningKey as P256SigningKey;
@@ -1504,6 +1546,59 @@ mod tests {
     }
 
     #[test]
+    fn recovery_import_requires_explicit_seed_material_confirmation() {
+        let output = run(Cli {
+            json: false,
+            command: Command::Recovery(RecoveryCommand::Import(RecoveryImportArgs {
+                bundle: PathBuf::from("backup.json"),
+                profile: Some("restored-user".to_string()),
+                state_dir: None,
+                overwrite_existing: false,
+                confirm_imported_seed_material: false,
+            })),
+        })
+        .expect("cli output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(value["ok"], Value::Bool(false));
+        assert_eq!(
+            value["command"]["segments"],
+            Value::Array(vec![
+                Value::String("recovery".to_string()),
+                Value::String("import".to_string()),
+            ])
+        );
+        assert_eq!(
+            value["error"]["code"],
+            Value::String("validation".to_string())
+        );
+        assert!(value["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("--confirm-imported-seed-material"));
+    }
+
+    #[test]
+    fn recovery_restore_alias_parses_to_import_command() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "recovery",
+            "restore",
+            "--bundle",
+            "backup.json",
+            "--confirm-imported-seed-material",
+        ])
+        .expect("recovery restore alias should parse");
+
+        let Command::Recovery(RecoveryCommand::Import(args)) = cli.command else {
+            panic!("expected recovery import command");
+        };
+        assert_eq!(args.bundle, PathBuf::from("backup.json"));
+        assert!(args.confirm_imported_seed_material);
+        assert!(!args.overwrite_existing);
+    }
+
+    #[test]
     fn native_sign_executes_when_serialized_handle_exists() {
         let state_root = tempdir().expect("state root");
         let profile = native_profile(state_root.path(), Mode::Native, vec![UseCase::Sign]);
@@ -1553,16 +1648,14 @@ mod tests {
         );
         assert!(!staged.digest_path.as_os_str().is_empty());
         assert_eq!(runner.invocations().len(), 1);
-        assert!(
-            !profile
-                .storage
-                .state_layout
-                .objects_dir
-                .join(&profile.name)
-                .join("native-sign")
-                .join("signature.p1363.bin")
-                .exists()
-        );
+        assert!(!profile
+            .storage
+            .state_layout
+            .objects_dir
+            .join(&profile.name)
+            .join("native-sign")
+            .join("signature.p1363.bin")
+            .exists());
     }
 
     #[test]
@@ -1806,11 +1899,9 @@ mod tests {
             value["error"]["code"],
             Value::String("unsupported".to_string())
         );
-        assert!(
-            value["error"]["message"]
-                .as_str()
-                .expect("error message")
-                .contains("seed-mode profiles")
-        );
+        assert!(value["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("seed-mode profiles"));
     }
 }
