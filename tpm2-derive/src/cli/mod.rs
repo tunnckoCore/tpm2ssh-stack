@@ -14,9 +14,10 @@ use args::{
     SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
-use ed25519_dalek::{Signature as Ed25519Signature, SigningKey as Ed25519SigningKey};
+use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey};
+use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
 use p256::ecdsa::signature::Verifier as _;
-use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePublicKey as _;
 use render::{failure, success, success_with_diagnostics};
 use secrecy::ExposeSecret;
@@ -49,8 +50,8 @@ use crate::ops::seed::{
     seed_profile_from_profile,
 };
 
-const SEED_VERIFY_CHILD_KEY_NAMESPACE: &str = "tpm2-derive.verify";
-const SEED_VERIFY_CHILD_KEY_PATH: &str = "m/signature/default";
+const SEED_SIGNING_KEY_NAMESPACE: &str = "tpm2-derive.sign";
+const SEED_SIGNING_KEY_PATH: &str = "m/signature/default";
 
 impl From<AlgorithmArg> for Algorithm {
     fn from(value: AlgorithmArg) -> Self {
@@ -434,13 +435,25 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
             diagnostics,
             "sign is not wired for PRF-mode profiles yet",
         ),
-        Mode::Seed => unsupported_mode_operation(
-            json,
-            command,
-            profile.mode.resolved,
-            diagnostics,
-            "sign is not wired for seed-mode profiles yet",
-        ),
+        Mode::Seed => {
+            let backend =
+                SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+            match sign_seed_with_backend(&request, &profile, &backend, &HkdfSha256SeedDeriver) {
+                Ok((result, sign_diagnostics)) => {
+                    diagnostics.extend(sign_diagnostics);
+                    success_with_diagnostics(json, command, result, diagnostics)
+                }
+                Err(error) => failure(
+                    json,
+                    command,
+                    ErrorEnvelope {
+                        code: error.code().as_str().to_string(),
+                        message: error.to_string(),
+                    },
+                    diagnostics,
+                ),
+            }
+        }
     }
 }
 
@@ -594,6 +607,152 @@ where
     ))
 }
 
+fn sign_seed_with_backend<B, D>(
+    request: &SignRequest,
+    profile: &Profile,
+    backend: &B,
+    deriver: &D,
+) -> Result<(SeedSignOperationResult, Vec<crate::model::Diagnostic>)>
+where
+    B: SeedBackend,
+    D: crate::ops::seed::SeedSoftwareDeriver,
+{
+    if !profile.uses.contains(&UseCase::Sign) {
+        return Err(Error::Unsupported(format!(
+            "profile '{}' is not configured with sign use",
+            profile.name
+        )));
+    }
+
+    let input_bytes = load_sign_input(&request.input)?;
+    if input_bytes.is_empty() {
+        return Err(Error::Validation(
+            "sign input must not be empty".to_string(),
+        ));
+    }
+
+    let seed_request = seed_sign_open_request(profile)?;
+    let seed_plan = plan_open(&seed_request)?;
+    let digest = Sha256::digest(&input_bytes).to_vec();
+    let derived = open_and_derive(backend, deriver, &seed_request)?;
+    let diagnostics =
+        seed_sign_diagnostics(profile, &seed_plan.warnings, derived.expose_secret().len());
+
+    let (signature_bytes, signature_format) = match profile.algorithm {
+        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, derived.expose_secret())?,
+        Algorithm::P256 => sign_seed_p256(&input_bytes, derived.expose_secret(), profile)?,
+        Algorithm::Secp256k1 => sign_seed_secp256k1(&input_bytes, derived.expose_secret(), profile)?,
+    };
+
+    Ok((
+        SeedSignOperationResult {
+            profile: profile.clone(),
+            request: request.clone(),
+            mode: Mode::Seed,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            digest_hex: hex_encode(&digest),
+            input_bytes: input_bytes.len(),
+            signature_bytes: signature_bytes.len(),
+            signature_hex: hex_encode(&signature_bytes),
+            signature_format,
+        },
+        diagnostics,
+    ))
+}
+
+fn sign_seed_ed25519(
+    input_bytes: &[u8],
+    derived_seed: &[u8],
+) -> Result<(Vec<u8>, SeedSignatureFormat)> {
+    let seed_bytes: [u8; 32] = derived_seed.try_into().map_err(|_| {
+        Error::Internal(
+            "seed sign ed25519 derivation produced a non-32-byte seed unexpectedly".to_string(),
+        )
+    })?;
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
+    let signature = signing_key.sign(input_bytes);
+    Ok((signature.to_bytes().to_vec(), SeedSignatureFormat::Raw))
+}
+
+fn sign_seed_p256(
+    input_bytes: &[u8],
+    derived_seed: &[u8],
+    profile: &Profile,
+) -> Result<(Vec<u8>, SeedSignatureFormat)> {
+    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+        Error::Internal(format!(
+            "failed to materialize p256 seed signing key for profile '{}': {error}",
+            profile.name
+        ))
+    })?;
+    let signature: P256Signature = <P256SigningKey as p256::ecdsa::signature::Signer<P256Signature>>::sign(&signing_key, input_bytes);
+    Ok((signature.to_der().as_bytes().to_vec(), SeedSignatureFormat::Der))
+}
+
+fn sign_seed_secp256k1(
+    input_bytes: &[u8],
+    derived_seed: &[u8],
+    profile: &Profile,
+) -> Result<(Vec<u8>, SeedSignatureFormat)> {
+    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+        Error::Internal(format!(
+            "failed to materialize secp256k1 seed signing key for profile '{}': {error}",
+            profile.name
+        ))
+    })?;
+    let signature: K256Signature = <K256SigningKey as k256::ecdsa::signature::Signer<K256Signature>>::sign(&signing_key, input_bytes);
+    Ok((signature.to_der().as_bytes().to_vec(), SeedSignatureFormat::Der))
+}
+
+fn seed_sign_open_request(profile: &Profile) -> Result<SeedOpenRequest> {
+    Ok(SeedOpenRequest {
+        profile: seed_sign_profile(profile)?,
+        auth_source: SeedOpenAuthSource::None,
+        output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
+            spec: seed_sign_derivation_spec(profile.algorithm)?,
+            output_bytes: 32,
+        }),
+        require_fresh_unseal: true,
+        confirm_software_derivation: true,
+    })
+}
+
+fn seed_sign_profile(profile: &Profile) -> Result<SeedProfile> {
+    if profile.mode.resolved != Mode::Seed {
+        return Err(Error::Unsupported(format!(
+            "profile '{}' did not resolve to seed mode",
+            profile.name
+        )));
+    }
+
+    seed_profile_from_profile(profile)
+}
+
+fn seed_sign_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
+    seed_signing_key_derivation_spec(algorithm)
+}
+
+fn seed_sign_diagnostics(
+    profile: &Profile,
+    warnings: &[crate::model::Diagnostic],
+    derived_bytes: usize,
+) -> Vec<crate::model::Diagnostic> {
+    let mut diagnostics = warnings.to_vec();
+    diagnostics.push(crate::model::Diagnostic::info(
+        "seed-signer-derived",
+        format!(
+            "derived {} bytes of {:?} signer material from sealed seed using {} {}",
+            derived_bytes,
+            profile.algorithm,
+            SEED_SIGNING_KEY_NAMESPACE,
+            SEED_SIGNING_KEY_PATH,
+        ),
+    ));
+    diagnostics
+}
+
 fn verify_seed_with_backend<B, D>(
     request: &VerifyRequest,
     profile: &Profile,
@@ -620,8 +779,6 @@ where
         ));
     }
 
-    ensure_seed_verify_algorithm_supported(profile.algorithm)?;
-
     let input_bytes = load_input_bytes(&request.input, "verify input")?;
     let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
     if signature_bytes.is_empty() {
@@ -637,15 +794,35 @@ where
     let diagnostics =
         seed_verify_diagnostics(profile, &seed_plan.warnings, derived.expose_secret().len());
 
-    verify_seed_ed25519(
-        request,
-        profile,
-        &input_bytes,
-        &signature_bytes,
-        &digest,
-        derived.expose_secret(),
-        diagnostics,
-    )
+    match profile.algorithm {
+        Algorithm::Ed25519 => verify_seed_ed25519(
+            request,
+            profile,
+            &input_bytes,
+            &signature_bytes,
+            &digest,
+            derived.expose_secret(),
+            diagnostics,
+        ),
+        Algorithm::P256 => verify_seed_p256(
+            request,
+            profile,
+            &input_bytes,
+            &signature_bytes,
+            &digest,
+            derived.expose_secret(),
+            diagnostics,
+        ),
+        Algorithm::Secp256k1 => verify_seed_secp256k1(
+            request,
+            profile,
+            &input_bytes,
+            &signature_bytes,
+            &digest,
+            derived.expose_secret(),
+            diagnostics,
+        ),
+    }
 }
 
 fn verify_seed_ed25519(
@@ -685,6 +862,78 @@ fn verify_seed_ed25519(
     ))
 }
 
+fn verify_seed_p256(
+    request: &VerifyRequest,
+    profile: &Profile,
+    input_bytes: &[u8],
+    signature_bytes: &[u8],
+    digest: &[u8],
+    derived_seed: &[u8],
+    diagnostics: Vec<crate::model::Diagnostic>,
+) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
+    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+        Error::Internal(format!(
+            "failed to materialize p256 seed verifying key for profile '{}': {error}",
+            profile.name
+        ))
+    })?;
+    let verifying_key = signing_key.verifying_key();
+    let (signature, signature_format) = parse_p256_verify_signature(signature_bytes)?;
+    let verified = verifying_key.verify(input_bytes, &signature).is_ok();
+
+    Ok((
+        VerifyOperationResult {
+            profile: profile.clone(),
+            request: request.clone(),
+            mode: Mode::Seed,
+            verified,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            digest_hex: hex_encode(digest),
+            input_bytes: input_bytes.len(),
+            signature_bytes: signature_bytes.len(),
+            signature_format: VerifySignatureFormat::from(signature_format),
+        },
+        diagnostics,
+    ))
+}
+
+fn verify_seed_secp256k1(
+    request: &VerifyRequest,
+    profile: &Profile,
+    input_bytes: &[u8],
+    signature_bytes: &[u8],
+    digest: &[u8],
+    derived_seed: &[u8],
+    diagnostics: Vec<crate::model::Diagnostic>,
+) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
+    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+        Error::Internal(format!(
+            "failed to materialize secp256k1 seed verifying key for profile '{}': {error}",
+            profile.name
+        ))
+    })?;
+    let verifying_key = signing_key.verifying_key();
+    let (signature, signature_format) = parse_k256_verify_signature(signature_bytes)?;
+    let verified = k256::ecdsa::signature::Verifier::verify(verifying_key, input_bytes, &signature).is_ok();
+
+    Ok((
+        VerifyOperationResult {
+            profile: profile.clone(),
+            request: request.clone(),
+            mode: Mode::Seed,
+            verified,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            digest_hex: hex_encode(digest),
+            input_bytes: input_bytes.len(),
+            signature_bytes: signature_bytes.len(),
+            signature_format: VerifySignatureFormat::from(signature_format),
+        },
+        diagnostics,
+    ))
+}
+
 fn seed_verify_open_request(profile: &Profile) -> Result<SeedOpenRequest> {
     Ok(SeedOpenRequest {
         profile: seed_verify_profile(profile)?,
@@ -709,27 +958,24 @@ fn seed_verify_profile(profile: &Profile) -> Result<SeedProfile> {
     seed_profile_from_profile(profile)
 }
 
-fn ensure_seed_verify_algorithm_supported(algorithm: Algorithm) -> Result<()> {
-    match algorithm {
-        Algorithm::Ed25519 => Ok(()),
-        Algorithm::P256 => Err(Error::Unsupported(
-            "seed verify is not wired for p256 profiles yet; native mode remains the preferred path for p256 sign/verify workloads"
-                .to_string(),
-        )),
-        Algorithm::Secp256k1 => Err(Error::Unsupported(
-            "seed verify is not wired for secp256k1 profiles yet".to_string(),
-        )),
-    }
+fn seed_verify_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
+    seed_signing_key_derivation_spec(algorithm)
 }
 
-fn seed_verify_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
-    ensure_seed_verify_algorithm_supported(algorithm)?;
+/// Shared derivation spec for both sign and verify operations.
+/// Sign and verify must derive the same key to round-trip.
+fn seed_signing_key_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
+    let (algo_name, output_kind) = match algorithm {
+        Algorithm::Ed25519 => ("ed25519", OutputKind::Ed25519Seed),
+        Algorithm::P256 => ("p256", OutputKind::P256Scalar),
+        Algorithm::Secp256k1 => ("secp256k1", OutputKind::Secp256k1Scalar),
+    };
 
     Ok(DerivationSpec::V1(DerivationSpecV1::software_child_key(
-        SEED_VERIFY_CHILD_KEY_NAMESPACE,
-        "ed25519",
-        SEED_VERIFY_CHILD_KEY_PATH,
-        OutputKind::Ed25519Seed,
+        SEED_SIGNING_KEY_NAMESPACE,
+        algo_name,
+        SEED_SIGNING_KEY_PATH,
+        output_kind,
     )?))
 }
 
@@ -745,8 +991,8 @@ fn seed_verify_diagnostics(
             "derived {} bytes of {:?} verifier material from sealed seed using {} {}",
             derived_bytes,
             profile.algorithm,
-            SEED_VERIFY_CHILD_KEY_NAMESPACE,
-            SEED_VERIFY_CHILD_KEY_PATH,
+            SEED_SIGNING_KEY_NAMESPACE,
+            SEED_SIGNING_KEY_PATH,
         ),
     ));
     diagnostics
@@ -794,6 +1040,26 @@ struct SignOperationResult {
     output_path: PathBuf,
     signature_bytes_written: Option<usize>,
     plan: NativeSignPlan,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SeedSignOperationResult {
+    profile: Profile,
+    request: SignRequest,
+    mode: Mode,
+    digest_algorithm: DigestAlgorithm,
+    digest_hex: String,
+    input_bytes: usize,
+    signature_bytes: usize,
+    signature_hex: String,
+    signature_format: SeedSignatureFormat,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum SeedSignatureFormat {
+    Raw,
+    Der,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Eq, PartialEq)]
@@ -1255,6 +1521,23 @@ fn parse_p256_verify_signature(
     ))
 }
 
+fn parse_k256_verify_signature(
+    signature_bytes: &[u8],
+) -> Result<(K256Signature, VerifySignatureFormat)> {
+    if let Ok(signature) = K256Signature::from_der(signature_bytes) {
+        return Ok((signature, VerifySignatureFormat::Der));
+    }
+
+    if let Ok(signature) = K256Signature::from_slice(signature_bytes) {
+        return Ok((signature, VerifySignatureFormat::P1363));
+    }
+
+    Err(Error::Validation(
+        "verify signature must be either ASN.1 DER ECDSA or 64-byte P1363 for secp256k1"
+            .to_string(),
+    ))
+}
+
 fn parse_ed25519_verify_signature(
     signature_bytes: &[u8],
 ) -> Result<(Ed25519Signature, VerifySignatureFormat)> {
@@ -1377,7 +1660,7 @@ mod tests {
     use std::cell::RefCell;
 
     use clap::Parser as _;
-    use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
+    use ed25519_dalek::SigningKey as Ed25519SigningKey;
     use p256::ecdsa::SigningKey as P256SigningKey;
     use p256::pkcs8::EncodePublicKey as _;
     use secrecy::SecretBox;
@@ -1840,63 +2123,411 @@ mod tests {
         }));
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "seed-verifier-derived"
-                && diagnostic.message.contains(SEED_VERIFY_CHILD_KEY_NAMESPACE)
+                && diagnostic.message.contains(SEED_SIGNING_KEY_NAMESPACE)
         }));
     }
 
     #[test]
-    fn seed_verify_keeps_p256_error_explicit() {
+    fn seed_verify_supports_p256_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(state_root.path(), Algorithm::P256, vec![UseCase::Verify]);
-        let error = verify_seed_with_backend(
+        let profile = seed_profile(state_root.path(), Algorithm::P256, vec![UseCase::Sign, UseCase::Verify]);
+        let backend = FakeSeedBackend::new(&[0x55; 32]);
+
+        // Sign a message first to get valid signature material
+        let message = b"hello from seed p256 verify".to_vec();
+        let seed_request = seed_sign_open_request(&profile).expect("seed sign request");
+        let derivation = match &seed_request.output {
+            SeedOpenOutput::DerivedBytes(request) => request.clone(),
+            SeedOpenOutput::RawSeed => unreachable!("seed sign uses derived bytes"),
+        };
+        let derived = HkdfSha256SeedDeriver
+            .derive(&SecretBox::new(Box::new(vec![0x55; 32])), &derivation)
+            .expect("derived seed");
+        let (signature, _format) = sign_seed_p256(&message, derived.expose_secret(), &profile)
+            .expect("seed p256 sign");
+
+        let input_path = state_root.path().join("input.bin");
+        let signature_path = state_root.path().join("signature.der");
+        fs::write(&input_path, &message).expect("input file");
+        fs::write(&signature_path, &signature).expect("signature file");
+
+        let (result, diagnostics) = verify_seed_with_backend(
             &VerifyRequest {
                 profile: profile.name.clone(),
-                input: InputSource::Path {
-                    path: state_root.path().join("input.bin"),
-                },
+                input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
-                    path: state_root.path().join("signature.bin"),
+                    path: signature_path,
                 },
             },
             &profile,
-            &FakeSeedBackend::new(&[0x55; 32]),
+            &backend,
             &HkdfSha256SeedDeriver,
         )
-        .expect_err("seed p256 should stay explicit unsupported");
+        .expect("seed p256 verify result");
 
-        assert!(
-            matches!(error, Error::Unsupported(message) if message.contains("native mode remains the preferred path"))
-        );
+        assert!(result.verified);
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.signature_format, VerifySignatureFormat::Der);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "seed-verifier-derived"
+                && diagnostic.message.contains(SEED_SIGNING_KEY_NAMESPACE)
+        }));
     }
 
     #[test]
-    fn sign_keeps_explicit_unsupported_result_for_seed_mode() {
+    fn seed_sign_succeeds_for_ed25519_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = native_profile(state_root.path(), Mode::Seed, vec![UseCase::Sign]);
-        profile.persist().expect("persist profile");
+        let profile = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Sign]);
+        let backend = FakeSeedBackend::new(&[0x42; 32]);
+
+        let message = b"hello from seed ed25519 sign".to_vec();
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
+
+        let (result, diagnostics) = sign_seed_with_backend(
+            &SignRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed ed25519 sign result");
+
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.signature_format, SeedSignatureFormat::Raw);
+        assert_eq!(result.signature_bytes, 64);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "seed-signer-derived"
+                && diagnostic.message.contains(SEED_SIGNING_KEY_NAMESPACE)
+        }));
+    }
+
+    #[test]
+    fn seed_sign_succeeds_for_p256_profiles() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(state_root.path(), Algorithm::P256, vec![UseCase::Sign]);
+        let backend = FakeSeedBackend::new(&[0x42; 32]);
+
+        let message = b"hello from seed p256 sign".to_vec();
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
+
+        let (result, _diagnostics) = sign_seed_with_backend(
+            &SignRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed p256 sign result");
+
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.signature_format, SeedSignatureFormat::Der);
+        assert!(result.signature_bytes > 0);
+    }
+
+    #[test]
+    fn seed_sign_succeeds_for_secp256k1_profiles() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(state_root.path(), Algorithm::Secp256k1, vec![UseCase::Sign]);
+        let backend = FakeSeedBackend::new(&[0x42; 32]);
+
+        let message = b"hello from seed secp256k1 sign".to_vec();
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
+
+        let (result, _diagnostics) = sign_seed_with_backend(
+            &SignRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secp256k1 sign result");
+
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.signature_format, SeedSignatureFormat::Der);
+        assert!(result.signature_bytes > 0);
+    }
+
+    #[test]
+    fn seed_sign_rejects_profiles_without_sign_use() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Verify]);
+        let backend = FakeSeedBackend::new(&[0x42; 32]);
 
         let input_path = state_root.path().join("input.bin");
-        fs::write(&input_path, b"seed sign").expect("input file");
+        fs::write(&input_path, b"test").expect("input file");
 
-        let output = run(Cli {
-            json: false,
-            command: Command::Sign(SignArgs {
+        let error = sign_seed_with_backend(
+            &SignRequest {
                 profile: profile.name.clone(),
-                input: input_path.display().to_string(),
-                state_dir: Some(state_root.path().to_path_buf()),
-            }),
-        })
-        .expect("cli output");
-        let value: Value = serde_json::from_str(&output).expect("json output");
+                input: InputSource::Path { path: input_path },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect_err("seed sign without sign use should fail");
 
-        assert_eq!(value["ok"], Value::Bool(false));
-        assert_eq!(
-            value["error"]["code"],
-            Value::String("unsupported".to_string())
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("sign use")));
+    }
+
+    #[test]
+    fn seed_sign_then_verify_round_trip_ed25519() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(
+            state_root.path(),
+            Algorithm::Ed25519,
+            vec![UseCase::Sign, UseCase::Verify],
         );
-        assert!(value["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("seed-mode profiles"));
+        let backend = FakeSeedBackend::new(&[0x77; 32]);
+        let message = b"round-trip ed25519 test".to_vec();
+
+        // Sign
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
+        let (sign_result, _) = sign_seed_with_backend(
+            &SignRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path {
+                    path: input_path.clone(),
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed ed25519 sign");
+
+        // Decode hex signature
+        let sig_bytes = hex_decode_test(&sign_result.signature_hex);
+        let signature_path = state_root.path().join("signature.raw");
+        fs::write(&signature_path, &sig_bytes).expect("signature file");
+
+        // Verify
+        let (verify_result, _) = verify_seed_with_backend(
+            &VerifyRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path {
+                    path: signature_path,
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed ed25519 verify");
+
+        assert!(verify_result.verified);
+    }
+
+    #[test]
+    fn seed_sign_then_verify_round_trip_p256() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(
+            state_root.path(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
+        let backend = FakeSeedBackend::new(&[0x77; 32]);
+        let message = b"round-trip p256 test".to_vec();
+
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
+        let (sign_result, _) = sign_seed_with_backend(
+            &SignRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path {
+                    path: input_path.clone(),
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed p256 sign");
+
+        let sig_bytes = hex_decode_test(&sign_result.signature_hex);
+        let signature_path = state_root.path().join("signature.der");
+        fs::write(&signature_path, &sig_bytes).expect("signature file");
+
+        let (verify_result, _) = verify_seed_with_backend(
+            &VerifyRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path {
+                    path: signature_path,
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed p256 verify");
+
+        assert!(verify_result.verified);
+    }
+
+    #[test]
+    fn seed_sign_then_verify_round_trip_secp256k1() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(
+            state_root.path(),
+            Algorithm::Secp256k1,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
+        let backend = FakeSeedBackend::new(&[0x77; 32]);
+        let message = b"round-trip secp256k1 test".to_vec();
+
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
+        let (sign_result, _) = sign_seed_with_backend(
+            &SignRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path {
+                    path: input_path.clone(),
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secp256k1 sign");
+
+        let sig_bytes = hex_decode_test(&sign_result.signature_hex);
+        let signature_path = state_root.path().join("signature.der");
+        fs::write(&signature_path, &sig_bytes).expect("signature file");
+
+        let (verify_result, _) = verify_seed_with_backend(
+            &VerifyRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path {
+                    path: signature_path,
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secp256k1 verify");
+
+        assert!(verify_result.verified);
+    }
+
+    #[test]
+    fn seed_verify_rejects_wrong_message_p256() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(
+            state_root.path(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
+        let backend = FakeSeedBackend::new(&[0x77; 32]);
+
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, b"original message").expect("input file");
+        let (sign_result, _) = sign_seed_with_backend(
+            &SignRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path {
+                    path: input_path.clone(),
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed p256 sign");
+
+        let sig_bytes = hex_decode_test(&sign_result.signature_hex);
+        let signature_path = state_root.path().join("signature.der");
+        fs::write(&signature_path, &sig_bytes).expect("signature file");
+
+        // Write a different message
+        fs::write(&input_path, b"tampered message").expect("tampered input");
+
+        let (verify_result, _) = verify_seed_with_backend(
+            &VerifyRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path {
+                    path: signature_path,
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed p256 verify");
+
+        assert!(!verify_result.verified);
+    }
+
+    #[test]
+    fn seed_verify_supports_secp256k1_profiles() {
+        let state_root = tempdir().expect("state root");
+        let profile = seed_profile(
+            state_root.path(),
+            Algorithm::Secp256k1,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
+        let backend = FakeSeedBackend::new(&[0x55; 32]);
+
+        let message = b"hello from seed secp256k1 verify".to_vec();
+        let seed_request = seed_sign_open_request(&profile).expect("seed sign request");
+        let derivation = match &seed_request.output {
+            SeedOpenOutput::DerivedBytes(request) => request.clone(),
+            SeedOpenOutput::RawSeed => unreachable!("seed sign uses derived bytes"),
+        };
+        let derived = HkdfSha256SeedDeriver
+            .derive(&SecretBox::new(Box::new(vec![0x55; 32])), &derivation)
+            .expect("derived seed");
+        let (signature, _format) = sign_seed_secp256k1(&message, derived.expose_secret(), &profile)
+            .expect("seed secp256k1 sign");
+
+        let input_path = state_root.path().join("input.bin");
+        let signature_path = state_root.path().join("signature.der");
+        fs::write(&input_path, &message).expect("input file");
+        fs::write(&signature_path, &signature).expect("signature file");
+
+        let (result, diagnostics) = verify_seed_with_backend(
+            &VerifyRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path {
+                    path: signature_path,
+                },
+            },
+            &profile,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secp256k1 verify result");
+
+        assert!(result.verified);
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.signature_format, VerifySignatureFormat::Der);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "seed-verifier-derived"
+                && diagnostic.message.contains(SEED_SIGNING_KEY_NAMESPACE)
+        }));
+    }
+
+    fn hex_decode_test(hex: &str) -> Vec<u8> {
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
+            })
+            .collect()
     }
 }

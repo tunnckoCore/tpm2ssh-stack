@@ -735,6 +735,41 @@ fn seed_scalar_retry_bytes(seed_bytes: &[u8; 32], algorithm: Algorithm, counter:
     hasher.finalize().into()
 }
 
+/// Standalone EC scalar validation that doesn't require a `Profile` reference.
+/// Used by the CLI seed sign/verify paths.
+pub fn seed_valid_ec_scalar_bytes_standalone(
+    derived_secret: &[u8],
+    algorithm: Algorithm,
+) -> Result<[u8; 32]> {
+    let seed_bytes: [u8; 32] = derived_secret.try_into().map_err(|_| {
+        Error::Internal(format!(
+            "seed derivation unexpectedly produced {} bytes instead of 32",
+            derived_secret.len()
+        ))
+    })?;
+
+    let is_valid: Box<dyn Fn(&[u8]) -> bool> = match algorithm {
+        Algorithm::P256 => Box::new(|candidate: &[u8]| p256::SecretKey::from_slice(candidate).is_ok()),
+        Algorithm::Secp256k1 => Box::new(|candidate: &[u8]| k256::SecretKey::from_slice(candidate).is_ok()),
+        Algorithm::Ed25519 => return Ok(seed_bytes),
+    };
+
+    if is_valid(&seed_bytes) {
+        return Ok(seed_bytes);
+    }
+
+    for counter in 1..=SEED_SCALAR_RETRY_LIMIT {
+        let candidate = seed_scalar_retry_bytes(&seed_bytes, algorithm, counter);
+        if is_valid(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(Error::Internal(format!(
+        "seed derivation could not produce a valid {algorithm:?} scalar after {SEED_SCALAR_RETRY_LIMIT} retries"
+    )))
+}
+
 fn materialize_native_setup<R>(profile: &mut Profile, runner: &R) -> Result<()>
 where
     R: CommandRunner,
