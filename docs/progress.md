@@ -102,8 +102,28 @@ _As of 2026-04-20._
 - `cargo check` passed
 
 ## Next cycle targets
-1. broaden verify coverage further
-2. broaden ssh-agent coverage further
-3. add richer public-key export format coverage for seed/OpenSSH where still partial
-4. continue migrating `tpm2ssh` off the legacy flow
-5. decide whether to hide or implement remaining placeholders (`encrypt`, `decrypt`, unsupported mode combinations)
+1. remove `tpm2ssh` from active workspace membership and restore it to its earlier standalone state
+2. add seed-mode `sign` / `verify` for `ed25519`, `p256`, and `secp256k1`
+3. simplify recovery import/export UX:
+   - prefer `import` over `recovery import`
+   - reduce confirmation flags to `--confirm` AND `--confirm-phrase` - both required
+   - make `--reason` optional metadata only
+4. enforce use-case boundaries:
+   - `derive` should fail for profiles without `use=derive`
+   - `ssh-agent add` should require ssh/ssh-agent use, not derive use
+   - add tests for both directions
+5. clean `docs/TPM2_DERIVE_COMBINATIONS.md`:
+   - add `Recovery Import` column
+   - remove user-specific PRF troubleshooting AND the meta-talk
+   - make `seed` the default practical framing
+6. review state layout and on-disk permissions:
+   - document exactly what is stored under `profiles/`, `objects/`, `exports/`
+   - tighten permissions where appropriate
+7. decide and implement SSH UX direction:
+   - rename toward `ssh-agent add`, or
+   - fold agent-loading UX into another command if that stays coherent
+8. implement `encrypt` / `decrypt`
+9. design and add `keygen`:
+   - accept derived material from our `derive` command, or direct input
+   - emit secret/public keypair with format selection, and optional output location
+   - optionally support a structured envelope from `derive`, but do not pretend stdin provenance can be strongly enforced without extra cryptographic design
