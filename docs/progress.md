@@ -11,22 +11,29 @@ _As of 2026-04-20._
 - `setup --mode seed`: seals a seed and persists seed metadata/blob paths.
 - `derive`: works for persisted `prf` and `seed` profiles.
 - `sign`: native sign executes when native setup state exists; otherwise returns a concrete planned result.
-- `verify`: native verify now works for native `p256` profiles.
-- `export --kind public-key`: works for native profiles.
+- `verify`:
+  - native `p256` works
+  - seed `ed25519` works
+- `export --kind public-key`:
+  - native `p256` works
+  - seed `ed25519` works
+  - seed `p256` works
+  - seed `secp256k1` works
+  - formats now include `spki-der`, `spki-pem`, `spki-hex`, and `openssh` where wired
 - `export --kind recovery-bundle`: works for seed profiles with explicit confirmations and explicit output path.
-- `ssh agent add`: seed-mode `ed25519` slice is wired.
-- `tpm2ssh`: now has a managed flow using `tpm2-derive` for safer setup/login paths.
-
-### Library-only but usable internals
-- seed recovery-bundle import / restore path exists in library code and reseals imported seed material.
+- `recovery import`: CLI path now exists via `tpm2-derive recovery import`.
+- `ssh agent add`:
+  - seed `ed25519` works
+  - seed `p256` works
+- `tpm2ssh`: now has managed flows using `tpm2-derive` and now covers managed seed P-256 SSH support too.
 
 ### Notes
 - `tpm2-derive/src/ops.rs` is **not** orphaned; it is the real `crate::ops` module root referenced by `tpm2-derive/src/lib.rs`.
+- SSH in this project is **not** Ed25519-only. P-256 is a valid SSH/Git flow too.
 
 ### Still missing / partial
-- CLI surface for recovery import / restore
-- broader verify coverage beyond native `p256`
-- broader `ssh agent add` coverage beyond seed `ed25519`
+- broader verify coverage beyond native `p256` and seed `ed25519`
+- broader `ssh agent add` coverage beyond seed `ed25519` / seed `p256`
 - richer TPM auth flows
 - PRF/seed sign support
 - encrypt/decrypt
@@ -41,13 +48,6 @@ _As of 2026-04-20._
 - `9542acd` — seed recovery-bundle export
 - `3f11ad8` — seed setup sealing
 
-### Result after merge
-- persisted profiles now carry real backend metadata instead of scaffold-only state
-- `setup` is no longer metadata-only for `native`, `prf`, and `seed`
-- `derive` can use persisted PRF roots and sealed-seed state
-- native sign can execute against persisted native setup state
-- seed recovery export exists as an explicit high-friction path
-
 ### Validation
 - `cargo test -p tpm2-derive` passed
 - latest pass count seen in this cycle: `54 tests`
@@ -60,13 +60,6 @@ _As of 2026-04-20._
 - `e7b9a73` — native verify vertical slice
 - `e9971b0` — seed-mode ssh-agent ed25519 slice
 - `d402c49` — `tpm2ssh` managed flow via `tpm2-derive`
-
-### Result after merge
-- native verify is now usable for the first real end-to-end verify path
-- seed-mode ssh-agent add exists for `ed25519`
-- recovery restore is now possible at library level
-- `tpm2ssh` started consuming `tpm2-derive` instead of relying only on legacy direct TPM handling
-- `src/ops.rs` concern was checked and clarified: it is intentional module structure, not dead/orphan code
 
 ### Validation
 - `cargo test -p tpm2-derive` passed
@@ -81,19 +74,36 @@ _As of 2026-04-20._
 - user-facing combinations guide: `docs/TPM2_DERIVE_COMBINATIONS.md`
 - troubleshooting note for the common PRF-under-sudo TCTI/Tabrmd failure mode
 
-### Result after change
-- `tpm2-derive --help` is now much more informative
-- subcommand help now explains what flags mean instead of showing bare names only
-- there is now a user-friendly matrix explaining which algorithm/mode/use combinations currently make sense
-- the PRF failure mode the user hit is documented as a transport/TCTI environment problem, not just a generic mode mismatch
-
 ### Validation
 - `cargo test -p tpm2-derive` passed
 - verified help output by building with a temporary cargo target dir and checking `--help`
 
+## Cycle 4/5 — 2026-04-20
+
+### Merged this cycle
+- `6970853` — seed-mode public key export
+- `1aafdd7` — public key export formats
+- `1bf76e6` — managed seed P-256 SSH support
+- `d39e517` — p256 SSH/signing docs clarification
+- `805d59f` — seed ed25519 verify support
+- `ec4ae63` — recovery import CLI path
+
+### Result after merge
+- seed-mode public export is real for `ed25519`, `p256`, and `secp256k1`
+- export formats now support binary DER plus armor/hex variants
+- direct ssh-agent flow now covers seed `p256` in addition to seed `ed25519`
+- recovery import is no longer library-only; it has a CLI command path
+- docs/help now stop implying SSH means Ed25519 only
+
+### Validation
+- `cargo test -p tpm2-derive` passed
+- latest pass count seen in this cycle: `78 tests`
+- `cargo test -p tpm2ssh` passed (`4 tests`)
+- `cargo check` passed
+
 ## Next cycle targets
-1. add CLI command path for recovery import / restore
-2. expand `ssh agent add` beyond seed `ed25519`
-3. expand verify coverage and tighten native UX
+1. broaden verify coverage further
+2. broaden ssh-agent coverage further
+3. add richer public-key export format coverage for seed/OpenSSH where still partial
 4. continue migrating `tpm2ssh` off the legacy flow
-5. decide whether to hide or implement remaining placeholders (`encrypt`, `decrypt`, other unsupported mode combinations)
+5. decide whether to hide or implement remaining placeholders (`encrypt`, `decrypt`, unsupported mode combinations)

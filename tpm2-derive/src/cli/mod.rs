@@ -1380,7 +1380,6 @@ mod tests {
 
     use clap::Parser as _;
     use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
-    use p256::ecdsa::signature::Signer as _;
     use p256::ecdsa::SigningKey as P256SigningKey;
     use p256::pkcs8::EncodePublicKey as _;
     use secrecy::SecretBox;
