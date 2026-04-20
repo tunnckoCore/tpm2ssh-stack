@@ -13,9 +13,14 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::SigningKey as Ed25519SigningKey;
+use p256::pkcs8::EncodePublicKey;
+use secrecy::ExposeSecret;
+use sha2::{Digest as _, Sha256};
 use tempfile::Builder as TempfileBuilder;
 
 use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessCommandRunner};
+use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CapabilityReport, ExportArtifact, ExportFormat, ExportKind, ExportRequest,
@@ -32,23 +37,29 @@ use crate::ops::native::{
     NativeSetupRequest,
 };
 use crate::ops::prf::{
-    PrfRootLayout, SubprocessPrfBackend, PRF_CONTEXT_PATH_METADATA_KEY,
-    PRF_PARENT_CONTEXT_PATH_METADATA_KEY, PRF_PRIVATE_PATH_METADATA_KEY,
-    PRF_PUBLIC_PATH_METADATA_KEY,
+    PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
+    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY, PrfRootLayout,
+    SubprocessPrfBackend,
 };
 use crate::ops::seed::{
-    export_recovery_bundle as export_seed_recovery_bundle, parse_recovery_bundle_json,
-    restore_recovery_bundle as restore_seed_recovery_bundle, seed_profile_from_profile,
-    SeedBackend, SeedCreateRequest, SeedCreateSource, SeedExportDestination, SeedExportFormat,
-    SeedExportRequest, SeedOpenAuthSource, SeedProfile, SeedRecoveryBundleV1,
-    SeedRecoveryImportRequest, SeedStorageKind, SubprocessSeedBackend, MIN_SEED_BYTES,
-    SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY, SEED_DERIVATION_KDF_METADATA_KEY,
-    SEED_OBJECT_LABEL_METADATA_KEY, SEED_PRIVATE_BLOB_PATH_METADATA_KEY,
-    SEED_PUBLIC_BLOB_PATH_METADATA_KEY, SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY,
-    SEED_STORAGE_KIND_METADATA_KEY,
+    HkdfSha256SeedDeriver, MIN_SEED_BYTES, SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY,
+    SEED_DERIVATION_KDF_METADATA_KEY, SEED_OBJECT_LABEL_METADATA_KEY,
+    SEED_PRIVATE_BLOB_PATH_METADATA_KEY, SEED_PUBLIC_BLOB_PATH_METADATA_KEY,
+    SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY, SEED_STORAGE_KIND_METADATA_KEY, SeedBackend,
+    SeedCreateRequest, SeedCreateSource, SeedExportDestination, SeedExportFormat,
+    SeedExportRequest, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest, SeedProfile,
+    SeedRecoveryBundleV1, SeedRecoveryImportRequest, SeedSoftwareDeriver, SeedStorageKind,
+    SoftwareSeedDerivationRequest, SubprocessSeedBackend,
+    export_recovery_bundle as export_seed_recovery_bundle, open_and_derive,
+    parse_recovery_bundle_json, restore_recovery_bundle as restore_seed_recovery_bundle,
+    seed_profile_from_profile,
 };
 
 const DEFAULT_SETUP_SEED_BYTES: usize = MIN_SEED_BYTES;
+const SEED_PUBLIC_KEY_NAMESPACE: &str = "tpm2-derive.export";
+const SEED_PUBLIC_KEY_PATH: &str = "m/public-key/default";
+const SEED_SCALAR_RETRY_DOMAIN: &[u8] = b"tpm2-derive\0seed-scalar-retry\0v1";
+const SEED_SCALAR_RETRY_LIMIT: u32 = 16;
 
 pub fn inspect(probe: &dyn CapabilityProbe, request: &InspectRequest) -> CapabilityReport {
     probe.detect(request.algorithm, &normalize_uses(request.uses.clone()))
@@ -384,10 +395,10 @@ fn export_public_key(profile: &Profile, requested_output: Option<&Path>) -> Resu
                 )));
             }
 
-            Err(Error::Unsupported(format!(
-                "profile '{}' resolved to seed mode; export public-key is not wired in this vertical slice",
-                profile.name
-            )))
+            let backend =
+                SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+            let deriver = HkdfSha256SeedDeriver;
+            export_seed_public_key_with_backend(profile, requested_output, &backend, &deriver)
         }
     }
 }
@@ -447,6 +458,196 @@ where
             bytes_written,
         },
     })
+}
+
+fn export_seed_public_key_with_backend<B, D>(
+    profile: &Profile,
+    requested_output: Option<&Path>,
+    backend: &B,
+    deriver: &D,
+) -> Result<ExportResult>
+where
+    B: SeedBackend,
+    D: SeedSoftwareDeriver,
+{
+    let seed_profile = seed_profile_from_profile(profile)?;
+    let derived = open_and_derive(
+        backend,
+        deriver,
+        &SeedOpenRequest {
+            profile: seed_profile,
+            auth_source: SeedOpenAuthSource::None,
+            output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
+                spec: seed_public_key_derivation_spec(profile)?,
+                output_bytes: 32,
+            }),
+            require_fresh_unseal: true,
+            confirm_software_derivation: true,
+        },
+    )?;
+
+    let public_key = seed_public_key_spki_der(profile, derived.expose_secret())?;
+    let destination = resolve_public_key_output_path(profile, requested_output)?;
+    write_public_key_output(&destination, &public_key)?;
+
+    Ok(ExportResult {
+        profile: profile.name.clone(),
+        mode: profile.mode.resolved,
+        kind: ExportKind::PublicKey,
+        artifact: ExportArtifact {
+            format: ExportFormat::SpkiDer,
+            path: destination,
+            bytes_written: public_key.len(),
+        },
+    })
+}
+
+fn seed_public_key_derivation_spec(profile: &Profile) -> Result<DerivationSpec> {
+    match profile.algorithm {
+        Algorithm::Ed25519
+            if profile
+                .uses
+                .iter()
+                .any(|use_case| matches!(use_case, UseCase::Ssh | UseCase::SshAgent)) =>
+        {
+            crate::ops::ssh::ssh_ed25519_derivation_spec()
+        }
+        Algorithm::Ed25519 => seed_software_child_key_spec("ed25519", OutputKind::Ed25519Seed),
+        Algorithm::Secp256k1 => {
+            seed_software_child_key_spec("secp256k1", OutputKind::Secp256k1Scalar)
+        }
+        Algorithm::P256 => seed_software_child_key_spec("p256", OutputKind::P256Scalar),
+    }
+}
+
+fn seed_software_child_key_spec(
+    algorithm: &str,
+    output_kind: OutputKind,
+) -> Result<DerivationSpec> {
+    Ok(DerivationSpec::V1(DerivationSpecV1::software_child_key(
+        SEED_PUBLIC_KEY_NAMESPACE,
+        algorithm,
+        SEED_PUBLIC_KEY_PATH,
+        output_kind,
+    )?))
+}
+
+fn seed_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
+    match profile.algorithm {
+        Algorithm::Ed25519 => seed_ed25519_public_key_spki_der(profile, derived_secret),
+        Algorithm::Secp256k1 => seed_secp256k1_public_key_spki_der(profile, derived_secret),
+        Algorithm::P256 => seed_p256_public_key_spki_der(profile, derived_secret),
+    }
+}
+
+fn seed_ed25519_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
+    let seed_bytes = seed_secret_bytes(profile, derived_secret)?;
+    let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
+    signing_key
+        .verifying_key()
+        .to_public_key_der()
+        .map(|document| document.as_bytes().to_vec())
+        .map_err(|error| {
+            Error::Internal(format!(
+                "failed to encode ed25519 seed public key for profile '{}': {error}",
+                profile.name
+            ))
+        })
+}
+
+fn seed_secp256k1_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
+    let scalar_bytes = seed_valid_ec_scalar_bytes(profile, derived_secret, |candidate| {
+        k256::SecretKey::from_slice(candidate).is_ok()
+    })?;
+    let secret_key = k256::SecretKey::from_slice(&scalar_bytes).map_err(|error| {
+        Error::Internal(format!(
+            "failed to materialize secp256k1 seed secret key for profile '{}': {error}",
+            profile.name
+        ))
+    })?;
+
+    secret_key
+        .public_key()
+        .to_public_key_der()
+        .map(|document| document.as_bytes().to_vec())
+        .map_err(|error| {
+            Error::Internal(format!(
+                "failed to encode secp256k1 seed public key for profile '{}': {error}",
+                profile.name
+            ))
+        })
+}
+
+fn seed_p256_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
+    let scalar_bytes = seed_valid_ec_scalar_bytes(profile, derived_secret, |candidate| {
+        p256::SecretKey::from_slice(candidate).is_ok()
+    })?;
+    let secret_key = p256::SecretKey::from_slice(&scalar_bytes).map_err(|error| {
+        Error::Internal(format!(
+            "failed to materialize p256 seed secret key for profile '{}': {error}",
+            profile.name
+        ))
+    })?;
+
+    secret_key
+        .public_key()
+        .to_public_key_der()
+        .map(|document| document.as_bytes().to_vec())
+        .map_err(|error| {
+            Error::Internal(format!(
+                "failed to encode p256 seed public key for profile '{}': {error}",
+                profile.name
+            ))
+        })
+}
+
+fn seed_secret_bytes(profile: &Profile, derived_secret: &[u8]) -> Result<[u8; 32]> {
+    derived_secret.try_into().map_err(|_| {
+        Error::Internal(format!(
+            "seed public-key derivation for profile '{}' unexpectedly produced {} bytes instead of 32",
+            profile.name,
+            derived_secret.len()
+        ))
+    })
+}
+
+fn seed_valid_ec_scalar_bytes<F>(
+    profile: &Profile,
+    derived_secret: &[u8],
+    is_valid: F,
+) -> Result<[u8; 32]>
+where
+    F: Fn(&[u8]) -> bool,
+{
+    let seed_bytes = seed_secret_bytes(profile, derived_secret)?;
+    if is_valid(&seed_bytes) {
+        return Ok(seed_bytes);
+    }
+
+    for counter in 1..=SEED_SCALAR_RETRY_LIMIT {
+        let candidate = seed_scalar_retry_bytes(&seed_bytes, profile.algorithm, counter);
+        if is_valid(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err(Error::Internal(format!(
+        "seed public-key derivation could not produce a valid {:?} scalar for profile '{}' after {} retries",
+        profile.algorithm, profile.name, SEED_SCALAR_RETRY_LIMIT
+    )))
+}
+
+fn seed_scalar_retry_bytes(seed_bytes: &[u8; 32], algorithm: Algorithm, counter: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SEED_SCALAR_RETRY_DOMAIN);
+    hasher.update(match algorithm {
+        Algorithm::Ed25519 => b"ed25519".as_slice(),
+        Algorithm::Secp256k1 => b"secp256k1".as_slice(),
+        Algorithm::P256 => b"p256".as_slice(),
+    });
+    hasher.update(counter.to_be_bytes());
+    hasher.update(seed_bytes);
+    hasher.finalize().into()
 }
 
 fn materialize_native_setup<R>(profile: &mut Profile, runner: &R) -> Result<()>
@@ -1048,7 +1249,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use secrecy::ExposeSecret;
-    use sha2::Digest as _;
 
     use crate::backend::{
         CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, HeuristicProbe,
@@ -1360,6 +1560,138 @@ mod tests {
         );
 
         fs::remove_dir_all(root_dir).expect("temporary native export state should be removed");
+    }
+
+    #[test]
+    fn export_writes_seed_ed25519_public_key_for_ssh_profile() {
+        let root_dir = unique_temp_path("export-seed-ed25519-public-key");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let profile = Profile::new(
+            "seed-ed25519".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::SshAgent],
+            ModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            state_layout,
+        );
+        let seed = vec![0x11; 32];
+        let output_path = root_dir.join("exports").join("seed-ed25519.der");
+
+        let result = export_seed_public_key_with_backend(
+            &profile,
+            Some(output_path.as_path()),
+            &FakeSeedExportBackend::new(seed.clone()),
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed ed25519 export should succeed");
+
+        let expected = expected_seed_public_key_der(
+            &seed,
+            crate::ops::ssh::ssh_ed25519_derivation_spec().expect("ssh ed25519 spec"),
+            Algorithm::Ed25519,
+        );
+
+        assert_eq!(result.profile, "seed-ed25519");
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.kind, ExportKind::PublicKey);
+        assert_eq!(result.artifact.format, ExportFormat::SpkiDer);
+        assert_eq!(
+            fs::read(&result.artifact.path).expect("ed25519 export output"),
+            expected
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary ed25519 export state should be removed");
+    }
+
+    #[test]
+    fn export_writes_seed_secp256k1_public_key() {
+        let root_dir = unique_temp_path("export-seed-secp256k1-public-key");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let profile = Profile::new(
+            "seed-secp256k1".to_string(),
+            Algorithm::Secp256k1,
+            vec![UseCase::Derive],
+            ModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            state_layout,
+        );
+        let seed = vec![0x22; 32];
+        let output_path = root_dir.join("exports").join("seed-secp256k1.der");
+
+        let result = export_seed_public_key_with_backend(
+            &profile,
+            Some(output_path.as_path()),
+            &FakeSeedExportBackend::new(seed.clone()),
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secp256k1 export should succeed");
+
+        let expected = expected_seed_public_key_der(
+            &seed,
+            seed_public_key_derivation_spec(&profile).expect("secp256k1 export spec"),
+            Algorithm::Secp256k1,
+        );
+
+        assert_eq!(result.artifact.format, ExportFormat::SpkiDer);
+        assert_eq!(
+            fs::read(&result.artifact.path).expect("secp256k1 export output"),
+            expected
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary secp256k1 export state should be removed");
+    }
+
+    #[test]
+    fn export_writes_seed_p256_public_key_without_touching_native_path() {
+        let root_dir = unique_temp_path("export-seed-p256-public-key");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let profile = Profile::new(
+            "seed-p256".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Derive],
+            ModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            state_layout,
+        );
+        let seed = vec![0x33; 32];
+        let output_path = root_dir.join("exports").join("seed-p256.der");
+
+        let result = export_seed_public_key_with_backend(
+            &profile,
+            Some(output_path.as_path()),
+            &FakeSeedExportBackend::new(seed.clone()),
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed p256 export should succeed");
+
+        let expected = expected_seed_public_key_der(
+            &seed,
+            seed_public_key_derivation_spec(&profile).expect("p256 export spec"),
+            Algorithm::P256,
+        );
+
+        assert_eq!(result.artifact.format, ExportFormat::SpkiDer);
+        assert_eq!(
+            fs::read(&result.artifact.path).expect("p256 export output"),
+            expected
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary p256 export state should be removed");
     }
 
     #[test]
@@ -1786,11 +2118,13 @@ mod tests {
         let persisted = Profile::load_named("restored-profile", Some(root_dir.clone()))
             .expect("persisted restored profile");
         assert_eq!(persisted.mode.resolved, Mode::Seed);
-        assert!(persisted
-            .mode
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("old-profile")));
+        assert!(
+            persisted
+                .mode
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("old-profile"))
+        );
 
         let sealed = backend.last_request();
         assert_eq!(sealed.profile_name, "restored-profile");
@@ -1912,6 +2246,50 @@ mod tests {
                 stderr: String::new(),
                 error: None,
             }
+        }
+    }
+
+    fn expected_seed_public_key_der(
+        seed: &[u8],
+        spec: DerivationSpec,
+        algorithm: Algorithm,
+    ) -> Vec<u8> {
+        let derived = HkdfSha256SeedDeriver
+            .derive(
+                &secrecy::SecretBox::new(Box::new(seed.to_vec())),
+                &SoftwareSeedDerivationRequest {
+                    spec,
+                    output_bytes: 32,
+                },
+            )
+            .expect("seed derivation for expected public key");
+        let derived_bytes: [u8; 32] = derived
+            .expose_secret()
+            .as_slice()
+            .try_into()
+            .expect("expected 32-byte derived key material");
+
+        match algorithm {
+            Algorithm::Ed25519 => Ed25519SigningKey::from_bytes(&derived_bytes)
+                .verifying_key()
+                .to_public_key_der()
+                .expect("ed25519 public key DER")
+                .as_bytes()
+                .to_vec(),
+            Algorithm::Secp256k1 => k256::SecretKey::from_slice(&derived_bytes)
+                .expect("valid secp256k1 scalar")
+                .public_key()
+                .to_public_key_der()
+                .expect("secp256k1 public key DER")
+                .as_bytes()
+                .to_vec(),
+            Algorithm::P256 => p256::SecretKey::from_slice(&derived_bytes)
+                .expect("valid p256 scalar")
+                .public_key()
+                .to_public_key_der()
+                .expect("p256 public key DER")
+                .as_bytes()
+                .to_vec(),
         }
     }
 

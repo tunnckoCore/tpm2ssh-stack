@@ -214,7 +214,7 @@ where
     })
 }
 
-fn ssh_ed25519_derivation_spec() -> Result<DerivationSpec> {
+pub(crate) fn ssh_ed25519_derivation_spec() -> Result<DerivationSpec> {
     Ok(DerivationSpec::V1(DerivationSpecV1::software_child_key(
         SSH_CHILD_KEY_NAMESPACE,
         "ed25519",
