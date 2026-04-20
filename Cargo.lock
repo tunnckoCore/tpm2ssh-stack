@@ -1085,8 +1085,11 @@ dependencies = [
  "libc",
  "p256",
  "rpassword",
+ "serde",
+ "serde_json",
  "sha2",
  "ssh-key",
+ "tpm2-derive",
  "whoami",
 ]
 
