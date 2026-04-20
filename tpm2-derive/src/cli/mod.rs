@@ -11,7 +11,7 @@ use args::{
 };
 use render::{failure, success};
 
-use crate::backend::HeuristicProbe;
+use crate::backend::{CapabilityProbe, default_probe};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CommandPath, DecryptRequest, DerivationContext, DeriveRequest, EncryptRequest,
@@ -66,7 +66,7 @@ impl From<ExportKindArg> for ExportKind {
 }
 
 pub fn run(cli: Cli) -> Result<String> {
-    let probe = HeuristicProbe;
+    let probe = default_probe();
 
     match cli.command {
         Command::Inspect(args) => run_inspect(cli.json, &probe, args),
@@ -123,7 +123,7 @@ pub fn run(cli: Cli) -> Result<String> {
     }
 }
 
-fn run_inspect(json: bool, probe: &HeuristicProbe, args: InspectArgs) -> Result<String> {
+fn run_inspect(json: bool, probe: &dyn CapabilityProbe, args: InspectArgs) -> Result<String> {
     let request = InspectRequest {
         algorithm: args.algorithm.map(Into::into),
         uses: args.uses.into_iter().map(Into::into).collect(),
@@ -133,7 +133,7 @@ fn run_inspect(json: bool, probe: &HeuristicProbe, args: InspectArgs) -> Result<
     success(json, CommandPath::from_segments(["inspect"]), report)
 }
 
-fn run_setup(json: bool, probe: &HeuristicProbe, args: SetupArgs) -> Result<String> {
+fn run_setup(json: bool, probe: &dyn CapabilityProbe, args: SetupArgs) -> Result<String> {
     let request = SetupRequest {
         profile: args.profile,
         algorithm: args.algorithm.into(),

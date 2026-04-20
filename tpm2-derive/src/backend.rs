@@ -2,8 +2,26 @@ use crate::model::{
     Algorithm, CapabilityReport, Diagnostic, Mode, NativeCapabilitySummary, TpmStatus, UseCase,
 };
 
+mod parser;
+mod recommend;
+mod subprocess;
+#[cfg(feature = "backend-tss-esapi")]
+mod tss_esapi;
+
+pub use subprocess::{
+    CapabilityGroup, CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner,
+    SubprocessCapabilityProbe, ToolAvailability, default_probe,
+};
+#[cfg(feature = "backend-tss-esapi")]
+pub use tss_esapi::TssEsapiCapabilityProbe;
+
 pub trait CapabilityProbe {
     fn detect(&self, algorithm: Option<Algorithm>, uses: &[UseCase]) -> CapabilityReport;
+
+    fn supports_mode(&self, algorithm: Algorithm, uses: &[UseCase], mode: Mode) -> bool {
+        let report = self.detect(Some(algorithm), uses);
+        recommend::report_supports_mode(&report, algorithm, uses, mode)
+    }
 }
 
 #[derive(Debug, Default)]

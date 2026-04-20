@@ -20,7 +20,7 @@ pub fn resolve_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> R
     }
 
     let report = probe.detect(Some(request.algorithm), &uses);
-    let resolved_mode = resolve_mode(request.requested_mode, request.algorithm, &uses, &report)?;
+    let resolved_mode = resolve_mode(probe, request.requested_mode, request.algorithm, &uses, &report)?;
     let reasons = if let Some(explicit) = request.requested_mode.explicit() {
         vec![format!("mode explicitly requested as {explicit:?}")]
     } else {
@@ -48,42 +48,21 @@ pub fn resolve_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> R
 }
 
 fn resolve_mode(
+    probe: &dyn CapabilityProbe,
     requested_mode: crate::model::ModePreference,
     algorithm: Algorithm,
     uses: &[UseCase],
     report: &CapabilityReport,
 ) -> Result<Mode> {
     match requested_mode.explicit() {
-        Some(mode) => {
-            validate_explicit_mode(mode, algorithm, uses, report)?;
-            Ok(mode)
-        }
+        Some(mode) if probe.supports_mode(algorithm, uses, mode) => Ok(mode),
+        Some(mode) => Err(Error::CapabilityMismatch(format!(
+            "requested mode {mode:?} is not supported for {algorithm:?} with uses {uses:?}"
+        ))),
         None => report
             .recommended_mode
             .ok_or_else(|| Error::CapabilityMismatch("unable to recommend a mode".to_string())),
     }
-}
-
-fn validate_explicit_mode(
-    mode: Mode,
-    algorithm: Algorithm,
-    uses: &[UseCase],
-    report: &CapabilityReport,
-) -> Result<()> {
-    if mode == Mode::Native {
-        let algorithm_supported = report.native.supported_algorithms.contains(&algorithm);
-        let uses_supported = uses
-            .iter()
-            .all(|use_case| report.native.supported_uses.contains(use_case));
-
-        if !algorithm_supported || !uses_supported {
-            return Err(Error::CapabilityMismatch(
-                "native mode is only scaffolded for P-256 sign/verify capabilities".to_string(),
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_profile_name(profile: &str) -> Result<()> {
