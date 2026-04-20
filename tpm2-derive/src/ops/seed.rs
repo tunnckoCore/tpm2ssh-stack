@@ -3,7 +3,12 @@ use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::BTreeSet;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use tempfile::{Builder as TempfileBuilder, NamedTempFile, TempDir};
 
+use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::DerivationSpec;
 use crate::error::{Error, Result};
 use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, UseCase};
@@ -136,7 +141,9 @@ pub struct SeedCreateRequest {
 
 #[derive(Debug)]
 pub enum SeedCreateSource {
-    GenerateRandom { bytes: usize },
+    GenerateRandom {
+        bytes: usize,
+    },
     Import {
         ingress: SeedImportIngress,
         material: Option<SeedMaterial>,
@@ -165,7 +172,9 @@ pub struct SeedCreatePlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum SeedCreateSourceSummary {
-    GenerateRandom { bytes: usize },
+    GenerateRandom {
+        bytes: usize,
+    },
     Import {
         ingress: SeedImportIngress,
         bytes: Option<usize>,
@@ -292,12 +301,10 @@ pub fn plan_create(request: &SeedCreateRequest) -> Result<SeedCreatePlan> {
                     });
                     None
                 }
-                None => {
-                    return Err(Error::Validation(
-                        "import source requires seed material unless stdin will provide it at runtime"
-                            .to_string(),
-                    ))
-                }
+                None => return Err(Error::Validation(
+                    "import source requires seed material unless stdin will provide it at runtime"
+                        .to_string(),
+                )),
             };
 
             (
@@ -404,7 +411,7 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
         SeedExportDestination::Stdout if !policy.allow_stdout => {
             return Err(Error::Validation(
                 "seed export to stdout is denied by policy".to_string(),
-            ))
+            ));
         }
         SeedExportDestination::ExplicitPath(ref path) => {
             if path.trim().is_empty() {
@@ -416,7 +423,7 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
         SeedExportDestination::CallerManagedSink if policy.require_explicit_destination => {
             return Err(Error::Validation(
                 "seed export policy requires an explicit operator-chosen destination".to_string(),
-            ))
+            ));
         }
         SeedExportDestination::Stdout | SeedExportDestination::CallerManagedSink => {}
     }
@@ -443,35 +450,494 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
 
 pub trait SeedBackend {
     fn seal_seed(&self, request: &SeedCreateRequest) -> Result<()>;
-    fn unseal_seed(&self, profile: &SeedProfile, auth_source: &SeedOpenAuthSource) -> Result<SeedMaterial>;
+    fn unseal_seed(
+        &self,
+        profile: &SeedProfile,
+        auth_source: &SeedOpenAuthSource,
+    ) -> Result<SeedMaterial>;
 }
 
-#[derive(Debug, Default)]
-pub struct ScaffoldSeedBackend;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedSealedObjectLayout {
+    pub object_dir: PathBuf,
+    pub public_blob: PathBuf,
+    pub private_blob: PathBuf,
+}
+
+impl SeedSealedObjectLayout {
+    fn for_profile(objects_dir: &Path, profile: &SeedProfile) -> Result<Self> {
+        validate_profile_name(&profile.storage.object_label)?;
+
+        let object_dir = objects_dir.join(&profile.storage.object_label);
+        Ok(Self {
+            public_blob: object_dir.join("sealed.pub"),
+            private_blob: object_dir.join("sealed.priv"),
+            object_dir,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubprocessSeedBackend<R = ProcessCommandRunner> {
+    objects_dir: PathBuf,
+    runner: R,
+}
+
+impl SubprocessSeedBackend<ProcessCommandRunner> {
+    pub fn new(objects_dir: impl Into<PathBuf>) -> Self {
+        Self::with_runner(objects_dir, ProcessCommandRunner)
+    }
+}
+
+impl<R> SubprocessSeedBackend<R> {
+    pub fn with_runner(objects_dir: impl Into<PathBuf>, runner: R) -> Self {
+        Self {
+            objects_dir: objects_dir.into(),
+            runner,
+        }
+    }
+
+    pub fn objects_dir(&self) -> &Path {
+        &self.objects_dir
+    }
+
+    pub fn sealed_object_layout(&self, profile: &SeedProfile) -> Result<SeedSealedObjectLayout> {
+        SeedSealedObjectLayout::for_profile(&self.objects_dir, profile)
+    }
+}
+
+impl<R> SeedBackend for SubprocessSeedBackend<R>
+where
+    R: CommandRunner,
+{
+    fn seal_seed(&self, request: &SeedCreateRequest) -> Result<()> {
+        plan_create(request)?;
+
+        let layout = self.sealed_object_layout(&request.profile)?;
+        let source_material = self.materialize_seed_source(&request.source)?;
+        let transient = new_seed_tempdir()?;
+        let staging = self.new_object_staging_dir()?;
+        let primary_context = transient.path().join("primary.ctx");
+        let seed_input = write_secret_tempfile(transient.path(), source_material.expose_secret())?;
+
+        self.run_checked(&create_primary_invocation(&primary_context))?;
+        self.run_checked(&seal_seed_invocation(
+            &primary_context,
+            seed_input.path(),
+            &staging.public_blob,
+            &staging.private_blob,
+        ))?;
+
+        self.commit_staging_object(staging, &layout, request.overwrite_existing)
+    }
+
+    fn unseal_seed(
+        &self,
+        profile: &SeedProfile,
+        auth_source: &SeedOpenAuthSource,
+    ) -> Result<SeedMaterial> {
+        validate_seed_profile(profile)?;
+        validate_safe_auth_source(auth_source)?;
+
+        if !matches!(auth_source, SeedOpenAuthSource::None) {
+            return Err(Error::Unsupported(
+                "seed backend unseal currently supports only auth-source=none; interactive or secret-backed TPM auth needs a richer request model"
+                    .to_string(),
+            ));
+        }
+
+        let layout = self.sealed_object_layout(profile)?;
+        ensure_layout_exists(&layout)?;
+
+        let transient = new_seed_tempdir()?;
+        let primary_context = transient.path().join("primary.ctx");
+        let object_context = transient.path().join("sealed.ctx");
+        let output_path = transient.path().join("unsealed.bin");
+
+        self.run_checked(&create_primary_invocation(&primary_context))?;
+        self.run_checked(&load_sealed_object_invocation(
+            &primary_context,
+            &layout.public_blob,
+            &layout.private_blob,
+            &object_context,
+        ))?;
+        self.run_checked(&unseal_seed_invocation(&object_context, &output_path))?;
+
+        let seed = read_secret_file(&output_path)?;
+        validate_seed_len(seed.len())?;
+        Ok(SecretBox::new(Box::new(seed)))
+    }
+}
+
+impl<R> SubprocessSeedBackend<R>
+where
+    R: CommandRunner,
+{
+    fn materialize_seed_source(&self, source: &SeedCreateSource) -> Result<SeedMaterial> {
+        match source {
+            SeedCreateSource::GenerateRandom { bytes } => self.generate_random_seed(*bytes),
+            SeedCreateSource::Import {
+                ingress: _,
+                material: Some(material),
+            } => clone_seed_material(material),
+            SeedCreateSource::Import {
+                ingress: SeedImportIngress::Stdin,
+                material: None,
+            } => read_seed_from_stdin(),
+            SeedCreateSource::Import { .. } => Err(Error::Validation(
+                "import source requires in-memory seed bytes or stdin at execution time"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn generate_random_seed(&self, bytes: usize) -> Result<SeedMaterial> {
+        validate_seed_len(bytes)?;
+
+        let transient = new_seed_tempdir()?;
+        let output_path = transient.path().join("generated-seed.bin");
+        self.run_checked(&generate_random_seed_invocation(bytes, &output_path))?;
+
+        let seed = read_secret_file(&output_path)?;
+        validate_seed_len(seed.len())?;
+        Ok(SecretBox::new(Box::new(seed)))
+    }
+
+    fn new_object_staging_dir(&self) -> Result<SeedObjectStaging> {
+        fs::create_dir_all(&self.objects_dir).map_err(|error| {
+            Error::State(format!(
+                "failed to create seed objects directory {}: {error}",
+                self.objects_dir.display()
+            ))
+        })?;
+
+        let tempdir = TempfileBuilder::new()
+            .prefix("seed-object-")
+            .tempdir_in(&self.objects_dir)
+            .map_err(|error| {
+                Error::State(format!(
+                    "failed to create staging directory under {}: {error}",
+                    self.objects_dir.display()
+                ))
+            })?;
+
+        Ok(SeedObjectStaging {
+            public_blob: tempdir.path().join("sealed.pub"),
+            private_blob: tempdir.path().join("sealed.priv"),
+            tempdir,
+        })
+    }
+
+    fn commit_staging_object(
+        &self,
+        staging: SeedObjectStaging,
+        layout: &SeedSealedObjectLayout,
+        overwrite_existing: bool,
+    ) -> Result<()> {
+        if layout.object_dir.exists() && !overwrite_existing {
+            return Err(Error::State(format!(
+                "seed object already exists for profile '{}'; pass overwrite_existing to replace it",
+                layout
+                    .object_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>")
+            )));
+        }
+
+        let staging_path = staging.tempdir.keep();
+
+        if layout.object_dir.exists() {
+            fs::remove_dir_all(&layout.object_dir).map_err(|error| {
+                Error::State(format!(
+                    "failed to remove existing seed object directory {}: {error}",
+                    layout.object_dir.display()
+                ))
+            })?;
+        }
+
+        fs::rename(&staging_path, &layout.object_dir).map_err(|error| {
+            Error::State(format!(
+                "failed to persist sealed seed object {} -> {}: {error}",
+                staging_path.display(),
+                layout.object_dir.display()
+            ))
+        })
+    }
+
+    fn run_checked(&self, invocation: &CommandInvocation) -> Result<CommandOutput> {
+        let output = self.runner.run(invocation);
+        if output.error.is_none() && output.exit_code == Some(0) {
+            return Ok(output);
+        }
+
+        Err(classify_command_error(invocation, &output))
+    }
+}
+
+#[derive(Debug)]
+struct SeedObjectStaging {
+    public_blob: PathBuf,
+    private_blob: PathBuf,
+    tempdir: TempDir,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScaffoldSeedBackend {
+    inner: SubprocessSeedBackend<ProcessCommandRunner>,
+}
+
+impl Default for ScaffoldSeedBackend {
+    fn default() -> Self {
+        let layout = crate::model::StateLayout::from_optional_root(None);
+        Self {
+            inner: SubprocessSeedBackend::new(layout.objects_dir),
+        }
+    }
+}
 
 impl SeedBackend for ScaffoldSeedBackend {
-    fn seal_seed(&self, _request: &SeedCreateRequest) -> Result<()> {
-        Err(Error::Unsupported(
-            "real TPM seed sealing backend is not implemented yet".to_string(),
-        ))
+    fn seal_seed(&self, request: &SeedCreateRequest) -> Result<()> {
+        self.inner.seal_seed(request)
     }
 
-    fn unseal_seed(&self, _profile: &SeedProfile, _auth_source: &SeedOpenAuthSource) -> Result<SeedMaterial> {
-        Err(Error::Unsupported(
-            "real TPM seed unseal backend is not implemented yet".to_string(),
-        ))
+    fn unseal_seed(
+        &self,
+        profile: &SeedProfile,
+        auth_source: &SeedOpenAuthSource,
+    ) -> Result<SeedMaterial> {
+        self.inner.unseal_seed(profile, auth_source)
     }
+}
+
+fn create_primary_invocation(primary_context: &Path) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_createprimary",
+        [
+            "-C".to_string(),
+            "o".to_string(),
+            "-g".to_string(),
+            "sha256".to_string(),
+            "-G".to_string(),
+            "rsa".to_string(),
+            "-c".to_string(),
+            path_arg(primary_context),
+        ],
+    )
+}
+
+fn seal_seed_invocation(
+    primary_context: &Path,
+    seed_input: &Path,
+    public_blob: &Path,
+    private_blob: &Path,
+) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_create",
+        [
+            "-C".to_string(),
+            path_arg(primary_context),
+            "-g".to_string(),
+            "sha256".to_string(),
+            "-G".to_string(),
+            "keyedhash".to_string(),
+            "-a".to_string(),
+            "fixedtpm|fixedparent|userwithauth".to_string(),
+            "-i".to_string(),
+            path_arg(seed_input),
+            "-u".to_string(),
+            path_arg(public_blob),
+            "-r".to_string(),
+            path_arg(private_blob),
+        ],
+    )
+}
+
+fn load_sealed_object_invocation(
+    primary_context: &Path,
+    public_blob: &Path,
+    private_blob: &Path,
+    object_context: &Path,
+) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_load",
+        [
+            "-C".to_string(),
+            path_arg(primary_context),
+            "-u".to_string(),
+            path_arg(public_blob),
+            "-r".to_string(),
+            path_arg(private_blob),
+            "-c".to_string(),
+            path_arg(object_context),
+        ],
+    )
+}
+
+fn unseal_seed_invocation(object_context: &Path, output_path: &Path) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_unseal",
+        [
+            "-c".to_string(),
+            path_arg(object_context),
+            "-o".to_string(),
+            path_arg(output_path),
+        ],
+    )
+}
+
+fn generate_random_seed_invocation(bytes: usize, output_path: &Path) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_getrandom",
+        ["-o".to_string(), path_arg(output_path), bytes.to_string()],
+    )
+}
+
+fn new_seed_tempdir() -> Result<TempDir> {
+    tempfile::tempdir().map_err(|error| {
+        Error::State(format!(
+            "failed to create secure temporary directory for seed handling: {error}"
+        ))
+    })
+}
+
+fn write_secret_tempfile(directory: &Path, bytes: &[u8]) -> Result<NamedTempFile> {
+    let mut file = NamedTempFile::new_in(directory).map_err(|error| {
+        Error::State(format!(
+            "failed to create secure temporary file in {}: {error}",
+            directory.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|error| {
+        Error::State(format!(
+            "failed to write secret material to secure temporary file {}: {error}",
+            file.path().display()
+        ))
+    })?;
+    file.flush().map_err(|error| {
+        Error::State(format!(
+            "failed to flush secret material to secure temporary file {}: {error}",
+            file.path().display()
+        ))
+    })?;
+    Ok(file)
+}
+
+fn read_secret_file(path: &Path) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|error| {
+        Error::State(format!(
+            "failed to read secret material from {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn read_seed_from_stdin() -> Result<SeedMaterial> {
+    let mut buffer = Vec::new();
+    let mut handle = std::io::stdin().lock().take((MAX_SEED_BYTES + 1) as u64);
+    handle.read_to_end(&mut buffer).map_err(|error| {
+        Error::State(format!("failed to read seed material from stdin: {error}"))
+    })?;
+    validate_seed_len(buffer.len())?;
+    Ok(SecretBox::new(Box::new(buffer)))
+}
+
+fn ensure_layout_exists(layout: &SeedSealedObjectLayout) -> Result<()> {
+    for path in [&layout.public_blob, &layout.private_blob] {
+        if !path.is_file() {
+            return Err(Error::State(format!(
+                "sealed seed artifact is missing: {}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn clone_seed_material(material: &SeedMaterial) -> Result<SeedMaterial> {
+    let cloned = material.expose_secret().clone();
+    validate_seed_len(cloned.len())?;
+    Ok(SecretBox::new(Box::new(cloned)))
+}
+
+fn classify_command_error(invocation: &CommandInvocation, output: &CommandOutput) -> Error {
+    let detail = render_command_failure_detail(output);
+    let lower = detail.to_ascii_lowercase();
+    let message = format!(
+        "{} failed{}{}",
+        invocation.program,
+        output
+            .exit_code
+            .map(|code| format!(" with exit status {code}"))
+            .unwrap_or_default(),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    );
+
+    if lower.contains("auth") || lower.contains("authorization") {
+        Error::AuthFailure(message)
+    } else if lower.contains("tcti")
+        || lower.contains("/dev/tpm")
+        || lower.contains("no standard tcti")
+        || lower.contains("connection refused")
+        || lower.contains("not found")
+    {
+        Error::TpmUnavailable(message)
+    } else {
+        Error::State(message)
+    }
+}
+
+fn render_command_failure_detail(output: &CommandOutput) -> String {
+    if let Some(error) = output.error.as_deref() {
+        return error.to_string();
+    }
+
+    let detail = if !output.stderr.trim().is_empty() {
+        output.stderr.trim()
+    } else {
+        output.stdout.trim()
+    };
+
+    preview(detail)
+}
+
+fn preview(value: &str) -> String {
+    let single_line = value.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+    let trimmed = single_line.trim();
+    const LIMIT: usize = 180;
+    if trimmed.len() > LIMIT {
+        format!("{}…", &trimmed[..LIMIT])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn path_arg(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 pub trait SeedSoftwareDeriver {
-    fn derive(&self, seed: &SeedMaterial, request: &SoftwareSeedDerivationRequest) -> Result<SeedMaterial>;
+    fn derive(
+        &self,
+        seed: &SeedMaterial,
+        request: &SoftwareSeedDerivationRequest,
+    ) -> Result<SeedMaterial>;
 }
 
 #[derive(Debug, Default)]
 pub struct HkdfSha256SeedDeriver;
 
 impl SeedSoftwareDeriver for HkdfSha256SeedDeriver {
-    fn derive(&self, seed: &SeedMaterial, request: &SoftwareSeedDerivationRequest) -> Result<SeedMaterial> {
+    fn derive(
+        &self,
+        seed: &SeedMaterial,
+        request: &SoftwareSeedDerivationRequest,
+    ) -> Result<SeedMaterial> {
         validate_derivation_request(request)?;
 
         let info = canonical_derivation_info(&SeedDerivation::hkdf_sha256_v1(), &request.spec);
@@ -527,7 +993,9 @@ pub fn validate_seed_profile(profile: &SeedProfile) -> Result<()> {
         ));
     }
 
-    if !matches!(profile.storage.kind, SeedStorageKind::TpmSealed) || !profile.storage.sealed_at_rest {
+    if !matches!(profile.storage.kind, SeedStorageKind::TpmSealed)
+        || !profile.storage.sealed_at_rest
+    {
         return Err(Error::Validation(
             "seed profiles must use TPM-sealed storage at rest".to_string(),
         ));
@@ -573,8 +1041,7 @@ fn validate_profile_name(profile: &str) -> Result<()> {
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
     {
         return Err(Error::Validation(
-            "profile name may only contain ASCII letters, digits, '.', '_' or '-'"
-                .to_string(),
+            "profile name may only contain ASCII letters, digits, '.', '_' or '-'".to_string(),
         ));
     }
 
@@ -641,7 +1108,8 @@ fn seed_mode_usage_warnings(profile: &SeedProfile) -> Vec<Diagnostic> {
         warnings.push(Diagnostic {
             level: DiagnosticLevel::Warning,
             code: "SEED_P256_NATIVE_PREFERRED".to_string(),
-            message: "p256 sign/verify usually fits native TPM mode better than seed mode".to_string(),
+            message: "p256 sign/verify usually fits native TPM mode better than seed mode"
+                .to_string(),
         });
     }
 
@@ -649,7 +1117,8 @@ fn seed_mode_usage_warnings(profile: &SeedProfile) -> Vec<Diagnostic> {
         warnings.push(Diagnostic {
             level: DiagnosticLevel::Info,
             code: "SEED_RECOVERY_EXPORT".to_string(),
-            message: "seed mode permits recovery export only under explicit high-friction policy".to_string(),
+            message: "seed mode permits recovery export only under explicit high-friction policy"
+                .to_string(),
         });
     }
 
@@ -708,8 +1177,11 @@ fn seed_kdf_name(kdf: SeedKdf) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
 
+    use super::*;
 
     fn seed_profile() -> SeedProfile {
         SeedProfile::scaffold(
@@ -747,9 +1219,7 @@ mod tests {
         };
 
         let error = plan_create(&request).expect_err("expected validation failure");
-        assert!(error
-            .to_string()
-            .contains("command arguments is forbidden"));
+        assert!(error.to_string().contains("command arguments is forbidden"));
     }
 
     #[test]
@@ -771,7 +1241,9 @@ mod tests {
         let request = SeedExportRequest {
             profile: seed_profile(),
             auth_source: SeedOpenAuthSource::InteractivePrompt,
-            destination: SeedExportDestination::ExplicitPath("/safe/location/recovery.json".to_string()),
+            destination: SeedExportDestination::ExplicitPath(
+                "/safe/location/recovery.json".to_string(),
+            ),
             format: SeedExportFormat::RecoveryBundleV1,
             reason: "hardware migration".to_string(),
             confirm_recovery_export: true,
@@ -794,5 +1266,275 @@ mod tests {
 
         assert_eq!(left.expose_secret(), right.expose_secret());
         assert_eq!(left.expose_secret().len(), 32);
+    }
+
+    #[derive(Debug)]
+    struct RecordingRunnerState {
+        expected_create_input: Option<Vec<u8>>,
+        generated_seed: Option<Vec<u8>>,
+        unsealed_seed: Option<Vec<u8>>,
+        invocations: RefCell<Vec<CommandInvocation>>,
+        create_input_paths: RefCell<Vec<PathBuf>>,
+        unseal_output_paths: RefCell<Vec<PathBuf>>,
+    }
+
+    impl RecordingRunnerState {
+        fn new(
+            expected_create_input: Option<Vec<u8>>,
+            generated_seed: Option<Vec<u8>>,
+            unsealed_seed: Option<Vec<u8>>,
+        ) -> Rc<Self> {
+            Rc::new(Self {
+                expected_create_input,
+                generated_seed,
+                unsealed_seed,
+                invocations: RefCell::new(Vec::new()),
+                create_input_paths: RefCell::new(Vec::new()),
+                unseal_output_paths: RefCell::new(Vec::new()),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingRunner {
+        state: Rc<RecordingRunnerState>,
+    }
+
+    impl RecordingRunner {
+        fn new(state: Rc<RecordingRunnerState>) -> Self {
+            Self { state }
+        }
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.state.invocations.borrow_mut().push(invocation.clone());
+
+            match invocation.program.as_str() {
+                "tpm2_getrandom" => {
+                    let output = pathbuf_arg(invocation, "-o");
+                    let requested = invocation
+                        .args
+                        .last()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .expect("requested byte count");
+                    let bytes = self
+                        .state
+                        .generated_seed
+                        .as_ref()
+                        .expect("generated seed configured");
+                    assert_eq!(bytes.len(), requested);
+                    fs::write(&output, bytes).expect("write random seed output");
+                    ok_output()
+                }
+                "tpm2_createprimary" => {
+                    fs::write(pathbuf_arg(invocation, "-c"), b"primary-context")
+                        .expect("write primary context");
+                    ok_output()
+                }
+                "tpm2_create" => {
+                    let input = pathbuf_arg(invocation, "-i");
+                    self.state
+                        .create_input_paths
+                        .borrow_mut()
+                        .push(input.clone());
+                    if let Some(expected) = &self.state.expected_create_input {
+                        let actual = fs::read(&input).expect("read sealing input");
+                        assert_eq!(&actual, expected);
+                    }
+                    fs::write(pathbuf_arg(invocation, "-u"), b"public-blob")
+                        .expect("write public blob");
+                    fs::write(pathbuf_arg(invocation, "-r"), b"private-blob")
+                        .expect("write private blob");
+                    ok_output()
+                }
+                "tpm2_load" => {
+                    fs::write(pathbuf_arg(invocation, "-c"), b"sealed-context")
+                        .expect("write load context");
+                    ok_output()
+                }
+                "tpm2_unseal" => {
+                    let output = pathbuf_arg(invocation, "-o");
+                    self.state
+                        .unseal_output_paths
+                        .borrow_mut()
+                        .push(output.clone());
+                    let bytes = self
+                        .state
+                        .unsealed_seed
+                        .as_ref()
+                        .expect("unsealed seed configured");
+                    fs::write(&output, bytes).expect("write unseal output");
+                    ok_output()
+                }
+                other => CommandOutput {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(format!("unexpected program: {other}")),
+                },
+            }
+        }
+    }
+
+    fn ok_output() -> CommandOutput {
+        CommandOutput {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+        }
+    }
+
+    fn pathbuf_arg(invocation: &CommandInvocation, flag: &str) -> PathBuf {
+        PathBuf::from(string_arg(invocation, flag))
+    }
+
+    fn string_arg(invocation: &CommandInvocation, flag: &str) -> String {
+        let index = invocation
+            .args
+            .iter()
+            .position(|arg| arg == flag)
+            .expect("flag present");
+        invocation.args[index + 1].clone()
+    }
+
+    fn sample_seed() -> Vec<u8> {
+        b"0123456789abcdef0123456789abcdef".to_vec()
+    }
+
+    fn recorded_programs(state: &RecordingRunnerState) -> Vec<String> {
+        state
+            .invocations
+            .borrow()
+            .iter()
+            .map(|invocation| invocation.program.clone())
+            .collect()
+    }
+
+    #[test]
+    fn subprocess_backend_seals_imported_seed_with_secure_tempfiles() {
+        let objects_dir = tempfile::tempdir().expect("objects dir");
+        let seed = sample_seed();
+        let state = RecordingRunnerState::new(Some(seed.clone()), None, None);
+        let backend = SubprocessSeedBackend::with_runner(
+            objects_dir.path().to_path_buf(),
+            RecordingRunner::new(state.clone()),
+        );
+        let profile = seed_profile();
+        let layout = backend.sealed_object_layout(&profile).expect("layout");
+        let request = SeedCreateRequest {
+            profile,
+            source: SeedCreateSource::Import {
+                ingress: SeedImportIngress::InMemory,
+                material: Some(SecretBox::new(Box::new(seed.clone()))),
+            },
+            overwrite_existing: false,
+        };
+
+        backend.seal_seed(&request).expect("seal imported seed");
+
+        assert_eq!(
+            recorded_programs(&state),
+            vec!["tpm2_createprimary", "tpm2_create"]
+        );
+        assert_eq!(
+            fs::read(&layout.public_blob).expect("public blob"),
+            b"public-blob"
+        );
+        assert_eq!(
+            fs::read(&layout.private_blob).expect("private blob"),
+            b"private-blob"
+        );
+
+        let create_input_path = state.create_input_paths.borrow()[0].clone();
+        assert!(
+            !create_input_path.exists(),
+            "temporary seed input should be cleaned up"
+        );
+
+        let seed_as_text = String::from_utf8(seed).expect("ascii seed");
+        for invocation in state.invocations.borrow().iter() {
+            for arg in &invocation.args {
+                assert!(
+                    !arg.contains(&seed_as_text),
+                    "seed material must not appear in subprocess argv"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subprocess_backend_generates_seed_via_tpm2_getrandom_before_sealing() {
+        let objects_dir = tempfile::tempdir().expect("objects dir");
+        let seed = b"abcdef0123456789abcdef0123456789".to_vec();
+        let state = RecordingRunnerState::new(Some(seed.clone()), Some(seed), None);
+        let backend = SubprocessSeedBackend::with_runner(
+            objects_dir.path().to_path_buf(),
+            RecordingRunner::new(state.clone()),
+        );
+        let request = SeedCreateRequest {
+            profile: seed_profile(),
+            source: SeedCreateSource::GenerateRandom { bytes: 32 },
+            overwrite_existing: false,
+        };
+
+        backend.seal_seed(&request).expect("seal generated seed");
+
+        assert_eq!(
+            recorded_programs(&state),
+            vec!["tpm2_getrandom", "tpm2_createprimary", "tpm2_create"]
+        );
+        let create_input_path = state.create_input_paths.borrow()[0].clone();
+        assert!(
+            !create_input_path.exists(),
+            "generated seed tempfile should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn subprocess_backend_unseals_seed_through_output_file() {
+        let objects_dir = tempfile::tempdir().expect("objects dir");
+        let seed = sample_seed();
+        let state = RecordingRunnerState::new(None, None, Some(seed.clone()));
+        let backend = SubprocessSeedBackend::with_runner(
+            objects_dir.path().to_path_buf(),
+            RecordingRunner::new(state.clone()),
+        );
+        let profile = seed_profile();
+        let layout = backend.sealed_object_layout(&profile).expect("layout");
+        fs::create_dir_all(&layout.object_dir).expect("object dir");
+        fs::write(&layout.public_blob, b"public-blob").expect("public blob");
+        fs::write(&layout.private_blob, b"private-blob").expect("private blob");
+
+        let unsealed = backend
+            .unseal_seed(&profile, &SeedOpenAuthSource::None)
+            .expect("unseal seed");
+
+        assert_eq!(
+            recorded_programs(&state),
+            vec!["tpm2_createprimary", "tpm2_load", "tpm2_unseal"]
+        );
+        assert_eq!(unsealed.expose_secret().as_slice(), seed.as_slice());
+
+        let unseal_output_path = state.unseal_output_paths.borrow()[0].clone();
+        assert!(
+            !unseal_output_path.exists(),
+            "unseal output tempfile should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn subprocess_backend_rejects_auth_sources_that_need_secret_transport() {
+        let objects_dir = tempfile::tempdir().expect("objects dir");
+        let backend = SubprocessSeedBackend::with_runner(
+            objects_dir.path().to_path_buf(),
+            RecordingRunner::new(RecordingRunnerState::new(None, None, None)),
+        );
+
+        let error = backend
+            .unseal_seed(&seed_profile(), &SeedOpenAuthSource::InteractivePrompt)
+            .expect_err("interactive auth should remain unsupported for now");
+        assert!(error.to_string().contains("auth-source=none"));
     }
 }
