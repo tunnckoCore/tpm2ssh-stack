@@ -1,6 +1,3 @@
 [workspace]
-members = [
-    "tpm2ssh",
-    "tpm2ssh-prfd",
-]
+members = ["tpm2-derive", "tpm2ssh"]
 resolver = "2"
