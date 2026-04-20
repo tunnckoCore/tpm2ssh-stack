@@ -4,6 +4,8 @@
 //! the `src/ops/` directory, which contains its submodules.
 
 pub mod derive;
+pub mod encrypt;
+pub mod keygen;
 pub mod native;
 pub mod prf;
 pub mod seed;

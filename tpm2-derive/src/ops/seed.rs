@@ -1192,16 +1192,6 @@ pub fn validate_seed_profile(profile: &SeedProfile) -> Result<()> {
         ));
     }
 
-    if profile
-        .uses
-        .iter()
-        .any(|use_case| matches!(use_case, UseCase::Encrypt | UseCase::Decrypt))
-    {
-        return Err(Error::Validation(
-            "seed mode scaffold does not support encrypt/decrypt uses".to_string(),
-        ));
-    }
-
     if !matches!(profile.storage.kind, SeedStorageKind::TpmSealed)
         || !profile.storage.sealed_at_rest
     {

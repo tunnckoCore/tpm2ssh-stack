@@ -33,10 +33,12 @@ pub enum Command {
     Sign(SignArgs),
     /// Verify a signature against a persisted profile; native P-256 is the main wired verify path today.
     Verify(VerifyArgs),
-    /// Reserved placeholder for future encryption support.
+    /// Encrypt data using a derived symmetric key from a persisted profile.
     Encrypt(EncryptArgs),
-    /// Reserved placeholder for future decryption support.
+    /// Decrypt data previously encrypted with the encrypt command.
     Decrypt(DecryptArgs),
+    /// Derive a keypair (secret key + public key) from a persisted profile.
+    Keygen(KeygenArgs),
     /// Export public material or recovery artifacts from a persisted profile.
     Export(ExportArgs),
     /// Import a break-glass recovery bundle and reseal it into TPM-backed state.
@@ -182,12 +184,9 @@ pub struct VerifyArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Reserved placeholder for future encryption support")]
+#[command(about = "Encrypt data using a derived symmetric key from a persisted profile")]
 pub struct EncryptArgs {
-    #[arg(
-        long,
-        help = "Existing profile name to use once encrypt is implemented"
-    )]
+    #[arg(long, help = "Existing profile name to use for encryption")]
     pub profile: String,
     #[arg(
         long,
@@ -195,15 +194,19 @@ pub struct EncryptArgs {
         help = "Input file to encrypt, or '-' for stdin"
     )]
     pub input: String,
+    #[arg(long, help = "Output file for ciphertext; defaults to stdout")]
+    pub output: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
+    pub state_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Reserved placeholder for future decryption support")]
+#[command(about = "Decrypt data previously encrypted with the encrypt command")]
 pub struct DecryptArgs {
-    #[arg(
-        long,
-        help = "Existing profile name to use once decrypt is implemented"
-    )]
+    #[arg(long, help = "Existing profile name to use for decryption")]
     pub profile: String,
     #[arg(
         long,
@@ -211,6 +214,61 @@ pub struct DecryptArgs {
         help = "Input file to decrypt, or '-' for stdin"
     )]
     pub input: String,
+    #[arg(long, help = "Output file for plaintext; defaults to stdout")]
+    pub output: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
+    pub state_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Derive a keypair (secret key + public key) from a persisted profile")]
+pub struct KeygenArgs {
+    #[arg(long = "from-profile", visible_alias = "profile", help = "Profile name to derive the keypair from")]
+    pub from_profile: String,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = KeygenKindArg::Auto,
+        help = "Derivation kind: auto tries prf then seed, or force a specific kind"
+    )]
+    pub kind: KeygenKindArg,
+    #[arg(
+        long = "format",
+        value_enum,
+        default_value_t = KeygenFormatArg::Hex,
+        help = "Output encoding for the generated keypair"
+    )]
+    pub format: KeygenFormatArg,
+    #[arg(long, help = "Output file for the keypair; defaults to stdout")]
+    pub output: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
+    pub state_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum KeygenKindArg {
+    /// Try PRF first, then seed, otherwise error.
+    #[default]
+    Auto,
+    /// Derive from a PRF-mode profile.
+    Prf,
+    /// Derive from a seed-mode profile.
+    Seed,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum KeygenFormatArg {
+    /// Lowercase hexadecimal.
+    #[default]
+    Hex,
+    /// JSON object with hex-encoded fields.
+    Json,
 }
 
 #[derive(Debug, Args)]

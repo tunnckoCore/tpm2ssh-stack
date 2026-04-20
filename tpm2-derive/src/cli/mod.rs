@@ -10,7 +10,8 @@ use tempfile::Builder as TempfileBuilder;
 
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
-    ImportArgs, ModeArg, PublicKeyExportFormatArg, SetupArgs,
+    ImportArgs, KeygenArgs, KeygenFormatArg, KeygenKindArg,
+    ModeArg, PublicKeyExportFormatArg, SetupArgs,
     SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
@@ -32,9 +33,10 @@ use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CommandPath, DecryptRequest, DerivationContext, DeriveRequest, EncryptRequest,
-    ErrorEnvelope, ExportKind, ExportRequest, InputSource, InspectRequest, Mode, ModePreference,
-    PendingOperation, Profile, PublicKeyExportFormat, RecoveryImportRequest, SetupRequest,
-    SignRequest, SshAgentAddRequest, UseCase, VerifyRequest,
+    ErrorEnvelope, ExportKind, ExportRequest, InputSource, InspectRequest, KeygenFormat,
+    KeygenKind, Mode, ModePreference, PendingOperation, Profile,
+    PublicKeyExportFormat, RecoveryImportRequest, SetupRequest, SignRequest, SshAgentAddRequest,
+    UseCase, VerifyRequest,
 };
 use crate::ops;
 use crate::ops::native::subprocess::{
@@ -107,6 +109,25 @@ impl From<PublicKeyExportFormatArg> for PublicKeyExportFormat {
     }
 }
 
+impl From<KeygenKindArg> for KeygenKind {
+    fn from(value: KeygenKindArg) -> Self {
+        match value {
+            KeygenKindArg::Auto => Self::Auto,
+            KeygenKindArg::Prf => Self::Prf,
+            KeygenKindArg::Seed => Self::Seed,
+        }
+    }
+}
+
+impl From<KeygenFormatArg> for KeygenFormat {
+    fn from(value: KeygenFormatArg) -> Self {
+        match value {
+            KeygenFormatArg::Hex => Self::Hex,
+            KeygenFormatArg::Json => Self::Json,
+        }
+    }
+}
+
 pub fn run(cli: Cli) -> Result<String> {
     let probe = default_probe();
 
@@ -116,20 +137,9 @@ pub fn run(cli: Cli) -> Result<String> {
         Command::Derive(args) => run_derive(cli.json, args),
         Command::Sign(args) => run_sign(cli.json, args),
         Command::Verify(args) => run_verify(cli.json, args),
-        Command::Encrypt(args) => run_placeholder(
-            cli.json,
-            CommandPath::from_segments(["encrypt"]),
-            args.profile.clone(),
-            "encrypt",
-            encrypt_summary(&args),
-        ),
-        Command::Decrypt(args) => run_placeholder(
-            cli.json,
-            CommandPath::from_segments(["decrypt"]),
-            args.profile.clone(),
-            "decrypt",
-            decrypt_summary(&args),
-        ),
+        Command::Encrypt(args) => run_encrypt(cli.json, args),
+        Command::Decrypt(args) => run_decrypt(cli.json, args),
+        Command::Keygen(args) => run_keygen(cli.json, args),
         Command::Export(args) => run_export(cli.json, args),
         Command::Import(args) => run_import(cli.json, args),
         Command::Ssh(SshCommand::Agent(SshAgentCommand::Add(args))) => {
@@ -340,6 +350,179 @@ fn run_ssh_agent_add(json: bool, args: SshAgentAddArgs) -> Result<String> {
             },
             Vec::new(),
         ),
+    }
+}
+
+fn run_encrypt(json: bool, args: EncryptArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["encrypt"]);
+    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: error.code().as_str().to_string(),
+                    message: error.to_string(),
+                },
+                Vec::new(),
+            );
+        }
+    };
+
+    let input_bytes = load_input_bytes(&parse_input_source(&args.input), "encrypt input")?;
+    let runner = ProcessCommandRunner;
+    match ops::encrypt::encrypt_with_defaults(&profile, &input_bytes, &runner) {
+        Ok(mut result) => {
+            if let Some(ref output) = args.output {
+                let ct = result.ciphertext.as_ref().map(|h| hex_decode_bytes(h)).unwrap_or_default();
+                write_output_file(output, &ct)?;
+                result.output_path = Some(output.clone());
+                result.ciphertext = None;
+            }
+            success(json, command, result)
+        }
+        Err(error) => failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["decrypt"]);
+    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: error.code().as_str().to_string(),
+                    message: error.to_string(),
+                },
+                Vec::new(),
+            );
+        }
+    };
+
+    let raw_input = load_input_bytes(&parse_input_source(&args.input), "decrypt input")?;
+    // Try to interpret as hex first (the format we emit), otherwise use raw bytes.
+    let ciphertext = try_hex_decode(&raw_input).unwrap_or(raw_input);
+    let runner = ProcessCommandRunner;
+    match ops::encrypt::decrypt_with_defaults(&profile, &ciphertext, &runner) {
+        Ok(mut result) => {
+            if let Some(ref output) = args.output {
+                let pt = result.plaintext.as_ref().map(|h| hex_decode_bytes(h)).unwrap_or_default();
+                write_output_file(output, &pt)?;
+                result.output_path = Some(output.clone());
+                result.plaintext = None;
+            }
+            success(json, command, result)
+        }
+        Err(error) => failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn run_keygen(json: bool, args: KeygenArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["keygen"]);
+    let profile = match ops::load_profile(&args.from_profile, args.state_dir.clone()) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: error.code().as_str().to_string(),
+                    message: error.to_string(),
+                },
+                Vec::new(),
+            );
+        }
+    };
+
+    // Validate kind constraint against resolved mode
+    let kind: KeygenKind = args.kind.into();
+    match kind {
+        KeygenKind::Auto => {} // accept whatever mode the profile resolved to
+        KeygenKind::Prf if profile.mode.resolved != Mode::Prf => {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: "validation".to_string(),
+                    message: format!(
+                        "--kind prf requested but profile '{}' resolved to {:?}",
+                        profile.name, profile.mode.resolved
+                    ),
+                },
+                Vec::new(),
+            );
+        }
+        KeygenKind::Seed if profile.mode.resolved != Mode::Seed => {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: "validation".to_string(),
+                    message: format!(
+                        "--kind seed requested but profile '{}' resolved to {:?}",
+                        profile.name, profile.mode.resolved
+                    ),
+                },
+                Vec::new(),
+            );
+        }
+        _ => {}
+    }
+
+    let runner = ProcessCommandRunner;
+    match ops::keygen::execute_with_defaults(&profile, &runner) {
+        Ok(mut result) => {
+            let format: KeygenFormat = args.format.into();
+            if let Some(ref output) = args.output {
+                let rendered = render_keygen_output(format, &result);
+                write_output_file(output, rendered.as_bytes())?;
+                result.output_path = Some(output.clone());
+            }
+            success(json, command, result)
+        }
+        Err(error) => failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn render_keygen_output(format: KeygenFormat, result: &crate::model::KeygenResult) -> String {
+    match format {
+        KeygenFormat::Hex => {
+            format!(
+                "secret_key: {}\npublic_key: {}\n",
+                result.secret_key_hex, result.public_key_hex
+            )
+        }
+        KeygenFormat::Json => {
+            serde_json::to_string_pretty(result).unwrap_or_default()
+        }
     }
 }
 
@@ -1027,6 +1210,7 @@ fn export_command_path(kind: ExportKind) -> CommandPath {
     }
 }
 
+#[allow(dead_code)]
 fn run_placeholder(
     json: bool,
     command: CommandPath,
@@ -1581,6 +1765,35 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
+fn hex_decode_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .filter_map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect()
+}
+
+fn try_hex_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(input).ok()?.trim();
+    if s.is_empty() || s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hex_decode_bytes(s))
+}
+
+fn write_output_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|e| {
+            Error::State(format!(
+                "failed to create output directory '{}': {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::write(path, data).map_err(|e| {
+        Error::State(format!("failed to write output to '{}': {e}", path.display()))
+    })
+}
+
 fn ensure_dir(path: &Path, label: &str) -> Result<()> {
     fs::create_dir_all(path).map_err(|error| {
         Error::State(format!(
@@ -1598,6 +1811,7 @@ fn mode_name(mode: Mode) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Value {
     match operation {
         "derive" => serde_json::to_value(DeriveRequest {
@@ -1626,11 +1840,13 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
         "encrypt" => serde_json::to_value(EncryptRequest {
             profile,
             input: InputSource::Stdin,
+            output: None,
         })
         .unwrap_or_default(),
         "decrypt" => serde_json::to_value(DecryptRequest {
             profile,
             input: InputSource::Stdin,
+            output: None,
         })
         .unwrap_or_default(),
         "export" => serde_json::to_value(ExportRequest {
@@ -1661,19 +1877,6 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
     }
 }
 
-fn encrypt_summary(args: &EncryptArgs) -> String {
-    format!(
-        "profile={} input={} state=planned",
-        args.profile, args.input
-    )
-}
-
-fn decrypt_summary(args: &DecryptArgs) -> String {
-    format!(
-        "profile={} input={} state=planned",
-        args.profile, args.input
-    )
-}
 
 #[cfg(test)]
 mod tests {

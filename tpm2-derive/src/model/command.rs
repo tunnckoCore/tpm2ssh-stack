@@ -70,12 +70,72 @@ pub struct VerifyRequest {
 pub struct EncryptRequest {
     pub profile: String,
     pub input: InputSource,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EncryptResult {
+    pub profile: String,
+    pub mode: Mode,
+    pub algorithm: Algorithm,
+    pub input_bytes: usize,
+    pub ciphertext_bytes: usize,
+    pub nonce_bytes: usize,
+    pub output_path: Option<PathBuf>,
+    pub encoding: String,
+    pub ciphertext: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DecryptRequest {
     pub profile: String,
     pub input: InputSource,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DecryptResult {
+    pub profile: String,
+    pub mode: Mode,
+    pub algorithm: Algorithm,
+    pub ciphertext_bytes: usize,
+    pub plaintext_bytes: usize,
+    pub output_path: Option<PathBuf>,
+    pub encoding: String,
+    pub plaintext: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeygenKind {
+    Auto,
+    Prf,
+    Seed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeygenFormat {
+    Hex,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KeygenRequest {
+    pub from_profile: String,
+    pub kind: KeygenKind,
+    pub format: KeygenFormat,
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct KeygenResult {
+    pub profile: String,
+    pub mode: Mode,
+    pub algorithm: Algorithm,
+    pub secret_key_hex: String,
+    pub public_key_hex: String,
+    pub output_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
