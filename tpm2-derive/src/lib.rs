@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod cli;
+pub mod crypto;
 pub mod error;
 pub mod model;
 pub mod ops;
