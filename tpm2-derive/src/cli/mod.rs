@@ -6,17 +6,16 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub use args::{Cli, Command};
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
-    ModeArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg,
-    VerifyArgs,
+    ModeArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
 };
+pub use args::{Cli, Command};
 use render::{failure, success, success_with_diagnostics};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
-use crate::backend::{CapabilityProbe, ProcessCommandRunner, default_probe};
+use crate::backend::{default_probe, CapabilityProbe, ProcessCommandRunner};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CommandPath, DecryptRequest, DerivationContext, DeriveRequest, EncryptRequest,
@@ -26,12 +25,11 @@ use crate::model::{
 };
 use crate::ops;
 use crate::ops::native::subprocess::{
-    NativeAuthSource, NativeKeyLocator, NativeSignArtifacts, NativeSignOptions, NativeSignPlan,
-    plan_sign,
+    plan_sign, NativeAuthSource, NativeKeyLocator, NativeSignArtifacts, NativeSignOptions,
+    NativeSignPlan,
 };
 use crate::ops::native::{
-    DigestAlgorithm, NativeKeyRef, NativeSignRequest, NativeSignatureFormat,
-    NativeSignatureScheme,
+    DigestAlgorithm, NativeKeyRef, NativeSignRequest, NativeSignatureFormat, NativeSignatureScheme,
 };
 
 impl From<AlgorithmArg> for Algorithm {
@@ -251,7 +249,10 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
         ),
         crate::model::Diagnostic::info(
             "profile-mode",
-            format!("sign request is bound to resolved mode {:?}", profile.mode.resolved),
+            format!(
+                "sign request is bound to resolved mode {:?}",
+                profile.mode.resolved
+            ),
         ),
     ];
 
@@ -306,9 +307,7 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
 fn export_command_path(kind: ExportKind) -> CommandPath {
     match kind {
         ExportKind::PublicKey => CommandPath::from_segments(["export", "public-key"]),
-        ExportKind::RecoveryBundle => {
-            CommandPath::from_segments(["export", "recovery-bundle"])
-        }
+        ExportKind::RecoveryBundle => CommandPath::from_segments(["export", "recovery-bundle"]),
     }
 }
 
@@ -396,17 +395,27 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
 
     profile.storage.state_layout.ensure_dirs()?;
 
-    let runtime_dir = profile.storage.state_layout.objects_dir.join(&profile.name).join("native-sign");
-    let native_dir = profile.storage.state_layout.objects_dir.join(&profile.name).join("native");
-    let output_dir = profile.storage.state_layout.exports_dir.join(&profile.name).join("signatures");
+    let runtime_dir = profile
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&profile.name)
+        .join("native-sign");
+    let output_dir = profile
+        .storage
+        .state_layout
+        .exports_dir
+        .join(&profile.name)
+        .join("signatures");
 
     ensure_dir(&runtime_dir, "native sign runtime")?;
-    ensure_dir(&native_dir, "native sign locator")?;
     ensure_dir(&output_dir, "native sign output")?;
 
     let input_bytes = load_sign_input(&request.input)?;
     if input_bytes.is_empty() {
-        return Err(Error::Validation("sign input must not be empty".to_string()));
+        return Err(Error::Validation(
+            "sign input must not be empty".to_string(),
+        ));
     }
 
     let digest = Sha256::digest(&input_bytes).to_vec();
@@ -420,8 +429,8 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
         ))
     })?;
 
-    let key_id = format!("{}-signing-key", profile.name);
-    let handle_path = native_dir.join(format!("{key_id}.handle"));
+    let key_id = ops::native_key_id(profile);
+    let locator = ops::resolve_native_key_locator(profile)?;
     let plan = plan_sign(
         &NativeSignRequest {
             key: NativeKeyRef {
@@ -434,9 +443,7 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
             digest,
         },
         &NativeSignOptions {
-            locator: NativeKeyLocator::SerializedHandle {
-                path: handle_path.clone(),
-            },
+            locator: locator.clone(),
             auth: NativeAuthSource::Empty,
             artifacts: NativeSignArtifacts {
                 digest_path: digest_path.clone(),
@@ -447,14 +454,16 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
     )?;
 
     let mut diagnostics = plan.warnings.clone();
-    if !handle_path.is_file() {
-        diagnostics.push(crate::model::Diagnostic::warning(
-            "native-key-handle-missing",
-            format!(
-                "serialized native key handle '{}' is not present yet; sign currently returns a concrete plan and staged digest, but execution still depends on setup materializing that handle",
-                handle_path.display()
-            ),
-        ));
+    if let NativeKeyLocator::SerializedHandle { path } = &locator {
+        if !path.is_file() {
+            diagnostics.push(crate::model::Diagnostic::warning(
+                "native-key-handle-missing",
+                format!(
+                    "serialized native key handle '{}' is not present yet; sign planning expects setup to materialize that handle first",
+                    path.display()
+                ),
+            ));
+        }
     }
 
     Ok(StagedNativeSign {
@@ -487,7 +496,10 @@ fn load_sign_input(input: &InputSource) -> Result<Vec<u8>> {
             Ok(buffer)
         }
         InputSource::Path { path } => fs::read(path).map_err(|error| {
-            Error::State(format!("failed to read sign input '{}': {error}", path.display()))
+            Error::State(format!(
+                "failed to read sign input '{}': {error}",
+                path.display()
+            ))
         }),
     }
 }
@@ -567,7 +579,6 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
     }
 }
 
-
 fn verify_summary(args: &VerifyArgs) -> String {
     format!(
         "profile={} input={} signature={} state=planned",
@@ -576,11 +587,17 @@ fn verify_summary(args: &VerifyArgs) -> String {
 }
 
 fn encrypt_summary(args: &EncryptArgs) -> String {
-    format!("profile={} input={} state=planned", args.profile, args.input)
+    format!(
+        "profile={} input={} state=planned",
+        args.profile, args.input
+    )
 }
 
 fn decrypt_summary(args: &DecryptArgs) -> String {
-    format!("profile={} input={} state=planned", args.profile, args.input)
+    format!(
+        "profile={} input={} state=planned",
+        args.profile, args.input
+    )
 }
 
 fn ssh_agent_add_summary(args: &SshAgentAddArgs) -> String {

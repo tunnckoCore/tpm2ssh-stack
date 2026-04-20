@@ -3,6 +3,7 @@ pub mod native;
 pub mod prf;
 pub mod seed;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,10 +17,13 @@ use crate::model::{
     StateLayout, UseCase,
 };
 use crate::ops::native::subprocess::{
-    NativeCommandSpec, NativeKeyLocator, NativePublicKeyExportOptions, plan_export_public_key,
+    plan_export_public_key, plan_setup, NativeCommandSpec, NativeKeyLocator,
+    NativePersistentHandle, NativePublicKeyExportOptions, NativeSetupArtifacts,
 };
 use crate::ops::native::{
-    NativeKeyRef, NativePublicKeyEncoding, NativePublicKeyExportRequest,
+    NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativeKeyRef, NativeKeyUse,
+    NativePrivateKeyPolicy, NativePublicKeyEncoding, NativePublicKeyExportRequest,
+    NativeSetupRequest,
 };
 
 pub fn inspect(probe: &dyn CapabilityProbe, request: &InspectRequest) -> CapabilityReport {
@@ -27,6 +31,17 @@ pub fn inspect(probe: &dyn CapabilityProbe, request: &InspectRequest) -> Capabil
 }
 
 pub fn resolve_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> Result<SetupResult> {
+    resolve_profile_with_runner(probe, request, &ProcessCommandRunner)
+}
+
+fn resolve_profile_with_runner<R>(
+    probe: &dyn CapabilityProbe,
+    request: &SetupRequest,
+    runner: &R,
+) -> Result<SetupResult>
+where
+    R: CommandRunner,
+{
     validate_profile_name(&request.profile)?;
 
     let uses = normalize_uses(request.uses.clone());
@@ -51,7 +66,7 @@ pub fn resolve_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> R
     };
 
     let state_layout = StateLayout::from_optional_root(request.state_dir.clone());
-    let profile = Profile::new(
+    let mut profile = Profile::new(
         request.profile.clone(),
         request.algorithm,
         uses,
@@ -66,6 +81,9 @@ pub fn resolve_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> R
     let persisted = if request.dry_run {
         false
     } else {
+        if profile.mode.resolved == Mode::Native {
+            materialize_native_setup(&mut profile, runner)?;
+        }
         profile.persist()?;
         true
     };
@@ -138,6 +156,86 @@ fn export_recovery_bundle(profile: &Profile) -> Result<ExportResult> {
     )))
 }
 
+fn materialize_native_setup<R>(profile: &mut Profile, runner: &R) -> Result<()>
+where
+    R: CommandRunner,
+{
+    if profile.algorithm != Algorithm::P256 {
+        return Err(Error::Unsupported(format!(
+            "native setup is currently wired only for P-256 profiles, got {:?}",
+            profile.algorithm
+        )));
+    }
+
+    let allowed_uses = native_key_uses(profile)?;
+    let key_id = native_key_id(profile);
+    let native_dir = native_state_dir(profile);
+    let scratch_dir = native_dir.join("setup-work");
+    let handle_path = native_handle_path(profile);
+    let persistent_handle = allocate_native_persistent_handle(runner)?;
+
+    profile.storage.state_layout.ensure_dirs()?;
+    fs::create_dir_all(&native_dir).map_err(|error| {
+        Error::State(format!(
+            "failed to create native setup directory '{}': {error}",
+            native_dir.display()
+        ))
+    })?;
+
+    if scratch_dir.exists() {
+        remove_path_if_present(&scratch_dir);
+    }
+    fs::create_dir_all(&scratch_dir).map_err(|error| {
+        Error::State(format!(
+            "failed to create native scratch directory '{}': {error}",
+            scratch_dir.display()
+        ))
+    })?;
+
+    let setup_request = NativeSetupRequest {
+        profile: profile.name.clone(),
+        key_label: Some(profile.name.clone()),
+        algorithm: NativeAlgorithm::P256,
+        curve: NativeCurve::NistP256,
+        allowed_uses,
+        hardware_binding: NativeHardwareBinding::Required,
+        private_key_policy: NativePrivateKeyPolicy::NonExportable,
+    };
+    let plan = plan_setup(
+        &setup_request,
+        &NativeSetupArtifacts {
+            scratch_dir: scratch_dir.clone(),
+            key_id: key_id.clone(),
+            persistent: NativePersistentHandle {
+                handle: persistent_handle.clone(),
+                serialized_handle_path: handle_path.clone(),
+            },
+        },
+    )?;
+
+    let execution = plan
+        .commands
+        .iter()
+        .try_for_each(|command| run_native_command_for_operation(command, runner, "native setup"));
+
+    for path in &plan.cleanup_paths {
+        remove_path_if_present(path);
+    }
+    remove_path_if_present(&scratch_dir);
+
+    execution?;
+
+    if !handle_path.is_file() {
+        return Err(Error::State(format!(
+            "native setup completed without creating serialized handle state '{}'; sign/export cannot locate the TPM object",
+            handle_path.display()
+        )));
+    }
+
+    persist_native_metadata(profile, &key_id, &persistent_handle, &handle_path);
+    Ok(())
+}
+
 fn export_native_public_key_with_runner<R>(
     profile: &Profile,
     requested_output: Option<&Path>,
@@ -182,7 +280,7 @@ where
     )?;
 
     for command in &plan.commands {
-        run_native_command(command, runner)?;
+        run_native_command_for_operation(command, runner, "native public-key export")?;
     }
 
     let exported = plan
@@ -218,12 +316,25 @@ where
     })
 }
 
-fn resolve_native_key_locator(profile: &Profile) -> Result<NativeKeyLocator> {
-    if let Some(path) = metadata_path(profile, &["native.serialized_handle_path", "native.serialized-handle-path"]) {
+const TPM_PERSISTENT_HANDLE_MIN: u32 = 0x8100_0000;
+const TPM_PERSISTENT_HANDLE_MAX: u32 = 0x81ff_ffff;
+const TPM_PERSISTENT_HANDLE_START: u32 = 0x8101_0000;
+
+pub(crate) fn resolve_native_key_locator(profile: &Profile) -> Result<NativeKeyLocator> {
+    if let Some(path) = metadata_path(
+        profile,
+        &[
+            "native.serialized_handle_path",
+            "native.serialized-handle-path",
+        ],
+    ) {
         return Ok(NativeKeyLocator::SerializedHandle { path });
     }
 
-    if let Some(handle) = metadata_value(profile, &["native.persistent_handle", "native.persistent-handle"]) {
+    if let Some(handle) = metadata_value(
+        profile,
+        &["native.persistent_handle", "native.persistent-handle"],
+    ) {
         return Ok(NativeKeyLocator::PersistentHandle { handle });
     }
 
@@ -244,6 +355,151 @@ fn resolve_native_key_locator(profile: &Profile) -> Result<NativeKeyLocator> {
     )))
 }
 
+fn native_key_uses(profile: &Profile) -> Result<Vec<NativeKeyUse>> {
+    let uses: Vec<_> = profile
+        .uses
+        .iter()
+        .map(|use_case| match use_case {
+            UseCase::Sign => Ok(NativeKeyUse::Sign),
+            UseCase::Verify => Ok(NativeKeyUse::Verify),
+            unsupported => Err(Error::Unsupported(format!(
+                "native setup is currently wired only for sign/verify uses, but profile '{}' requested {:?}",
+                profile.name, unsupported
+            ))),
+        })
+        .collect::<Result<_>>()?;
+
+    if uses.is_empty() {
+        return Err(Error::Validation(
+            "native setup requires at least one sign/verify use".to_string(),
+        ));
+    }
+
+    Ok(uses)
+}
+
+fn allocate_native_persistent_handle<R>(runner: &R) -> Result<String>
+where
+    R: CommandRunner,
+{
+    let output = runner.run(&crate::backend::CommandInvocation::new(
+        "tpm2_getcap",
+        ["handles-persistent"],
+    ));
+
+    if output.error.is_some() {
+        return Err(Error::TpmUnavailable(format!(
+            "failed to discover TPM persistent handles via 'tpm2_getcap handles-persistent': {}",
+            render_command_detail(&output)
+        )));
+    }
+
+    if output.exit_code != Some(0) {
+        return Err(Error::CapabilityMismatch(format!(
+            "failed to discover TPM persistent handles via 'tpm2_getcap handles-persistent': {}",
+            render_command_detail(&output)
+        )));
+    }
+
+    let taken = parse_persistent_handles(&output.stdout)?;
+    for candidate in TPM_PERSISTENT_HANDLE_START..=TPM_PERSISTENT_HANDLE_MAX {
+        let handle = format!("0x{candidate:08x}");
+        if !taken.contains(&handle) {
+            return Ok(handle);
+        }
+    }
+
+    Err(Error::State(
+        "no free TPM persistent handles remain in the persistent-object range".to_string(),
+    ))
+}
+
+fn parse_persistent_handles(stdout: &str) -> Result<BTreeSet<String>> {
+    let mut handles = BTreeSet::new();
+
+    for line in stdout.lines() {
+        for token in
+            line.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '[' | ']' | ':' | '-'))
+        {
+            let token = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ','));
+            if let Some(handle) = parse_persistent_handle_token(token)? {
+                handles.insert(handle);
+            }
+        }
+    }
+
+    Ok(handles)
+}
+
+fn parse_persistent_handle_token(token: &str) -> Result<Option<String>> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let normalized = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    if normalized.len() != 8 || !normalized.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+
+    let value = u32::from_str_radix(normalized, 16).map_err(|error| {
+        Error::State(format!(
+            "failed to parse persistent handle token '{trimmed}': {error}"
+        ))
+    })?;
+    if !(TPM_PERSISTENT_HANDLE_MIN..=TPM_PERSISTENT_HANDLE_MAX).contains(&value) {
+        return Ok(None);
+    }
+
+    Ok(Some(format!("0x{value:08x}")))
+}
+
+fn persist_native_metadata(
+    profile: &mut Profile,
+    key_id: &str,
+    persistent_handle: &str,
+    handle_path: &Path,
+) {
+    profile
+        .metadata
+        .insert("native.backend".to_string(), "subprocess".to_string());
+    profile
+        .metadata
+        .insert("native.key_id".to_string(), key_id.to_string());
+    profile.metadata.insert(
+        "native.locator_kind".to_string(),
+        "serialized-handle".to_string(),
+    );
+    profile.metadata.insert(
+        "native.serialized_handle_path".to_string(),
+        path_for_metadata(&profile.storage.state_layout.root_dir, handle_path),
+    );
+    profile.metadata.insert(
+        "native.persistent_handle".to_string(),
+        persistent_handle.to_string(),
+    );
+}
+
+fn path_for_metadata(root_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(root_dir)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn native_state_dir(profile: &Profile) -> PathBuf {
+    profile
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&profile.name)
+        .join("native")
+}
+
+fn native_handle_path(profile: &Profile) -> PathBuf {
+    native_state_dir(profile).join(format!("{}.handle", native_key_id(profile)))
+}
+
 fn metadata_path(profile: &Profile, keys: &[&str]) -> Option<PathBuf> {
     let value = metadata_value(profile, keys)?;
     let path = PathBuf::from(value);
@@ -262,15 +518,19 @@ fn metadata_value(profile: &Profile, keys: &[&str]) -> Option<String> {
 fn native_handle_path_candidates(profile: &Profile) -> Vec<PathBuf> {
     let objects_dir = &profile.storage.state_layout.objects_dir;
     vec![
+        native_handle_path(profile),
         objects_dir.join(format!("{}.handle", profile.name)),
-        objects_dir.join(&profile.name).join(format!("{}.handle", profile.name)),
+        objects_dir
+            .join(&profile.name)
+            .join(format!("{}.handle", profile.name)),
         objects_dir.join(&profile.name).join("key.handle"),
         objects_dir.join(&profile.name).join("persistent.handle"),
     ]
 }
 
-fn native_key_id(profile: &Profile) -> String {
-    metadata_value(profile, &["native.key_id", "native.key-id"]).unwrap_or_else(|| profile.name.clone())
+pub(crate) fn native_key_id(profile: &Profile) -> String {
+    metadata_value(profile, &["native.key_id", "native.key-id"])
+        .unwrap_or_else(|| format!("{}-signing-key", profile.name))
 }
 
 fn resolve_public_key_output_path(
@@ -292,7 +552,10 @@ fn resolve_public_key_output_path(
 }
 
 fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).map_err(|error| {
             Error::State(format!(
                 "failed to create export directory '{}': {error}",
@@ -309,7 +572,19 @@ fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
     })
 }
 
-fn run_native_command<R>(command: &NativeCommandSpec, runner: &R) -> Result<()>
+fn remove_path_if_present(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn run_native_command_for_operation<R>(
+    command: &NativeCommandSpec,
+    runner: &R,
+    operation: &str,
+) -> Result<()>
 where
     R: CommandRunner,
 {
@@ -320,7 +595,7 @@ where
 
     if output.error.is_some() {
         return Err(Error::TpmUnavailable(format!(
-            "native public-key export failed while running '{} {}': {}",
+            "{operation} failed while running '{} {}': {}",
             command.program,
             command.args.join(" "),
             render_command_detail(&output)
@@ -329,7 +604,7 @@ where
 
     if output.exit_code != Some(0) {
         return Err(Error::CapabilityMismatch(format!(
-            "native public-key export failed while running '{} {}': {}",
+            "{operation} failed while running '{} {}': {}",
             command.program,
             command.args.join(" "),
             render_command_detail(&output)
@@ -425,6 +700,7 @@ mod tests {
     use std::env;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, HeuristicProbe};
     use crate::model::ModePreference;
@@ -440,26 +716,53 @@ mod tests {
     }
 
     #[test]
-    fn setup_persists_profile_when_not_dry_run() {
+    fn setup_persists_materialized_native_profile_when_not_dry_run() {
         let root_dir = unique_temp_path("setup-persist");
+        let runner = FakeNativeSetupRunner::new();
         let request = SetupRequest {
             profile: "prod-signer".to_string(),
             algorithm: Algorithm::P256,
             uses: vec![UseCase::Verify, UseCase::Sign],
-            requested_mode: ModePreference::Auto,
+            requested_mode: ModePreference::Native,
             state_dir: Some(root_dir.clone()),
             dry_run: false,
         };
 
-        let result = resolve_profile(&HeuristicProbe, &request).expect("setup should succeed");
+        let result = resolve_profile_with_runner(&HeuristicProbe, &request, &runner)
+            .expect("setup should succeed");
         let profile_path = root_dir.join("profiles").join("prod-signer.json");
+        let handle_path = root_dir
+            .join("objects")
+            .join("prod-signer")
+            .join("native")
+            .join("prod-signer-signing-key.handle");
 
         assert!(result.persisted);
         assert_eq!(result.profile.storage.profile_path, profile_path);
         assert!(profile_path.is_file());
+        assert!(handle_path.is_file());
+        assert_eq!(
+            result.profile.metadata.get("native.key_id"),
+            Some(&"prod-signer-signing-key".to_string())
+        );
+        assert_eq!(
+            result.profile.metadata.get("native.serialized_handle_path"),
+            Some(&"objects/prod-signer/native/prod-signer-signing-key.handle".to_string())
+        );
+        assert_eq!(
+            result.profile.metadata.get("native.persistent_handle"),
+            Some(&"0x81010002".to_string())
+        );
+        assert!(!root_dir
+            .join("objects")
+            .join("prod-signer")
+            .join("native")
+            .join("setup-work")
+            .exists());
 
         let loaded = load_profile("prod-signer", Some(root_dir.clone())).expect("profile loads");
         assert_eq!(loaded, result.profile);
+        assert_eq!(runner.calls().len(), 5);
 
         fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
     }
@@ -467,19 +770,22 @@ mod tests {
     #[test]
     fn setup_dry_run_does_not_touch_state() {
         let root_dir = unique_temp_path("setup-dry-run");
+        let runner = FakeNativeSetupRunner::new();
         let request = SetupRequest {
             profile: "prod-signer".to_string(),
             algorithm: Algorithm::P256,
             uses: vec![UseCase::Sign],
-            requested_mode: ModePreference::Auto,
+            requested_mode: ModePreference::Native,
             state_dir: Some(root_dir.clone()),
             dry_run: true,
         };
 
-        let result = resolve_profile(&HeuristicProbe, &request).expect("setup should succeed");
+        let result = resolve_profile_with_runner(&HeuristicProbe, &request, &runner)
+            .expect("setup should succeed");
 
         assert!(!result.persisted);
         assert!(!root_dir.exists());
+        assert!(runner.calls().is_empty());
 
         if root_dir.exists() {
             fs::remove_dir_all(root_dir).expect("temporary dry-run state should be removed");
@@ -492,7 +798,7 @@ mod tests {
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let profile = Profile {
+        let mut profile = Profile {
             schema_version: crate::model::PROFILE_SCHEMA_VERSION,
             name: "prod-signer".to_string(),
             algorithm: Algorithm::P256,
@@ -510,10 +816,21 @@ mod tests {
             export_policy: crate::model::ExportPolicy::for_mode(Mode::Native),
             metadata: BTreeMap::new(),
         };
-        profile.persist().expect("persist profile");
 
-        let handle_path = state_layout.objects_dir.join("prod-signer.handle");
+        let handle_path = state_layout
+            .objects_dir
+            .join("prod-signer")
+            .join("native")
+            .join("prod-signer-signing-key.handle");
+        fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
         fs::write(&handle_path, b"serialized-handle").expect("handle file");
+        persist_native_metadata(
+            &mut profile,
+            "prod-signer-signing-key",
+            "0x81010002",
+            &handle_path,
+        );
+        profile.persist().expect("persist profile");
 
         let output_path = root_dir.join("custom").join("prod-signer.der");
         let result = export_native_public_key_with_runner(
@@ -528,7 +845,10 @@ mod tests {
         assert_eq!(result.kind, ExportKind::PublicKey);
         assert_eq!(result.artifact.format, ExportFormat::SpkiDer);
         assert_eq!(result.artifact.path, output_path);
-        assert_eq!(fs::read(&result.artifact.path).expect("export output"), example_spki_der());
+        assert_eq!(
+            fs::read(&result.artifact.path).expect("export output"),
+            example_spki_der()
+        );
 
         fs::remove_dir_all(root_dir).expect("temporary native export state should be removed");
     }
@@ -560,6 +880,58 @@ mod tests {
         assert!(matches!(error, Error::PolicyRefusal(message) if message.contains("PRF mode")));
 
         fs::remove_dir_all(root_dir).expect("temporary prf export state should be removed");
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeNativeSetupRunner {
+        calls: Arc<Mutex<Vec<CommandInvocation>>>,
+    }
+
+    impl FakeNativeSetupRunner {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn calls(&self) -> Vec<CommandInvocation> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl CommandRunner for FakeNativeSetupRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(invocation.clone());
+
+            match invocation.program.as_str() {
+                "tpm2_getcap" => CommandOutput {
+                    exit_code: Some(0),
+                    stdout: "- 0x81010000\n- 0x81010001\n".to_string(),
+                    stderr: String::new(),
+                    error: None,
+                },
+                "tpm2_createprimary" => {
+                    write_output_flag(invocation, "-c", b"primary-context");
+                    success_output()
+                }
+                "tpm2_create" => {
+                    write_output_flag(invocation, "-u", b"public-blob");
+                    write_output_flag(invocation, "-r", b"private-blob");
+                    success_output()
+                }
+                "tpm2_load" => {
+                    write_output_flag(invocation, "-c", b"loaded-context");
+                    write_output_flag(invocation, "-n", b"object-name");
+                    success_output()
+                }
+                "tpm2_evictcontrol" => {
+                    write_output_flag(invocation, "-o", b"serialized-handle");
+                    success_output()
+                }
+                other => panic!("unexpected command {other}"),
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -594,11 +966,32 @@ mod tests {
         }
     }
 
+    fn write_output_flag(invocation: &CommandInvocation, flag: &str, bytes: &[u8]) {
+        let output_path = invocation
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| PathBuf::from(&pair[1]))
+            .unwrap_or_else(|| panic!("{flag} output path"));
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).expect("output parent dir");
+        }
+        fs::write(output_path, bytes).expect("fake TPM output");
+    }
+
+    fn success_output() -> CommandOutput {
+        CommandOutput {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+            error: None,
+        }
+    }
+
     fn example_spki_der() -> Vec<u8> {
         let mut der = vec![
-            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
-            0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
-            0x04,
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00, 0x04,
         ];
         der.extend_from_slice(&[0x11; 32]);
         der.extend_from_slice(&[0x22; 32]);
