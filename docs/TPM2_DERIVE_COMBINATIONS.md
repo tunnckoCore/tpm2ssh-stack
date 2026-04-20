@@ -164,12 +164,12 @@ or preserve your TPM-related env when using sudo if your system already exports 
 
 Best for:
 
-- Ed25519 identities
-- SSH-oriented deterministic identities
+- Ed25519/p256/secp256k1 identities
+- SSH-oriented deterministic identities (p256/Ed25519)
 - recovery-friendly flows
 - fallback when PRF/native is not what you want
 
-### Currently usable seed combinations
+### Currently usable combinations
 
 #### Seed setup + derive
 
