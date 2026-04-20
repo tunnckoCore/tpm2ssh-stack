@@ -568,7 +568,7 @@ fn native_handle_path(profile: &Profile) -> PathBuf {
     native_state_dir(profile).join(format!("{}.handle", native_key_id(profile)))
 }
 
-fn metadata_path(profile: &Profile, keys: &[&str]) -> Option<PathBuf> {
+pub(crate) fn metadata_path(profile: &Profile, keys: &[&str]) -> Option<PathBuf> {
     let value = metadata_value(profile, keys)?;
     let path = PathBuf::from(value);
     if path.is_absolute() {
@@ -578,12 +578,12 @@ fn metadata_path(profile: &Profile, keys: &[&str]) -> Option<PathBuf> {
     }
 }
 
-fn metadata_value(profile: &Profile, keys: &[&str]) -> Option<String> {
+pub(crate) fn metadata_value(profile: &Profile, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| profile.metadata.get(*key).cloned())
 }
 
-fn native_handle_path_candidates(profile: &Profile) -> Vec<PathBuf> {
+pub(crate) fn native_handle_path_candidates(profile: &Profile) -> Vec<PathBuf> {
     let objects_dir = &profile.storage.state_layout.objects_dir;
     vec![
         native_handle_path(profile),
