@@ -10,8 +10,3 @@
 /target/
 **/target/
 
-# Local test keys
-ed-testkey
-ed-testkey.pub
-**/ed-testkey
-**/ed-testkey.pub
