@@ -18,8 +18,8 @@ use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessComma
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CapabilityReport, ExportArtifact, ExportFormat, ExportKind, ExportRequest,
-    ExportResult, InspectRequest, Mode, ModeResolution, Profile, SetupRequest, SetupResult,
-    StateLayout, UseCase,
+    ExportResult, InspectRequest, Mode, ModePreference, ModeResolution, Profile,
+    RecoveryImportRequest, RecoveryImportResult, SetupRequest, SetupResult, StateLayout, UseCase,
 };
 use crate::ops::native::subprocess::{
     NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
@@ -31,18 +31,20 @@ use crate::ops::native::{
     NativeSetupRequest,
 };
 use crate::ops::prf::{
-    PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
-    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY, PrfRootLayout,
-    SubprocessPrfBackend,
+    PrfRootLayout, SubprocessPrfBackend, PRF_CONTEXT_PATH_METADATA_KEY,
+    PRF_PARENT_CONTEXT_PATH_METADATA_KEY, PRF_PRIVATE_PATH_METADATA_KEY,
+    PRF_PUBLIC_PATH_METADATA_KEY,
 };
 use crate::ops::seed::{
-    MIN_SEED_BYTES, SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY, SEED_DERIVATION_KDF_METADATA_KEY,
+    export_recovery_bundle as export_seed_recovery_bundle, parse_recovery_bundle_json,
+    restore_recovery_bundle as restore_seed_recovery_bundle, seed_profile_from_profile,
+    SeedBackend, SeedCreateRequest, SeedCreateSource, SeedExportDestination, SeedExportFormat,
+    SeedExportRequest, SeedOpenAuthSource, SeedProfile, SeedRecoveryBundleV1,
+    SeedRecoveryImportRequest, SeedStorageKind, SubprocessSeedBackend, MIN_SEED_BYTES,
+    SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY, SEED_DERIVATION_KDF_METADATA_KEY,
     SEED_OBJECT_LABEL_METADATA_KEY, SEED_PRIVATE_BLOB_PATH_METADATA_KEY,
     SEED_PUBLIC_BLOB_PATH_METADATA_KEY, SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY,
-    SEED_STORAGE_KIND_METADATA_KEY, SeedBackend, SeedCreateRequest, SeedCreateSource,
-    SeedExportDestination, SeedExportFormat, SeedExportRequest, SeedOpenAuthSource, SeedProfile,
-    SeedRecoveryBundleV1, SeedStorageKind, SubprocessSeedBackend,
-    export_recovery_bundle as export_seed_recovery_bundle, seed_profile_from_profile,
+    SEED_STORAGE_KIND_METADATA_KEY,
 };
 
 const DEFAULT_SETUP_SEED_BYTES: usize = MIN_SEED_BYTES;
@@ -167,13 +169,6 @@ fn persist_seed_setup_profile(profile: &mut Profile, seed_backend: &dyn SeedBack
         profile.algorithm,
         profile.uses.clone(),
     )?;
-    let object_dir = profile
-        .storage
-        .state_layout
-        .objects_dir
-        .join(&seed_profile.storage.object_label);
-    let public_blob = object_dir.join("sealed.pub");
-    let private_blob = object_dir.join("sealed.priv");
 
     seed_backend.seal_seed(&SeedCreateRequest {
         profile: seed_profile.clone(),
@@ -182,6 +177,19 @@ fn persist_seed_setup_profile(profile: &mut Profile, seed_backend: &dyn SeedBack
         },
         overwrite_existing: false,
     })?;
+
+    apply_seed_profile_metadata(profile, &seed_profile);
+    Ok(())
+}
+
+fn apply_seed_profile_metadata(profile: &mut Profile, seed_profile: &SeedProfile) {
+    let object_dir = profile
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&seed_profile.storage.object_label);
+    let public_blob = object_dir.join("sealed.pub");
+    let private_blob = object_dir.join("sealed.priv");
 
     profile.metadata.insert(
         SEED_OBJECT_LABEL_METADATA_KEY.to_string(),
@@ -214,8 +222,6 @@ fn persist_seed_setup_profile(profile: &mut Profile, seed_backend: &dyn SeedBack
             .software_derived_at_use_time
             .to_string(),
     );
-
-    Ok(())
 }
 
 fn state_relative_metadata_path(profile: &Profile, path: &Path) -> String {
@@ -240,6 +246,61 @@ fn seed_kdf_name(kdf: crate::ops::seed::SeedKdf) -> &'static str {
 pub fn load_profile(profile: &str, state_dir: Option<PathBuf>) -> Result<Profile> {
     validate_profile_name(profile)?;
     Profile::load_named(profile, state_dir)
+}
+
+pub fn import_recovery_bundle(request: &RecoveryImportRequest) -> Result<RecoveryImportResult> {
+    let payload = fs::read(&request.bundle_path).map_err(|error| {
+        Error::State(format!(
+            "failed to read recovery bundle '{}': {error}",
+            request.bundle_path.display()
+        ))
+    })?;
+    let bundle = parse_recovery_bundle_json(&payload)?;
+    let state_layout = StateLayout::from_optional_root(request.state_dir.clone());
+    let backend = SubprocessSeedBackend::new(state_layout.objects_dir.clone());
+
+    import_recovery_bundle_with_backend(request, bundle, state_layout, &backend)
+}
+
+fn import_recovery_bundle_with_backend<B>(
+    request: &RecoveryImportRequest,
+    bundle: SeedRecoveryBundleV1,
+    state_layout: StateLayout,
+    backend: &B,
+) -> Result<RecoveryImportResult>
+where
+    B: SeedBackend,
+{
+    let restored = restore_seed_recovery_bundle(
+        backend,
+        &SeedRecoveryImportRequest {
+            bundle,
+            target_profile: request.profile.clone(),
+            overwrite_existing: request.overwrite_existing,
+        },
+    )?;
+    let mut profile = Profile::new(
+        restored.profile.profile.clone(),
+        restored.profile.algorithm,
+        restored.profile.uses.clone(),
+        ModeResolution {
+            requested: ModePreference::Seed,
+            resolved: Mode::Seed,
+            reasons: vec![format!(
+                "restored from seed recovery bundle for profile '{}'",
+                restored.restored_from_profile
+            )],
+        },
+        state_layout,
+    );
+    apply_seed_profile_metadata(&mut profile, &restored.profile);
+    profile.persist()?;
+
+    Ok(RecoveryImportResult {
+        profile,
+        restored_from_profile: restored.restored_from_profile,
+        seed_bytes: restored.seed_bytes,
+    })
 }
 
 fn apply_prf_root_metadata(profile: &mut Profile, layout: &PrfRootLayout) -> Result<()> {
@@ -985,6 +1046,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use secrecy::ExposeSecret;
+    use sha2::Digest as _;
+
     use crate::backend::{
         CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, HeuristicProbe,
     };
@@ -1655,6 +1719,144 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_import_persists_restored_seed_profile_metadata() {
+        let root_dir = unique_temp_path("import-seed-recovery-bundle");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let seed = vec![0x42; 32];
+        let bundle = SeedRecoveryBundleV1 {
+            schema_version: crate::ops::seed::SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
+            kind: crate::ops::seed::SEED_RECOVERY_BUNDLE_KIND.to_string(),
+            exported_at_unix_seconds: 1,
+            reason: "hardware migration".to_string(),
+            profile: crate::ops::seed::SeedRecoveryBundleProfile {
+                name: "old-profile".to_string(),
+                algorithm: Algorithm::Ed25519,
+                uses: vec![UseCase::Derive, UseCase::SshAgent],
+                derivation: crate::ops::seed::SeedDerivation::hkdf_sha256_v1(),
+            },
+            seed: crate::ops::seed::SeedRecoveryBundleSecret {
+                encoding: "hex".to_string(),
+                bytes: seed.len(),
+                sha256: seed_sha256_hex(&seed),
+                material: seed_hex_encode(&seed),
+            },
+        };
+        let backend = FakeSeedImportBackend::default();
+
+        let result = import_recovery_bundle_with_backend(
+            &RecoveryImportRequest {
+                bundle_path: root_dir.join("backup").join("seed.recovery.json"),
+                profile: Some("restored-profile".to_string()),
+                state_dir: Some(root_dir.clone()),
+                overwrite_existing: true,
+            },
+            bundle,
+            state_layout.clone(),
+            &backend,
+        )
+        .expect("recovery import should succeed");
+
+        assert_eq!(result.profile.name, "restored-profile");
+        assert_eq!(result.profile.mode.resolved, Mode::Seed);
+        assert_eq!(result.restored_from_profile, "old-profile");
+        assert_eq!(result.seed_bytes, seed.len());
+        assert_eq!(
+            result.profile.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY),
+            Some(&"restored-profile".to_string())
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_PUBLIC_BLOB_PATH_METADATA_KEY),
+            Some(&"objects/restored-profile/sealed.pub".to_string())
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_PRIVATE_BLOB_PATH_METADATA_KEY),
+            Some(&"objects/restored-profile/sealed.priv".to_string())
+        );
+
+        let persisted = Profile::load_named("restored-profile", Some(root_dir.clone()))
+            .expect("persisted restored profile");
+        assert_eq!(persisted.mode.resolved, Mode::Seed);
+        assert!(persisted
+            .mode
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("old-profile")));
+
+        let sealed = backend.last_request();
+        assert_eq!(sealed.profile_name, "restored-profile");
+        assert_eq!(sealed.object_label, "restored-profile");
+        assert!(sealed.overwrite_existing);
+        assert_eq!(sealed.seed, seed);
+
+        fs::remove_dir_all(root_dir).expect("temporary import state should be removed");
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeSeedImportBackend {
+        last_request: Arc<Mutex<Option<RecordedSeedImport>>>,
+    }
+
+    impl FakeSeedImportBackend {
+        fn last_request(&self) -> RecordedSeedImport {
+            self.last_request
+                .lock()
+                .expect("last request")
+                .clone()
+                .expect("recorded seed import")
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedSeedImport {
+        profile_name: String,
+        object_label: String,
+        overwrite_existing: bool,
+        seed: Vec<u8>,
+    }
+
+    impl crate::ops::seed::SeedBackend for FakeSeedImportBackend {
+        fn seal_seed(&self, request: &crate::ops::seed::SeedCreateRequest) -> Result<()> {
+            let seed = match &request.source {
+                crate::ops::seed::SeedCreateSource::Import {
+                    ingress,
+                    material: Some(material),
+                } => {
+                    assert_eq!(*ingress, crate::ops::seed::SeedImportIngress::InMemory);
+                    material.expose_secret().clone()
+                }
+                other => panic!("expected imported seed source, found {other:?}"),
+            };
+
+            self.last_request
+                .lock()
+                .expect("last request")
+                .replace(RecordedSeedImport {
+                    profile_name: request.profile.profile.clone(),
+                    object_label: request.profile.storage.object_label.clone(),
+                    overwrite_existing: request.overwrite_existing,
+                    seed,
+                });
+            Ok(())
+        }
+
+        fn unseal_seed(
+            &self,
+            _profile: &crate::ops::seed::SeedProfile,
+            _auth_source: &crate::ops::seed::SeedOpenAuthSource,
+        ) -> Result<crate::ops::seed::SeedMaterial> {
+            unreachable!("recovery import should only seal imported seeds")
+        }
+    }
+
     #[derive(Clone)]
     struct FakeSeedExportBackend {
         seed: Vec<u8>,
@@ -1710,6 +1912,15 @@ mod tests {
                 error: None,
             }
         }
+    }
+
+    fn seed_hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn seed_sha256_hex(bytes: &[u8]) -> String {
+        let digest = sha2::Sha256::digest(bytes);
+        seed_hex_encode(&digest)
     }
 
     fn write_output_flag(invocation: &CommandInvocation, flag: &str, bytes: &[u8]) {

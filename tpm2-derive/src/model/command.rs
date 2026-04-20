@@ -120,6 +120,21 @@ pub struct ExportResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RecoveryImportRequest {
+    pub bundle_path: PathBuf,
+    pub profile: Option<String>,
+    pub state_dir: Option<PathBuf>,
+    pub overwrite_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RecoveryImportResult {
+    pub profile: Profile,
+    pub restored_from_profile: String,
+    pub seed_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SshAgentAddRequest {
     pub profile: String,
     pub comment: Option<String>,

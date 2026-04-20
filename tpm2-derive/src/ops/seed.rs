@@ -15,6 +15,7 @@ use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, Profile, UseCase};
 
 pub const SEED_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const SEED_RECOVERY_BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const SEED_RECOVERY_BUNDLE_KIND: &str = "seed-recovery-bundle-v1";
 pub const MIN_SEED_BYTES: usize = 32;
 pub const MAX_SEED_BYTES: usize = 64;
 pub const MAX_DERIVED_BYTES: usize = 4096;
@@ -272,6 +273,29 @@ pub struct SeedExportPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SeedRecoveryImportRequest {
+    pub bundle: SeedRecoveryBundleV1,
+    pub target_profile: Option<String>,
+    pub overwrite_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SeedRecoveryImportPlan {
+    pub profile: SeedProfile,
+    pub restored_from_profile: String,
+    pub seed_bytes: usize,
+    pub warnings: Vec<Diagnostic>,
+    pub next_backend_action: SeedBackendAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SeedRecoveryImportResult {
+    pub profile: SeedProfile,
+    pub restored_from_profile: String,
+    pub seed_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SeedRecoveryBundleV1 {
     pub schema_version: u32,
     pub kind: String,
@@ -495,6 +519,70 @@ pub fn seed_profile_from_profile(profile: &Profile) -> Result<SeedProfile> {
     }
 
     Ok(seed_profile)
+}
+
+pub fn parse_recovery_bundle_json(payload: &[u8]) -> Result<SeedRecoveryBundleV1> {
+    let bundle: SeedRecoveryBundleV1 = serde_json::from_slice(payload)?;
+    decode_recovery_bundle_seed(&bundle)?;
+    Ok(bundle)
+}
+
+pub fn plan_recovery_import(request: &SeedRecoveryImportRequest) -> Result<SeedRecoveryImportPlan> {
+    let seed = decode_recovery_bundle_seed(&request.bundle)?;
+    let profile_name = request
+        .target_profile
+        .clone()
+        .unwrap_or_else(|| request.bundle.profile.name.clone());
+    let profile = SeedProfile {
+        schema_version: SEED_PROFILE_SCHEMA_VERSION,
+        profile: profile_name.clone(),
+        algorithm: request.bundle.profile.algorithm,
+        uses: normalize_uses(request.bundle.profile.uses.clone()),
+        storage: SeedStorage::tpm_sealed(profile_name),
+        derivation: request.bundle.profile.derivation.clone(),
+        export_policy: SeedExportPolicy::high_friction_recovery_only(),
+    };
+    validate_seed_profile(&profile)?;
+
+    let mut warnings = seed_mode_usage_warnings(&profile);
+    warnings.push(Diagnostic {
+        level: DiagnosticLevel::Warning,
+        code: "SEED_RECOVERY_IMPORT".to_string(),
+        message: format!(
+            "recovery import consumes exported seed material outside TPM sealed-at-rest protection; protect the bundle until import is complete"
+        ),
+    });
+
+    Ok(SeedRecoveryImportPlan {
+        profile,
+        restored_from_profile: request.bundle.profile.name.clone(),
+        seed_bytes: seed.len(),
+        warnings,
+        next_backend_action: SeedBackendAction::SealImportedSeed,
+    })
+}
+
+pub fn restore_recovery_bundle(
+    backend: &dyn SeedBackend,
+    request: &SeedRecoveryImportRequest,
+) -> Result<SeedRecoveryImportResult> {
+    let plan = plan_recovery_import(request)?;
+    let seed = decode_recovery_bundle_seed(&request.bundle)?;
+
+    backend.seal_seed(&SeedCreateRequest {
+        profile: plan.profile.clone(),
+        source: SeedCreateSource::Import {
+            ingress: SeedImportIngress::InMemory,
+            material: Some(SecretBox::new(Box::new(seed))),
+        },
+        overwrite_existing: request.overwrite_existing,
+    })?;
+
+    Ok(SeedRecoveryImportResult {
+        profile: plan.profile,
+        restored_from_profile: plan.restored_from_profile,
+        seed_bytes: plan.seed_bytes,
+    })
 }
 
 pub fn export_recovery_bundle(
@@ -1037,7 +1125,7 @@ pub fn open_and_derive(
 fn build_recovery_bundle(request: &SeedExportRequest, seed: &[u8]) -> SeedRecoveryBundleV1 {
     SeedRecoveryBundleV1 {
         schema_version: SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
-        kind: "seed-recovery-bundle-v1".to_string(),
+        kind: SEED_RECOVERY_BUNDLE_KIND.to_string(),
         exported_at_unix_seconds: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time before unix epoch")
@@ -1237,6 +1325,49 @@ fn required_export_confirmations(policy: &SeedExportPolicy) -> Vec<String> {
     confirmations
 }
 
+fn decode_recovery_bundle_seed(bundle: &SeedRecoveryBundleV1) -> Result<Vec<u8>> {
+    if bundle.schema_version != SEED_RECOVERY_BUNDLE_SCHEMA_VERSION {
+        return Err(Error::Validation(format!(
+            "unsupported seed recovery bundle schema version: {}",
+            bundle.schema_version
+        )));
+    }
+
+    if bundle.kind != SEED_RECOVERY_BUNDLE_KIND {
+        return Err(Error::Validation(format!(
+            "unsupported seed recovery bundle kind: {}",
+            bundle.kind
+        )));
+    }
+
+    if bundle.seed.encoding != "hex" {
+        return Err(Error::Validation(format!(
+            "unsupported seed recovery bundle encoding: {}",
+            bundle.seed.encoding
+        )));
+    }
+
+    let seed = hex_decode(&bundle.seed.material)?;
+    validate_seed_len(seed.len())?;
+
+    if bundle.seed.bytes != seed.len() {
+        return Err(Error::Validation(format!(
+            "seed recovery bundle declared {} bytes but decoded {} bytes",
+            bundle.seed.bytes,
+            seed.len()
+        )));
+    }
+
+    let digest = sha256_hex(&seed);
+    if bundle.seed.sha256 != digest {
+        return Err(Error::Validation(
+            "seed recovery bundle sha256 did not match decoded seed material".to_string(),
+        ));
+    }
+
+    Ok(seed)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1244,6 +1375,28 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return Err(Error::Validation(
+            "seed recovery bundle hex material must have an even number of characters".to_string(),
+        ));
+    }
+
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            let pair = std::str::from_utf8(pair).expect("hex pairs are ascii");
+            u8::from_str_radix(pair, 16).map_err(|_| {
+                Error::Validation(format!(
+                    "seed recovery bundle hex material contained invalid data at byte index {index}"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1380,7 +1533,7 @@ mod tests {
             .expect("recovery bundle should export");
 
         assert_eq!(bundle.schema_version, SEED_RECOVERY_BUNDLE_SCHEMA_VERSION);
-        assert_eq!(bundle.kind, "seed-recovery-bundle-v1");
+        assert_eq!(bundle.kind, SEED_RECOVERY_BUNDLE_KIND);
         assert_eq!(bundle.reason, "hardware migration");
         assert_eq!(bundle.profile.name, "seed-profile");
         assert_eq!(bundle.seed.encoding, "hex");
@@ -1388,6 +1541,82 @@ mod tests {
         assert_eq!(bundle.seed.material, hex_encode(&seed));
         assert_eq!(bundle.seed.sha256, sha256_hex(&seed));
         assert!(bundle.exported_at_unix_seconds > 0);
+    }
+
+    #[test]
+    fn parse_recovery_bundle_json_rejects_sha256_mismatch() {
+        let bundle = SeedRecoveryBundleV1 {
+            schema_version: SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
+            kind: SEED_RECOVERY_BUNDLE_KIND.to_string(),
+            exported_at_unix_seconds: 1,
+            reason: "hardware migration".to_string(),
+            profile: SeedRecoveryBundleProfile {
+                name: "seed-profile".to_string(),
+                algorithm: Algorithm::Ed25519,
+                uses: vec![UseCase::Derive],
+                derivation: SeedDerivation::hkdf_sha256_v1(),
+            },
+            seed: SeedRecoveryBundleSecret {
+                encoding: "hex".to_string(),
+                bytes: 32,
+                sha256: "00".repeat(32),
+                material: "11".repeat(32),
+            },
+        };
+
+        let payload = serde_json::to_vec(&bundle).expect("bundle json");
+        let error = parse_recovery_bundle_json(&payload).expect_err("sha mismatch should fail");
+        assert!(error.to_string().contains("sha256 did not match"));
+    }
+
+    #[test]
+    fn restore_recovery_bundle_reseals_seed_with_target_profile_override() {
+        let seed = sample_seed();
+        let request = SeedRecoveryImportRequest {
+            bundle: SeedRecoveryBundleV1 {
+                schema_version: SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
+                kind: SEED_RECOVERY_BUNDLE_KIND.to_string(),
+                exported_at_unix_seconds: 1,
+                reason: "hardware migration".to_string(),
+                profile: SeedRecoveryBundleProfile {
+                    name: "old-profile".to_string(),
+                    algorithm: Algorithm::Ed25519,
+                    uses: vec![UseCase::Derive, UseCase::SshAgent],
+                    derivation: SeedDerivation::hkdf_sha256_v1(),
+                },
+                seed: SeedRecoveryBundleSecret {
+                    encoding: "hex".to_string(),
+                    bytes: seed.len(),
+                    sha256: sha256_hex(&seed),
+                    material: hex_encode(&seed),
+                },
+            },
+            target_profile: Some("new-profile".to_string()),
+            overwrite_existing: true,
+        };
+        let backend = RecordingImportBackend::default();
+
+        let result = restore_recovery_bundle(&backend, &request).expect("restore bundle");
+
+        assert_eq!(result.profile.profile, "new-profile");
+        assert_eq!(result.profile.storage.object_label, "new-profile");
+        assert_eq!(result.restored_from_profile, "old-profile");
+        assert_eq!(result.seed_bytes, seed.len());
+
+        let sealed = backend.last_request.borrow();
+        let sealed = sealed.as_ref().expect("seal request recorded");
+        assert!(sealed.overwrite_existing);
+        assert_eq!(sealed.profile.profile, "new-profile");
+        match &sealed.source {
+            RecordedSeedCreateSource::Import {
+                ingress,
+                material: Some(material),
+            } => {
+                assert_eq!(*ingress, SeedImportIngress::InMemory);
+                assert_eq!(material.expose_secret().as_slice(), seed.as_slice());
+            }
+            other => panic!("expected imported seed, found {other:?}"),
+        }
     }
 
     #[test]
@@ -1440,6 +1669,58 @@ mod tests {
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.0.clone())))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingImportBackend {
+        last_request: RefCell<Option<RecordedSealRequest>>,
+    }
+
+    #[derive(Debug)]
+    struct RecordedSealRequest {
+        profile: SeedProfile,
+        overwrite_existing: bool,
+        source: RecordedSeedCreateSource,
+    }
+
+    #[derive(Debug)]
+    enum RecordedSeedCreateSource {
+        GenerateRandom,
+        Import {
+            ingress: SeedImportIngress,
+            material: Option<SeedMaterial>,
+        },
+    }
+
+    impl SeedBackend for RecordingImportBackend {
+        fn seal_seed(&self, request: &SeedCreateRequest) -> Result<()> {
+            let source = match &request.source {
+                SeedCreateSource::GenerateRandom { .. } => RecordedSeedCreateSource::GenerateRandom,
+                SeedCreateSource::Import { ingress, material } => {
+                    RecordedSeedCreateSource::Import {
+                        ingress: ingress.clone(),
+                        material: material.as_ref().map(|material| {
+                            clone_seed_material(material).expect("clone seed material")
+                        }),
+                    }
+                }
+            };
+
+            self.last_request.replace(Some(RecordedSealRequest {
+                profile: request.profile.clone(),
+                overwrite_existing: request.overwrite_existing,
+                source,
+            }));
+            Ok(())
+        }
+
+        fn unseal_seed(
+            &self,
+            _profile: &SeedProfile,
+            _auth_source: &SeedOpenAuthSource,
+        ) -> Result<SeedMaterial> {
+            unreachable!("recovery import does not unseal from the backend")
         }
     }
 
