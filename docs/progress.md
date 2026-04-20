@@ -74,6 +74,23 @@ _As of 2026-04-20._
 - `cargo test -p tpm2ssh` passed (`3 tests`)
 - `cargo check` passed
 
+## Cycle 3 — 2026-04-20
+
+### Landed this cycle
+- clap help text for top-level commands, subcommands, flags, and enum values
+- user-facing combinations guide: `docs/TPM2_DERIVE_COMBINATIONS.md`
+- troubleshooting note for the common PRF-under-sudo TCTI/Tabrmd failure mode
+
+### Result after change
+- `tpm2-derive --help` is now much more informative
+- subcommand help now explains what flags mean instead of showing bare names only
+- there is now a user-friendly matrix explaining which algorithm/mode/use combinations currently make sense
+- the PRF failure mode the user hit is documented as a transport/TCTI environment problem, not just a generic mode mismatch
+
+### Validation
+- `cargo test -p tpm2-derive` passed
+- verified help output by building with a temporary cargo target dir and checking `--help`
+
 ## Next cycle targets
 1. add CLI command path for recovery import / restore
 2. expand `ssh agent add` beyond seed `ed25519`
