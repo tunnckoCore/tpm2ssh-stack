@@ -5,10 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret, SecretSlice};
 use serde::{Deserialize, Serialize};
+use tempfile::{Builder as TempfileBuilder, TempDir};
 
 use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationVersion, OutputKind};
 use crate::error::{Error, Result};
+
+pub const PRF_CONTEXT_PATH_METADATA_KEY: &str = "prf.context-path";
+pub const PRF_PARENT_CONTEXT_PATH_METADATA_KEY: &str = "prf.parent-context-path";
+pub const PRF_PUBLIC_PATH_METADATA_KEY: &str = "prf.public-path";
+pub const PRF_PRIVATE_PATH_METADATA_KEY: &str = "prf.private-path";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -188,6 +194,148 @@ impl TpmPrfWorkspace {
             root_dir,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrfRootLayout {
+    pub object_dir: PathBuf,
+    pub parent_context_path: PathBuf,
+    pub public_path: PathBuf,
+    pub private_path: PathBuf,
+    pub loaded_context_path: PathBuf,
+}
+
+impl PrfRootLayout {
+    pub fn for_profile(objects_dir: &Path, profile: &str) -> Self {
+        Self::for_object_dir(objects_dir.join(profile))
+    }
+
+    fn for_object_dir(object_dir: PathBuf) -> Self {
+        Self {
+            parent_context_path: object_dir.join("parent.ctx"),
+            public_path: object_dir.join("prf-root.pub"),
+            private_path: object_dir.join("prf-root.priv"),
+            loaded_context_path: object_dir.join("prf-root.ctx"),
+            object_dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubprocessPrfBackend<R = ProcessCommandRunner> {
+    objects_dir: PathBuf,
+    runner: R,
+}
+
+impl SubprocessPrfBackend<ProcessCommandRunner> {
+    pub fn new(objects_dir: impl Into<PathBuf>) -> Self {
+        Self::with_runner(objects_dir, ProcessCommandRunner)
+    }
+}
+
+impl<R> SubprocessPrfBackend<R> {
+    pub fn with_runner(objects_dir: impl Into<PathBuf>, runner: R) -> Self {
+        Self {
+            objects_dir: objects_dir.into(),
+            runner,
+        }
+    }
+
+    pub fn objects_dir(&self) -> &Path {
+        &self.objects_dir
+    }
+
+    pub fn root_layout(&self, profile: &str) -> PrfRootLayout {
+        PrfRootLayout::for_profile(&self.objects_dir, profile)
+    }
+}
+
+impl<R> SubprocessPrfBackend<R>
+where
+    R: CommandRunner,
+{
+    pub fn provision_root(&self, profile: &str) -> Result<PrfRootLayout> {
+        fs::create_dir_all(&self.objects_dir).map_err(|error| {
+            Error::State(format!(
+                "failed to create PRF objects directory '{}': {error}",
+                self.objects_dir.display()
+            ))
+        })?;
+
+        let final_layout = self.root_layout(profile);
+        if final_layout.object_dir.exists() {
+            return Err(Error::State(format!(
+                "PRF root material already exists for profile '{}' at '{}'",
+                profile,
+                final_layout.object_dir.display()
+            )));
+        }
+
+        let staging = self.new_root_staging()?;
+        self.run_checked(&create_primary_invocation(
+            &staging.layout.parent_context_path,
+        ))?;
+        self.run_checked(&create_prf_root_invocation(
+            &staging.layout.parent_context_path,
+            &staging.layout.public_path,
+            &staging.layout.private_path,
+        ))?;
+        self.run_checked(&load_prf_root_invocation(
+            &staging.layout.parent_context_path,
+            &staging.layout.public_path,
+            &staging.layout.private_path,
+            &staging.layout.loaded_context_path,
+        ))?;
+
+        self.commit_root_staging(staging, &final_layout)
+    }
+
+    fn new_root_staging(&self) -> Result<PrfRootStaging> {
+        let tempdir = TempfileBuilder::new()
+            .prefix("prf-root-")
+            .tempdir_in(&self.objects_dir)
+            .map_err(|error| {
+                Error::State(format!(
+                    "failed to create PRF staging directory under '{}': {error}",
+                    self.objects_dir.display()
+                ))
+            })?;
+        let layout = PrfRootLayout::for_object_dir(tempdir.path().to_path_buf());
+
+        Ok(PrfRootStaging { layout, tempdir })
+    }
+
+    fn commit_root_staging(
+        &self,
+        staging: PrfRootStaging,
+        final_layout: &PrfRootLayout,
+    ) -> Result<PrfRootLayout> {
+        let staging_path = staging.tempdir.keep();
+        fs::rename(&staging_path, &final_layout.object_dir).map_err(|error| {
+            Error::State(format!(
+                "failed to persist PRF root material '{}' -> '{}': {error}",
+                staging_path.display(),
+                final_layout.object_dir.display()
+            ))
+        })?;
+
+        Ok(final_layout.clone())
+    }
+
+    fn run_checked(&self, invocation: &CommandInvocation) -> Result<CommandOutput> {
+        let output = self.runner.run(invocation);
+        if output.error.is_none() && output.exit_code == Some(0) {
+            return Ok(output);
+        }
+
+        Err(classify_prf_setup_command_error(invocation, &output))
+    }
+}
+
+#[derive(Debug)]
+struct PrfRootStaging {
+    layout: PrfRootLayout,
+    tempdir: TempDir,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -373,6 +521,67 @@ pub fn finalize(request: PrfRequest, raw: RawPrfOutput) -> Result<PrfResponse> {
     })
 }
 
+fn create_primary_invocation(parent_context_path: &Path) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_createprimary",
+        [
+            "-C".to_string(),
+            "o".to_string(),
+            "-g".to_string(),
+            "sha256".to_string(),
+            "-G".to_string(),
+            "rsa".to_string(),
+            "-c".to_string(),
+            path_arg(parent_context_path),
+        ],
+    )
+}
+
+fn create_prf_root_invocation(
+    parent_context_path: &Path,
+    public_path: &Path,
+    private_path: &Path,
+) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_create",
+        [
+            "-C".to_string(),
+            path_arg(parent_context_path),
+            "-g".to_string(),
+            "sha256".to_string(),
+            "-G".to_string(),
+            "keyedhash".to_string(),
+            "-a".to_string(),
+            "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign".to_string(),
+            "-u".to_string(),
+            path_arg(public_path),
+            "-r".to_string(),
+            path_arg(private_path),
+        ],
+    )
+}
+
+fn load_prf_root_invocation(
+    parent_context_path: &Path,
+    public_path: &Path,
+    private_path: &Path,
+    loaded_context_path: &Path,
+) -> CommandInvocation {
+    CommandInvocation::new(
+        "tpm2_load",
+        [
+            "-C".to_string(),
+            path_arg(parent_context_path),
+            "-u".to_string(),
+            path_arg(public_path),
+            "-r".to_string(),
+            path_arg(private_path),
+            "-c".to_string(),
+            path_arg(loaded_context_path),
+        ],
+    )
+}
+
 fn ensure_matching_versions(
     request_version: PrfProtocolVersion,
     response_version: PrfProtocolVersion,
@@ -421,6 +630,29 @@ fn temp_workspace_root(profile: &str) -> Result<PathBuf> {
         sanitized_profile,
         now.as_nanos()
     )))
+}
+
+fn classify_prf_setup_command_error(
+    invocation: &CommandInvocation,
+    output: &CommandOutput,
+) -> Error {
+    let detail = render_command_detail(output);
+    let message = format!(
+        "PRF setup failed while running '{} {}'{}",
+        invocation.program,
+        invocation.args.join(" "),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    );
+
+    if output.error.is_some() {
+        Error::TpmUnavailable(message)
+    } else {
+        Error::CapabilityMismatch(message)
+    }
 }
 
 fn command_succeeded(output: &CommandOutput) -> bool {

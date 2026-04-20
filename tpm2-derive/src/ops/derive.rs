@@ -13,17 +13,15 @@ use crate::error::{Error, Result};
 use crate::model::{DeriveRequest, DeriveResult, Mode, Profile};
 
 use super::prf::{
-    PrfRequest, TpmPrfExecutor, TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, plan_tpm_prf_in,
+    PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
+    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY, PrfRequest, TpmPrfExecutor,
+    TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, plan_tpm_prf_in,
 };
 use super::seed::{
     HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
     SeedProfile, SeedSoftwareDeriver, SoftwareSeedDerivationRequest, open_and_derive,
 };
 
-const PRF_CONTEXT_PATH_METADATA_KEY: &str = "prf.context-path";
-const PRF_PARENT_CONTEXT_PATH_METADATA_KEY: &str = "prf.parent-context-path";
-const PRF_PUBLIC_PATH_METADATA_KEY: &str = "prf.public-path";
-const PRF_PRIVATE_PATH_METADATA_KEY: &str = "prf.private-path";
 const SEED_OBJECT_LABEL_METADATA_KEY: &str = "seed.object-label";
 
 pub fn execute_with_defaults<R>(
@@ -156,33 +154,18 @@ fn derive_spec(request: &DeriveRequest) -> Result<DerivationSpec> {
 fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
     let object_dir = profile.storage.state_layout.objects_dir.join(&profile.name);
 
-    if let Some(context_path) = profile.metadata.get(PRF_CONTEXT_PATH_METADATA_KEY) {
-        return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
-            context_path: PathBuf::from(context_path),
-        }));
-    }
-
-    for file_name in ["prf-root.ctx", "root.ctx", "key.ctx"] {
-        let candidate = object_dir.join(file_name);
-        if candidate.is_file() {
-            return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
-                context_path: candidate,
-            }));
-        }
-    }
-
     let metadata_parent = profile
         .metadata
         .get(PRF_PARENT_CONTEXT_PATH_METADATA_KEY)
-        .map(PathBuf::from);
+        .map(|path| resolve_state_path(profile, path));
     let metadata_public = profile
         .metadata
         .get(PRF_PUBLIC_PATH_METADATA_KEY)
-        .map(PathBuf::from);
+        .map(|path| resolve_state_path(profile, path));
     let metadata_private = profile
         .metadata
         .get(PRF_PRIVATE_PATH_METADATA_KEY)
-        .map(PathBuf::from);
+        .map(|path| resolve_state_path(profile, path));
 
     if let (Some(parent_context_path), Some(public_path), Some(private_path)) =
         (metadata_parent, metadata_public, metadata_private)
@@ -210,13 +193,40 @@ fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
         }
     }
 
+    if let Some(context_path) = profile
+        .metadata
+        .get(PRF_CONTEXT_PATH_METADATA_KEY)
+        .map(|path| resolve_state_path(profile, path))
+    {
+        return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
+            context_path,
+        }));
+    }
+
+    for file_name in ["prf-root.ctx", "root.ctx", "key.ctx"] {
+        let candidate = object_dir.join(file_name);
+        if candidate.is_file() {
+            return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
+                context_path: candidate,
+            }));
+        }
+    }
+
     Err(Error::Unsupported(format!(
-        "profile '{}' resolved to PRF mode but no PRF root material was found; expected metadata '{}' or object files like '{}/prf-root.ctx' or loadable blobs under '{}'",
+        "profile '{}' resolved to PRF mode but no PRF root material was found; expected metadata '{}' or loadable blobs under '{}'",
         profile.name,
         PRF_CONTEXT_PATH_METADATA_KEY,
-        object_dir.display(),
         object_dir.display()
     )))
+}
+
+fn resolve_state_path(profile: &Profile, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        profile.storage.state_layout.root_dir.join(path)
+    }
 }
 
 fn seed_profile_from_profile(profile: &Profile) -> Result<SeedProfile> {
@@ -325,6 +335,48 @@ mod tests {
     }
 
     #[test]
+    fn executes_prf_derive_from_relative_loadable_metadata() {
+        let root_dir = unique_temp_path("derive-prf-relative-loadable");
+        let object_dir = root_dir.join("objects").join("prf-profile");
+        fs::create_dir_all(&object_dir).expect("create object dir");
+        fs::write(object_dir.join("parent.ctx"), b"parent").expect("write parent context");
+        fs::write(object_dir.join("prf-root.pub"), b"pub").expect("write public blob");
+        fs::write(object_dir.join("prf-root.priv"), b"priv").expect("write private blob");
+        fs::write(object_dir.join("prf-root.ctx"), b"loaded").expect("write loaded context");
+
+        let mut profile = test_profile(root_dir.clone(), "prf-profile", Mode::Prf);
+        profile.metadata.insert(
+            PRF_PARENT_CONTEXT_PATH_METADATA_KEY.to_string(),
+            "objects/prf-profile/parent.ctx".to_string(),
+        );
+        profile.metadata.insert(
+            PRF_PUBLIC_PATH_METADATA_KEY.to_string(),
+            "objects/prf-profile/prf-root.pub".to_string(),
+        );
+        profile.metadata.insert(
+            PRF_PRIVATE_PATH_METADATA_KEY.to_string(),
+            "objects/prf-profile/prf-root.priv".to_string(),
+        );
+        profile.metadata.insert(
+            PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+            "objects/prf-profile/prf-root.ctx".to_string(),
+        );
+
+        let request = test_request("prf-profile", 16);
+        let runner = FakePrfRunner::new(b"raw-prf-material".to_vec());
+        let seed_backend = FakeSeedBackend::default();
+        let seed_deriver = FakeSeedDeriver::default();
+
+        let result = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+            .expect("prf derive should succeed");
+
+        assert_eq!(result.mode, Mode::Prf);
+        assert_eq!(runner.recorded_programs(), vec!["tpm2_load", "tpm2_hmac"]);
+
+        fs::remove_dir_all(root_dir).expect("remove temp dir");
+    }
+
+    #[test]
     fn reports_unsupported_when_prf_material_is_missing() {
         let root_dir = unique_temp_path("derive-prf-missing");
         let profile = test_profile(root_dir.clone(), "prf-profile", Mode::Prf);
@@ -423,6 +475,15 @@ mod tests {
                 raw_output,
                 invocations: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn recorded_programs(&self) -> Vec<String> {
+            self.invocations
+                .lock()
+                .expect("lock invocations")
+                .iter()
+                .map(|invocation| invocation.program.clone())
+                .collect()
         }
     }
 

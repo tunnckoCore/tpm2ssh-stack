@@ -25,6 +25,11 @@ use crate::ops::native::{
     NativePrivateKeyPolicy, NativePublicKeyEncoding, NativePublicKeyExportRequest,
     NativeSetupRequest,
 };
+use crate::ops::prf::{
+    PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
+    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY, PrfRootLayout,
+    SubprocessPrfBackend,
+};
 
 pub fn inspect(probe: &dyn CapabilityProbe, request: &InspectRequest) -> CapabilityReport {
     probe.detect(request.algorithm, &normalize_uses(request.uses.clone()))
@@ -81,10 +86,25 @@ where
     let persisted = if request.dry_run {
         false
     } else {
-        if profile.mode.resolved == Mode::Native {
-            materialize_native_setup(&mut profile, runner)?;
+        let provisioned_dir = match profile.mode.resolved {
+            Mode::Native => {
+                materialize_native_setup(&mut profile, runner)?;
+                None
+            }
+            Mode::Prf => {
+                let layout = materialize_prf_setup(&mut profile, runner)?;
+                Some(layout.object_dir)
+            }
+            Mode::Seed => None,
+        };
+
+        if let Err(error) = profile.persist() {
+            if let Some(path) = provisioned_dir {
+                let _ = fs::remove_dir_all(path);
+            }
+            return Err(error);
         }
-        profile.persist()?;
+
         true
     };
 
@@ -98,6 +118,54 @@ where
 pub fn load_profile(profile: &str, state_dir: Option<PathBuf>) -> Result<Profile> {
     validate_profile_name(profile)?;
     Profile::load_named(profile, state_dir)
+}
+
+fn apply_prf_root_metadata(profile: &mut Profile, layout: &PrfRootLayout) -> Result<()> {
+    profile.metadata.insert(
+        PRF_PARENT_CONTEXT_PATH_METADATA_KEY.to_string(),
+        persistable_state_path(&profile.storage.state_layout, &layout.parent_context_path)?,
+    );
+    profile.metadata.insert(
+        PRF_PUBLIC_PATH_METADATA_KEY.to_string(),
+        persistable_state_path(&profile.storage.state_layout, &layout.public_path)?,
+    );
+    profile.metadata.insert(
+        PRF_PRIVATE_PATH_METADATA_KEY.to_string(),
+        persistable_state_path(&profile.storage.state_layout, &layout.private_path)?,
+    );
+    profile.metadata.insert(
+        PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+        persistable_state_path(&profile.storage.state_layout, &layout.loaded_context_path)?,
+    );
+    Ok(())
+}
+
+fn materialize_prf_setup<R>(profile: &mut Profile, runner: &R) -> Result<PrfRootLayout>
+where
+    R: CommandRunner,
+{
+    let backend = SubprocessPrfBackend::with_runner(
+        profile.storage.state_layout.objects_dir.clone(),
+        runner,
+    );
+    let layout = backend.provision_root(&profile.name)?;
+    apply_prf_root_metadata(profile, &layout)?;
+    Ok(layout)
+}
+
+fn persistable_state_path(state_layout: &StateLayout, path: &Path) -> Result<String> {
+    if path.starts_with(&state_layout.root_dir) {
+        let relative = path.strip_prefix(&state_layout.root_dir).map_err(|error| {
+            Error::State(format!(
+                "failed to persist state path '{}' relative to '{}': {error}",
+                path.display(),
+                state_layout.root_dir.display()
+            ))
+        })?;
+        return Ok(relative.display().to_string());
+    }
+
+    Ok(path.display().to_string())
 }
 
 pub fn export(request: &ExportRequest) -> Result<ExportResult> {
@@ -702,8 +770,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, HeuristicProbe};
-    use crate::model::ModePreference;
+    use crate::backend::{
+        CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, HeuristicProbe,
+    };
+    use crate::model::{Diagnostic, ModePreference, NativeCapabilitySummary, TpmStatus};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -790,6 +860,72 @@ mod tests {
         if root_dir.exists() {
             fs::remove_dir_all(root_dir).expect("temporary dry-run state should be removed");
         }
+    }
+
+    #[test]
+    fn setup_prf_provisions_root_material_and_persists_relative_metadata() {
+        let root_dir = unique_temp_path("setup-prf-provision");
+        let request = SetupRequest {
+            profile: "prf-default".to_string(),
+            algorithm: Algorithm::Ed25519,
+            uses: vec![UseCase::Derive],
+            requested_mode: ModePreference::Prf,
+            state_dir: Some(root_dir.clone()),
+            dry_run: false,
+        };
+        let probe = StaticCapabilityProbe::prf();
+        let runner = FakePrfSetupRunner::default();
+
+        let result = resolve_profile_with_runner(&probe, &request, &runner)
+            .expect("PRF setup should succeed");
+        let object_dir = root_dir.join("objects").join("prf-default");
+
+        assert!(result.persisted);
+        assert!(object_dir.join("parent.ctx").is_file());
+        assert!(object_dir.join("prf-root.pub").is_file());
+        assert!(object_dir.join("prf-root.priv").is_file());
+        assert!(object_dir.join("prf-root.ctx").is_file());
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(PRF_PARENT_CONTEXT_PATH_METADATA_KEY)
+                .map(String::as_str),
+            Some("objects/prf-default/parent.ctx")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(PRF_PUBLIC_PATH_METADATA_KEY)
+                .map(String::as_str),
+            Some("objects/prf-default/prf-root.pub")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(PRF_PRIVATE_PATH_METADATA_KEY)
+                .map(String::as_str),
+            Some("objects/prf-default/prf-root.priv")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(PRF_CONTEXT_PATH_METADATA_KEY)
+                .map(String::as_str),
+            Some("objects/prf-default/prf-root.ctx")
+        );
+
+        let loaded = load_profile("prf-default", Some(root_dir.clone())).expect("profile loads");
+        assert_eq!(loaded.metadata, result.profile.metadata);
+        assert_eq!(
+            runner.recorded_programs(),
+            vec!["tpm2_createprimary", "tpm2_create", "tpm2_load"]
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary prf setup state should be removed");
     }
 
     #[test]
@@ -932,6 +1068,100 @@ mod tests {
                 other => panic!("unexpected command {other}"),
             }
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct StaticCapabilityProbe {
+        report: CapabilityReport,
+    }
+
+    impl StaticCapabilityProbe {
+        fn prf() -> Self {
+            Self {
+                report: CapabilityReport {
+                    tpm: TpmStatus {
+                        present: Some(true),
+                        accessible: Some(true),
+                    },
+                    native: NativeCapabilitySummary {
+                        supported_algorithms: Vec::new(),
+                        supported_uses: Vec::new(),
+                    },
+                    prf_available: Some(true),
+                    seed_available: Some(true),
+                    recommended_mode: Some(Mode::Prf),
+                    recommendation_reasons: vec!["fake PRF support".to_string()],
+                    diagnostics: vec![Diagnostic::info("fake-probe", "PRF is supported")],
+                },
+            }
+        }
+    }
+
+    impl CapabilityProbe for StaticCapabilityProbe {
+        fn detect(&self, _algorithm: Option<Algorithm>, _uses: &[UseCase]) -> CapabilityReport {
+            self.report.clone()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePrfSetupRunner {
+        programs: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakePrfSetupRunner {
+        fn recorded_programs(&self) -> Vec<String> {
+            self.programs.lock().expect("recorded programs").clone()
+        }
+    }
+
+    impl CommandRunner for FakePrfSetupRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.programs
+                .lock()
+                .expect("recorded programs")
+                .push(invocation.program.clone());
+
+            match invocation.program.as_str() {
+                "tpm2_createprimary" => {
+                    fs::write(pathbuf_arg(invocation, "-c"), b"parent-context")
+                        .expect("write parent context");
+                }
+                "tpm2_create" => {
+                    fs::write(pathbuf_arg(invocation, "-u"), b"prf-public")
+                        .expect("write public blob");
+                    fs::write(pathbuf_arg(invocation, "-r"), b"prf-private")
+                        .expect("write private blob");
+                }
+                "tpm2_load" => {
+                    fs::write(pathbuf_arg(invocation, "-c"), b"prf-context")
+                        .expect("write loaded context");
+                }
+                other => {
+                    return CommandOutput {
+                        exit_code: Some(1),
+                        stdout: String::new(),
+                        stderr: format!("unexpected command: {other}"),
+                        error: None,
+                    };
+                }
+            }
+
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            }
+        }
+    }
+
+    fn pathbuf_arg(invocation: &CommandInvocation, flag: &str) -> PathBuf {
+        invocation
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| PathBuf::from(&pair[1]))
+            .unwrap_or_else(|| panic!("missing {flag} argument"))
     }
 
     #[derive(Clone)]

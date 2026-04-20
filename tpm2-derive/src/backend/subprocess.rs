@@ -73,6 +73,15 @@ pub trait CommandRunner {
     fn run(&self, invocation: &CommandInvocation) -> CommandOutput;
 }
 
+impl<R> CommandRunner for &R
+where
+    R: CommandRunner + ?Sized,
+{
+    fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+        (**self).run(invocation)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessCommandRunner;
 
@@ -507,6 +516,11 @@ mod tests {
 
         assert_eq!(report.recommended_mode, Some(Mode::Native));
         assert_eq!(report.tpm.accessible, Some(true));
-        assert!(report.native.supported_algorithms.contains(&Algorithm::P256));
+        assert!(
+            report
+                .native
+                .supported_algorithms
+                .contains(&Algorithm::P256)
+        );
     }
 }
