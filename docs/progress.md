@@ -106,7 +106,7 @@ _As of 2026-04-20._
 2. simplify recovery import/export UX:
    - prefer `import` over `recovery import`
    - reduce confirmation flags to `--confirm` AND `--confirm-phrase` - both required
-   - make `--reason` optional metadata only
+   - the `--reason` remains required
 3. enforce use-case boundaries:
    - `derive` should fail for profiles without `use=derive`
    - `ssh-agent add` should require ssh/ssh-agent use, not derive use
