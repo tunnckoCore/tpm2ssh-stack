@@ -139,6 +139,17 @@ pub struct SshAgentAddRequest {
     pub profile: String,
     pub comment: Option<String>,
     pub socket: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SshAgentAddResult {
+    pub profile: String,
+    pub mode: Mode,
+    pub algorithm: Algorithm,
+    pub socket: PathBuf,
+    pub comment: String,
+    pub public_key_openssh: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

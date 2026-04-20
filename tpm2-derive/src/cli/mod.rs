@@ -21,8 +21,8 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::backend::{
-    default_probe, CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner,
-    ProcessCommandRunner,
+    CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner,
+    default_probe,
 };
 use crate::error::{Error, Result};
 use crate::model::{
@@ -33,8 +33,8 @@ use crate::model::{
 };
 use crate::ops;
 use crate::ops::native::subprocess::{
-    plan_sign, NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
-    NativeSignOptions, NativeSignPlan,
+    NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
+    NativeSignOptions, NativeSignPlan, plan_sign,
 };
 use crate::ops::native::{
     DigestAlgorithm, NativeKeyRef, NativeSignRequest, NativeSignatureFormat, NativeSignatureScheme,
@@ -109,13 +109,9 @@ pub fn run(cli: Cli) -> Result<String> {
             decrypt_summary(&args),
         ),
         Command::Export(args) => run_export(cli.json, args),
-        Command::Ssh(SshCommand::Agent(SshAgentCommand::Add(args))) => run_placeholder(
-            cli.json,
-            CommandPath::from_segments(["ssh-agent", "add"]),
-            args.profile.clone(),
-            "ssh-agent add",
-            ssh_agent_add_summary(&args),
-        ),
+        Command::Ssh(SshCommand::Agent(SshAgentCommand::Add(args))) => {
+            run_ssh_agent_add(cli.json, args)
+        }
     }
 }
 
@@ -209,6 +205,44 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
     };
 
     match ops::export(&request) {
+        Ok(result) => success(json, command, result),
+        Err(error) => failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        ),
+    }
+}
+
+fn run_ssh_agent_add(json: bool, args: SshAgentAddArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["ssh-agent", "add"]);
+    let request = SshAgentAddRequest {
+        profile: args.profile.clone(),
+        comment: args.comment.clone(),
+        socket: args.socket.clone(),
+        state_dir: args.state_dir.clone(),
+    };
+
+    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: error.code().as_str().to_string(),
+                    message: error.to_string(),
+                },
+                Vec::new(),
+            );
+        }
+    };
+
+    match ops::ssh::add_with_defaults(&profile, &request) {
         Ok(result) => success(json, command, result),
         Err(error) => failure(
             json,
@@ -1064,6 +1098,7 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
             profile,
             comment: None,
             socket: None,
+            state_dir: None,
         })
         .unwrap_or_default(),
         _ => serde_json::to_value(PendingOperation {
@@ -1087,17 +1122,6 @@ fn decrypt_summary(args: &DecryptArgs) -> String {
     format!(
         "profile={} input={} state=planned",
         args.profile, args.input
-    )
-}
-
-fn ssh_agent_add_summary(args: &SshAgentAddArgs) -> String {
-    format!(
-        "profile={} socket={} state=planned",
-        args.profile,
-        args.socket
-            .as_ref()
-            .map(|path| path.as_path().display().to_string())
-            .unwrap_or_else(|| "SSH_AUTH_SOCK".to_string())
     )
 }
 
@@ -1280,14 +1304,16 @@ mod tests {
         );
         assert!(!staged.digest_path.as_os_str().is_empty());
         assert_eq!(runner.invocations().len(), 1);
-        assert!(!profile
-            .storage
-            .state_layout
-            .objects_dir
-            .join(&profile.name)
-            .join("native-sign")
-            .join("signature.p1363.bin")
-            .exists());
+        assert!(
+            !profile
+                .storage
+                .state_layout
+                .objects_dir
+                .join(&profile.name)
+                .join("native-sign")
+                .join("signature.p1363.bin")
+                .exists()
+        );
     }
 
     #[test]
@@ -1452,9 +1478,11 @@ mod tests {
             value["error"]["code"],
             Value::String("unsupported".to_string())
         );
-        assert!(value["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("seed-mode profiles"));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("seed-mode profiles")
+        );
     }
 }

@@ -7,6 +7,7 @@ pub mod derive;
 pub mod native;
 pub mod prf;
 pub mod seed;
+pub mod ssh;
 
 use std::collections::BTreeSet;
 use std::fs;

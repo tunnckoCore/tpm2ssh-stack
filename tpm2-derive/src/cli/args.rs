@@ -148,6 +148,8 @@ pub struct SshAgentAddArgs {
     pub comment: Option<String>,
     #[arg(long)]
     pub socket: Option<PathBuf>,
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
