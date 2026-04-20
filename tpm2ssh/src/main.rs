@@ -3,16 +3,17 @@ use p256::SecretKey;
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use ssh_key::{PrivateKey, private::EcdsaKeypair, private::Ed25519Keypair, private::KeypairData};
+use ssh_key::{private::EcdsaKeypair, private::Ed25519Keypair, private::KeypairData, PrivateKey};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use tpm2_derive::backend::{ProcessCommandRunner, default_probe};
+use tpm2_derive::backend::{default_probe, ProcessCommandRunner};
 use tpm2_derive::{
-    Algorithm, DerivationContext, DeriveRequest, ModePreference, SetupRequest, UseCase,
+    Algorithm, DerivationContext, DeriveRequest, Mode, ModePreference, SetupRequest,
+    SshAgentAddRequest, UseCase,
 };
 
 const DEFAULT_HANDLE: &str = "0x81006969";
@@ -521,6 +522,55 @@ fn try_login_with_managed_profile(
         ));
     }
 
+    let socket = if !show_priv && profile.mode.resolved == Mode::Seed {
+        login_with_managed_seed_profile(paths, username, algorithm, &profile)?
+    } else {
+        let key_material = derive_managed_key_material(algorithm, &profile)?;
+        let private_key = build_private_key(algorithm, &key_material)?;
+        add_private_key_to_agent(paths, username, algorithm, &private_key, show_priv, verbose)?
+    };
+
+    println!("Key successfully added to ssh-agent through managed profile!");
+    println!("Managed profile: {}", profile.name);
+    println!("Resolved mode: {:?}", profile.mode.resolved);
+    println!("SSH_AUTH_SOCK={socket}");
+
+    Ok(true)
+}
+
+fn login_with_managed_seed_profile(
+    paths: &Tpm2SshPaths,
+    username: &str,
+    algorithm: LoginAlgorithm,
+    profile: &tpm2_derive::Profile,
+) -> Result<String, String> {
+    let result = tpm2_derive::ops::ssh::add_with_defaults(
+        profile,
+        &SshAgentAddRequest {
+            profile: profile.name.clone(),
+            comment: Some(algorithm.comment().to_string()),
+            socket: None,
+            state_dir: Some(profile.storage.state_layout.root_dir.clone()),
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "managed ssh-agent add failed for profile '{}': {error}",
+            profile.name
+        )
+    })?;
+
+    let (public_key_path, public_key_exists) =
+        write_public_key_openssh(paths, username, algorithm, &result.public_key_openssh)?;
+    report_public_key_path(&public_key_path, public_key_exists);
+
+    Ok(result.socket.display().to_string())
+}
+
+fn derive_managed_key_material(
+    algorithm: LoginAlgorithm,
+    profile: &tpm2_derive::Profile,
+) -> Result<[u8; DERIVED_KEY_BYTES], String> {
     let mut context_fields = BTreeMap::new();
     context_fields.insert(
         "algorithm".to_string(),
@@ -542,25 +592,14 @@ fn try_login_with_managed_profile(
     };
 
     let runner = ProcessCommandRunner;
-    let result = tpm2_derive::ops::derive::execute_with_defaults(&profile, &request, &runner)
+    let result = tpm2_derive::ops::derive::execute_with_defaults(profile, &request, &runner)
         .map_err(|error| {
             format!(
                 "managed derive failed for profile '{}': {error}",
                 profile.name
             )
         })?;
-    let key_material = decode_key_material(&result.material)?;
-
-    let private_key = build_private_key(algorithm, &key_material)?;
-    let socket =
-        add_private_key_to_agent(paths, username, algorithm, &private_key, show_priv, verbose)?;
-
-    println!("Key successfully added to ssh-agent through managed profile!");
-    println!("Managed profile: {}", profile.name);
-    println!("Resolved mode: {:?}", result.mode);
-    println!("SSH_AUTH_SOCK={socket}");
-
-    Ok(true)
+    decode_key_material(&result.material)
 }
 
 fn login_legacy(
@@ -672,23 +711,12 @@ fn add_private_key_to_agent(
         .to_openssh(ssh_key::LineEnding::LF)
         .map_err(|error| format!("failed to serialize OpenSSH private key: {error}"))?;
 
-    let pub_key_filename = format!("id_{}_{}_tpm2.pub", username, algorithm.ssh_alg_name());
-    let pub_key_path = paths.root_dir.join(pub_key_filename);
-    let pub_key_exists = pub_key_path.exists();
-
-    let public_key = private_key.public_key();
-    let mut public_key_ssh = public_key
+    let public_key_openssh = private_key
+        .public_key()
         .to_openssh()
         .map_err(|error| format!("failed to serialize OpenSSH public key: {error}"))?;
-    if !public_key_ssh.ends_with('\n') {
-        public_key_ssh.push('\n');
-    }
-    fs::write(&pub_key_path, public_key_ssh).map_err(|error| {
-        format!(
-            "failed to write public key '{}': {error}",
-            pub_key_path.display()
-        )
-    })?;
+    let (pub_key_path, pub_key_exists) =
+        write_public_key_openssh(paths, username, algorithm, &public_key_openssh)?;
 
     if show_priv {
         println!();
@@ -718,13 +746,37 @@ fn add_private_key_to_agent(
         return Err("ssh-add failed".to_string());
     }
 
+    report_public_key_path(&pub_key_path, pub_key_exists);
+
+    Ok(socket)
+}
+
+fn write_public_key_openssh(
+    paths: &Tpm2SshPaths,
+    username: &str,
+    algorithm: LoginAlgorithm,
+    public_key_openssh: &str,
+) -> Result<(PathBuf, bool), String> {
+    let pub_key_filename = format!("id_{}_{}_tpm2.pub", username, algorithm.ssh_alg_name());
+    let pub_key_path = paths.root_dir.join(pub_key_filename);
+    let pub_key_exists = pub_key_path.exists();
+    let mut normalized = public_key_openssh.trim_end().to_string();
+    normalized.push('\n');
+    fs::write(&pub_key_path, normalized).map_err(|error| {
+        format!(
+            "failed to write public key '{}': {error}",
+            pub_key_path.display()
+        )
+    })?;
+    Ok((pub_key_path, pub_key_exists))
+}
+
+fn report_public_key_path(pub_key_path: &Path, pub_key_exists: bool) {
     if pub_key_exists {
         println!("Public key already exists at: {}", pub_key_path.display());
     } else {
         println!("Public key written to: {}", pub_key_path.display());
     }
-
-    Ok(socket)
 }
 
 fn ssh_agent_socket() -> String {
@@ -780,7 +832,25 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+
+    fn test_paths(name: &str) -> Tpm2SshPaths {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        let root_dir =
+            std::env::temp_dir().join(format!("tpm2ssh-{name}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&root_dir).expect("create test root");
+        Tpm2SshPaths {
+            managed_state_dir: root_dir.join("tpm2-derive-state"),
+            managed_config_path: root_dir.join("managed-profiles.json"),
+            legacy_handle_path: root_dir.join("handle.txt"),
+            root_dir,
+        }
+    }
 
     #[test]
     fn managed_profiles_config_tracks_profiles_per_algorithm() {
@@ -807,5 +877,36 @@ mod tests {
         let secret_key = p256_secret_key_from_material(&material)
             .expect("fallback should produce a valid secret key");
         assert_ne!(secret_key.to_bytes().as_slice(), material.as_slice());
+    }
+
+    #[test]
+    fn write_public_key_openssh_uses_algorithm_specific_filename_and_normalizes_newline() {
+        let paths = test_paths("pubkey");
+        let public_key =
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBJexample";
+
+        let (path, existed) =
+            write_public_key_openssh(&paths, "alice", LoginAlgorithm::P256, public_key)
+                .expect("public key write should succeed");
+        assert!(!existed);
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("id_alice_nistp256_tpm2.pub")
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("public key contents"),
+            format!("{public_key}\n")
+        );
+
+        let (_, existed_again) = write_public_key_openssh(
+            &paths,
+            "alice",
+            LoginAlgorithm::P256,
+            &format!("{public_key}\n"),
+        )
+        .expect("rewrite should succeed");
+        assert!(existed_again);
+
+        let _ = fs::remove_dir_all(&paths.root_dir);
     }
 }
