@@ -19,13 +19,19 @@ use secrecy::ExposeSecret;
 use sha2::{Digest as _, Sha256};
 use tempfile::Builder as TempfileBuilder;
 
+use ssh_key::{
+    PublicKey as SshPublicKey,
+    public::{EcdsaPublicKey as SshEcdsaPublicKey, KeyData as SshKeyData},
+};
+
 use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CapabilityReport, ExportArtifact, ExportFormat, ExportKind, ExportRequest,
     ExportResult, InspectRequest, Mode, ModePreference, ModeResolution, Profile,
-    RecoveryImportRequest, RecoveryImportResult, SetupRequest, SetupResult, StateLayout, UseCase,
+    PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult, SetupRequest, SetupResult,
+    StateLayout, UseCase,
 };
 use crate::ops::native::subprocess::{
     NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
@@ -364,14 +370,29 @@ fn persistable_state_path(state_layout: &StateLayout, path: &Path) -> Result<Str
 pub fn export(request: &ExportRequest) -> Result<ExportResult> {
     validate_profile_name(&request.profile)?;
 
+    if request.kind != ExportKind::PublicKey && request.public_key_format.is_some() {
+        return Err(Error::Validation(
+            "--format is supported only with --kind public-key".to_string(),
+        ));
+    }
+
     let profile = load_profile(&request.profile, request.state_dir.clone())?;
     match request.kind {
-        ExportKind::PublicKey => export_public_key(&profile, request.output.as_deref()),
+        ExportKind::PublicKey => export_public_key(
+            &profile,
+            request.output.as_deref(),
+            request.public_key_format,
+        ),
         ExportKind::RecoveryBundle => export_recovery_bundle(&profile, request),
     }
 }
 
-fn export_public_key(profile: &Profile, requested_output: Option<&Path>) -> Result<ExportResult> {
+fn export_public_key(
+    profile: &Profile,
+    requested_output: Option<&Path>,
+    requested_format: Option<PublicKeyExportFormat>,
+) -> Result<ExportResult> {
+    let format = requested_format.unwrap_or(PublicKeyExportFormat::SpkiDer);
     match profile.mode.resolved {
         Mode::Prf => Err(Error::PolicyRefusal(format!(
             "profile '{}' resolved to PRF mode; PRF roots do not expose a standalone public key",
@@ -385,7 +406,12 @@ fn export_public_key(profile: &Profile, requested_output: Option<&Path>) -> Resu
                 )));
             }
 
-            export_native_public_key_with_runner(profile, requested_output, &ProcessCommandRunner)
+            export_native_public_key_with_runner(
+                profile,
+                requested_output,
+                format,
+                &ProcessCommandRunner,
+            )
         }
         Mode::Seed => {
             if !profile.export_policy.public_key_export {
@@ -398,7 +424,13 @@ fn export_public_key(profile: &Profile, requested_output: Option<&Path>) -> Resu
             let backend =
                 SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
             let deriver = HkdfSha256SeedDeriver;
-            export_seed_public_key_with_backend(profile, requested_output, &backend, &deriver)
+            export_seed_public_key_with_backend(
+                profile,
+                requested_output,
+                format,
+                &backend,
+                &deriver,
+            )
         }
     }
 }
@@ -463,6 +495,7 @@ where
 fn export_seed_public_key_with_backend<B, D>(
     profile: &Profile,
     requested_output: Option<&Path>,
+    format: PublicKeyExportFormat,
     backend: &B,
     deriver: &D,
 ) -> Result<ExportResult>
@@ -486,18 +519,19 @@ where
         },
     )?;
 
-    let public_key = seed_public_key_spki_der(profile, derived.expose_secret())?;
-    let destination = resolve_public_key_output_path(profile, requested_output)?;
-    write_public_key_output(&destination, &public_key)?;
+    let public_key_der = seed_public_key_spki_der(profile, derived.expose_secret())?;
+    let rendered_public_key = render_seed_public_key_export(profile, format, &public_key_der)?;
+    let destination = resolve_public_key_output_path(profile, requested_output, format)?;
+    write_public_key_output(&destination, &rendered_public_key)?;
 
     Ok(ExportResult {
         profile: profile.name.clone(),
         mode: profile.mode.resolved,
         kind: ExportKind::PublicKey,
         artifact: ExportArtifact {
-            format: ExportFormat::SpkiDer,
+            format: format.into(),
             path: destination,
-            bytes_written: public_key.len(),
+            bytes_written: rendered_public_key.len(),
         },
     })
 }
@@ -733,6 +767,7 @@ where
 fn export_native_public_key_with_runner<R>(
     profile: &Profile,
     requested_output: Option<&Path>,
+    format: PublicKeyExportFormat,
     runner: &R,
 ) -> Result<ExportResult>
 where
@@ -758,13 +793,14 @@ where
             ))
         })?;
 
+    let requested_encoding = native_public_key_encoding(format);
     let plan = plan_export_public_key(
         &NativePublicKeyExportRequest {
             key: NativeKeyRef {
                 profile: profile.name.clone(),
                 key_id: native_key_id(profile),
             },
-            encodings: vec![NativePublicKeyEncoding::SpkiDer],
+            encodings: vec![requested_encoding],
         },
         &NativePublicKeyExportOptions {
             locator,
@@ -780,32 +816,33 @@ where
     let exported = plan
         .outputs
         .iter()
-        .find(|output| output.encoding == NativePublicKeyEncoding::SpkiDer)
+        .find(|output| output.encoding == requested_encoding)
         .ok_or_else(|| {
-            Error::Internal(
-                "native public-key export plan did not produce the expected SPKI DER artifact"
-                    .to_string(),
-            )
+            Error::Internal(format!(
+                "native public-key export plan did not produce the expected {:?} artifact",
+                requested_encoding
+            ))
         })?;
 
-    let public_key = fs::read(&exported.path).map_err(|error| {
+    let exported_bytes = fs::read(&exported.path).map_err(|error| {
         Error::State(format!(
             "failed to read native public key from '{}': {error}",
             exported.path.display()
         ))
     })?;
+    let rendered_public_key = render_native_public_key_export(profile, format, &exported_bytes)?;
 
-    let destination = resolve_public_key_output_path(profile, requested_output)?;
-    write_public_key_output(&destination, &public_key)?;
+    let destination = resolve_public_key_output_path(profile, requested_output, format)?;
+    write_public_key_output(&destination, &rendered_public_key)?;
 
     Ok(ExportResult {
         profile: profile.name.clone(),
         mode: profile.mode.resolved,
         kind: ExportKind::PublicKey,
         artifact: ExportArtifact {
-            format: ExportFormat::SpkiDer,
+            format: format.into(),
             path: destination,
-            bytes_written: public_key.len(),
+            bytes_written: rendered_public_key.len(),
         },
     })
 }
@@ -1030,6 +1067,7 @@ pub(crate) fn native_key_id(profile: &Profile) -> String {
 fn resolve_public_key_output_path(
     profile: &Profile,
     requested_output: Option<&Path>,
+    format: PublicKeyExportFormat,
 ) -> Result<PathBuf> {
     match requested_output {
         Some(path) if path.is_dir() => Err(Error::Validation(format!(
@@ -1037,11 +1075,124 @@ fn resolve_public_key_output_path(
             path.display()
         ))),
         Some(path) => Ok(path.to_path_buf()),
-        None => Ok(profile
-            .storage
-            .state_layout
-            .exports_dir
-            .join(format!("{}.public-key.spki.der", profile.name))),
+        None => Ok(profile.storage.state_layout.exports_dir.join(format!(
+            "{}.{}",
+            profile.name,
+            public_key_export_default_suffix(format)
+        ))),
+    }
+}
+
+fn native_public_key_encoding(format: PublicKeyExportFormat) -> NativePublicKeyEncoding {
+    match format {
+        PublicKeyExportFormat::SpkiDer => NativePublicKeyEncoding::SpkiDer,
+        PublicKeyExportFormat::SpkiPem => NativePublicKeyEncoding::Pem,
+        PublicKeyExportFormat::SpkiHex | PublicKeyExportFormat::Openssh => {
+            NativePublicKeyEncoding::SpkiDer
+        }
+    }
+}
+
+fn render_native_public_key_export(
+    profile: &Profile,
+    format: PublicKeyExportFormat,
+    exported_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    match format {
+        PublicKeyExportFormat::SpkiDer | PublicKeyExportFormat::SpkiPem => {
+            Ok(exported_bytes.to_vec())
+        }
+        PublicKeyExportFormat::SpkiHex => Ok(hex_encode(exported_bytes).into_bytes()),
+        PublicKeyExportFormat::Openssh => {
+            render_openssh_public_key(profile, exported_bytes).map(String::into_bytes)
+        }
+    }
+}
+
+fn render_seed_public_key_export(
+    profile: &Profile,
+    format: PublicKeyExportFormat,
+    spki_der: &[u8],
+) -> Result<Vec<u8>> {
+    match format {
+        PublicKeyExportFormat::SpkiDer => Ok(spki_der.to_vec()),
+        PublicKeyExportFormat::SpkiPem => Ok(spki_der_to_pem(spki_der).into_bytes()),
+        PublicKeyExportFormat::SpkiHex => Ok(hex_encode(spki_der).into_bytes()),
+        PublicKeyExportFormat::Openssh => match profile.algorithm {
+            Algorithm::P256 => render_openssh_public_key(profile, spki_der).map(String::into_bytes),
+            Algorithm::Ed25519 | Algorithm::Secp256k1 => Err(Error::Unsupported(format!(
+                "OpenSSH public-key export is not wired for seed {:?} profiles yet",
+                profile.algorithm
+            ))),
+        },
+    }
+}
+
+fn spki_der_to_pem(spki_der: &[u8]) -> String {
+    let base64 = base64_encode(spki_der);
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in base64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).expect("base64 is ascii"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PUBLIC KEY-----\n");
+    pem
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+        output.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+
+    output
+}
+
+fn render_openssh_public_key(profile: &Profile, spki_der: &[u8]) -> Result<String> {
+    let sec1 = crate::ops::native::subprocess::extract_p256_sec1_from_spki_der(spki_der)?;
+    let key_data = SshKeyData::Ecdsa(SshEcdsaPublicKey::from_sec1_bytes(&sec1).map_err(
+        |error| {
+            Error::State(format!(
+                "failed to convert exported SPKI DER into an OpenSSH ECDSA public key for profile '{}': {error}",
+                profile.name
+            ))
+        },
+    )?);
+    let public_key = SshPublicKey::new(key_data, profile.name.clone());
+
+    public_key.to_openssh().map_err(|error| {
+        Error::State(format!(
+            "failed to render OpenSSH public key for profile '{}': {error}",
+            profile.name
+        ))
+    })
+}
+
+fn public_key_export_default_suffix(format: PublicKeyExportFormat) -> &'static str {
+    match format {
+        PublicKeyExportFormat::SpkiDer => "public-key.spki.der",
+        PublicKeyExportFormat::SpkiPem => "public-key.spki.pem",
+        PublicKeyExportFormat::SpkiHex => "public-key.spki.hex",
+        PublicKeyExportFormat::Openssh => "public-key.openssh.pub",
     }
 }
 
@@ -1178,6 +1329,14 @@ fn render_command_detail(output: &CommandOutput) -> String {
     }
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 fn preview(value: &str) -> String {
     let single_line = value.lines().map(str::trim).collect::<Vec<_>>().join(" ");
     let trimmed = single_line.trim();
@@ -1249,6 +1408,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use secrecy::ExposeSecret;
+    use ssh_key::PublicKey as SshPublicKey;
 
     use crate::backend::{
         CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, HeuristicProbe,
@@ -1545,6 +1705,7 @@ mod tests {
         let result = export_native_public_key_with_runner(
             &profile,
             Some(output_path.as_path()),
+            PublicKeyExportFormat::SpkiDer,
             &FakeNativeExportRunner::success(example_spki_der()),
         )
         .expect("native export should succeed");
@@ -1585,6 +1746,7 @@ mod tests {
         let result = export_seed_public_key_with_backend(
             &profile,
             Some(output_path.as_path()),
+            PublicKeyExportFormat::SpkiDer,
             &FakeSeedExportBackend::new(seed.clone()),
             &HkdfSha256SeedDeriver,
         )
@@ -1631,6 +1793,7 @@ mod tests {
         let result = export_seed_public_key_with_backend(
             &profile,
             Some(output_path.as_path()),
+            PublicKeyExportFormat::SpkiDer,
             &FakeSeedExportBackend::new(seed.clone()),
             &HkdfSha256SeedDeriver,
         )
@@ -1674,6 +1837,7 @@ mod tests {
         let result = export_seed_public_key_with_backend(
             &profile,
             Some(output_path.as_path()),
+            PublicKeyExportFormat::SpkiDer,
             &FakeSeedExportBackend::new(seed.clone()),
             &HkdfSha256SeedDeriver,
         )
@@ -1692,6 +1856,80 @@ mod tests {
         );
 
         fs::remove_dir_all(root_dir).expect("temporary p256 export state should be removed");
+    }
+
+    #[test]
+    fn export_native_public_key_supports_spki_pem_output() {
+        let root_dir = unique_temp_path("export-native-public-key-pem");
+        let (profile, _) = persisted_native_export_profile(&root_dir);
+
+        let output_path = root_dir.join("custom").join("prod-signer.pem");
+        let result = export_native_public_key_with_runner(
+            &profile,
+            Some(output_path.as_path()),
+            PublicKeyExportFormat::SpkiPem,
+            &FakeNativeExportRunner::success(example_spki_der()),
+        )
+        .expect("native pem export should succeed");
+
+        assert_eq!(result.artifact.format, ExportFormat::SpkiPem);
+        let exported = fs::read_to_string(&result.artifact.path).expect("pem output");
+        assert!(exported.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+        assert!(exported.ends_with("-----END PUBLIC KEY-----\n"));
+
+        fs::remove_dir_all(root_dir).expect("temporary native export state should be removed");
+    }
+
+    #[test]
+    fn export_native_public_key_supports_spki_hex_output() {
+        let root_dir = unique_temp_path("export-native-public-key-hex");
+        let (profile, _) = persisted_native_export_profile(&root_dir);
+
+        let output_path = root_dir.join("custom").join("prod-signer.hex");
+        let result = export_native_public_key_with_runner(
+            &profile,
+            Some(output_path.as_path()),
+            PublicKeyExportFormat::SpkiHex,
+            &FakeNativeExportRunner::success(example_spki_der()),
+        )
+        .expect("native hex export should succeed");
+
+        assert_eq!(result.artifact.format, ExportFormat::SpkiHex);
+        assert_eq!(
+            fs::read_to_string(&result.artifact.path).expect("hex output"),
+            hex_encode(&example_spki_der())
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary native export state should be removed");
+    }
+
+    #[test]
+    fn export_native_public_key_supports_openssh_output() {
+        let root_dir = unique_temp_path("export-native-public-key-openssh");
+        let (profile, _) = persisted_native_export_profile(&root_dir);
+
+        let result = export_native_public_key_with_runner(
+            &profile,
+            None,
+            PublicKeyExportFormat::Openssh,
+            &FakeNativeExportRunner::success(example_spki_der()),
+        )
+        .expect("native openssh export should succeed");
+
+        assert_eq!(result.artifact.format, ExportFormat::Openssh);
+        assert_eq!(
+            result.artifact.path,
+            root_dir
+                .join("exports")
+                .join("prod-signer.public-key.openssh.pub")
+        );
+
+        let exported = fs::read_to_string(&result.artifact.path).expect("openssh output");
+        assert!(exported.starts_with("ecdsa-sha2-nistp256 "));
+        let parsed = SshPublicKey::from_openssh(&exported).expect("parse openssh public key");
+        assert_eq!(parsed.comment(), "prod-signer");
+
+        fs::remove_dir_all(root_dir).expect("temporary native export state should be removed");
     }
 
     #[test]
@@ -1714,6 +1952,7 @@ mod tests {
             profile: "prf-default".to_string(),
             kind: ExportKind::PublicKey,
             output: None,
+            public_key_format: None,
             state_dir: Some(root_dir.clone()),
             reason: None,
             confirm_recovery_export: false,
@@ -1988,6 +2227,7 @@ mod tests {
                 profile: profile.name.clone(),
                 kind: ExportKind::RecoveryBundle,
                 output: Some(output_path.clone()),
+                public_key_format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm_recovery_export: true,
@@ -2035,6 +2275,7 @@ mod tests {
                 profile: profile.name.clone(),
                 kind: ExportKind::RecoveryBundle,
                 output: None,
+                public_key_format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm_recovery_export: true,
@@ -2217,6 +2458,47 @@ mod tests {
         }
     }
 
+    fn persisted_native_export_profile(root_dir: &Path) -> (Profile, PathBuf) {
+        let state_layout = StateLayout::new(root_dir.to_path_buf());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let mut profile = Profile {
+            schema_version: crate::model::PROFILE_SCHEMA_VERSION,
+            name: "prod-signer".to_string(),
+            algorithm: Algorithm::P256,
+            uses: vec![UseCase::Sign, UseCase::Verify],
+            mode: ModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            storage: crate::model::ProfileStorage {
+                state_layout: state_layout.clone(),
+                profile_path: state_layout.profile_path("prod-signer"),
+                root_material_kind: crate::model::RootMaterialKind::NativeObject,
+            },
+            export_policy: crate::model::ExportPolicy::for_mode(Mode::Native),
+            metadata: BTreeMap::new(),
+        };
+
+        let handle_path = state_layout
+            .objects_dir
+            .join("prod-signer")
+            .join("native")
+            .join("prod-signer-signing-key.handle");
+        fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
+        fs::write(&handle_path, b"serialized-handle").expect("handle file");
+        persist_native_metadata(
+            &mut profile,
+            "prod-signer-signing-key",
+            "0x81010002",
+            &handle_path,
+        );
+        profile.persist().expect("persist profile");
+
+        (profile, handle_path)
+    }
+
     #[derive(Clone)]
     struct FakeNativeExportRunner {
         der: Vec<u8>,
@@ -2238,7 +2520,18 @@ mod tests {
                 .find(|pair| pair[0] == "-o")
                 .map(|pair| PathBuf::from(&pair[1]))
                 .expect("-o output path");
-            fs::write(output_path, &self.der).expect("fake DER output");
+            let output_format = invocation
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-f")
+                .map(|pair| pair[1].as_str())
+                .expect("-f format");
+            let bytes = match output_format {
+                "der" => self.der.clone(),
+                "pem" => example_spki_pem(),
+                other => panic!("unexpected export format {other}"),
+            };
+            fs::write(output_path, bytes).expect("fake public key output");
 
             CommandOutput {
                 exit_code: Some(0),
@@ -2332,5 +2625,44 @@ mod tests {
         der.extend_from_slice(&[0x11; 32]);
         der.extend_from_slice(&[0x22; 32]);
         der
+    }
+
+    fn example_spki_pem() -> Vec<u8> {
+        let base64 = base64_encode(&example_spki_der());
+        let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+        for chunk in base64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).expect("base64 is ascii"));
+            pem.push('\n');
+        }
+        pem.push_str("-----END PUBLIC KEY-----\n");
+        pem.into_bytes()
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = *chunk.get(1).unwrap_or(&0);
+            let b2 = *chunk.get(2).unwrap_or(&0);
+            let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+            output.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+            output.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+            if chunk.len() > 1 {
+                output.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+            } else {
+                output.push('=');
+            }
+            if chunk.len() > 2 {
+                output.push(TABLE[(triple & 0x3f) as usize] as char);
+            } else {
+                output.push('=');
+            }
+        }
+
+        output
     }
 }

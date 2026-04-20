@@ -90,6 +90,7 @@ pub struct ExportRequest {
     pub profile: String,
     pub kind: ExportKind,
     pub output: Option<PathBuf>,
+    pub public_key_format: Option<PublicKeyExportFormat>,
     pub state_dir: Option<PathBuf>,
     pub reason: Option<String>,
     pub confirm_recovery_export: bool,
@@ -99,9 +100,32 @@ pub struct ExportRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+pub enum PublicKeyExportFormat {
+    SpkiDer,
+    SpkiPem,
+    SpkiHex,
+    Openssh,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
 pub enum ExportFormat {
     SpkiDer,
+    SpkiPem,
+    SpkiHex,
+    Openssh,
     RecoveryBundleJson,
+}
+
+impl From<PublicKeyExportFormat> for ExportFormat {
+    fn from(value: PublicKeyExportFormat) -> Self {
+        match value {
+            PublicKeyExportFormat::SpkiDer => Self::SpkiDer,
+            PublicKeyExportFormat::SpkiPem => Self::SpkiPem,
+            PublicKeyExportFormat::SpkiHex => Self::SpkiHex,
+            PublicKeyExportFormat::Openssh => Self::Openssh,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

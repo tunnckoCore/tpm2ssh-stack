@@ -8,10 +8,14 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     version,
     about = "TPM-backed key operations with native, PRF, and seed modes",
     long_about = "TPM-backed key operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'setup' to provision persistent state, and the operational subcommands ('derive', 'sign', 'verify', 'export', 'ssh agent add') to use an existing profile.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive setup --profile prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive derive --profile app-prf --purpose session --namespace com.example\n  tpm2-derive export --profile seed-user --kind recovery-bundle --output backup.json --reason 'hardware migration' --confirm-recovery-export --confirm-sealed-at-rest-boundary --confirmation-phrase 'I understand this export weakens TPM-only protection'"
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive setup --profile prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive derive --profile app-prf --purpose session --namespace com.example\n  tpm2-derive export --profile prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --profile seed-user --kind recovery-bundle --output backup.json --reason 'hardware migration' --confirm-recovery-export --confirm-sealed-at-rest-boundary --confirmation-phrase 'I understand this export weakens TPM-only protection'"
 )]
 pub struct Cli {
-    #[arg(long, global = true, help = "Emit structured JSON instead of plain output")]
+    #[arg(
+        long,
+        global = true,
+        help = "Emit structured JSON instead of plain output"
+    )]
     pub json: bool,
     #[command(subcommand)]
     pub command: Command,
@@ -42,7 +46,11 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum SshCommand {
-    #[command(name = "agent", subcommand, about = "Interact with an ssh-agent using a persisted profile")]
+    #[command(
+        name = "agent",
+        subcommand,
+        about = "Interact with an ssh-agent using a persisted profile"
+    )]
     Agent(SshAgentCommand),
 }
 
@@ -57,7 +65,11 @@ pub enum SshAgentCommand {
 pub struct InspectArgs {
     #[arg(long, value_enum, help = "Limit the probe to an algorithm of interest")]
     pub algorithm: Option<AlgorithmArg>,
-    #[arg(long = "use", value_enum, help = "Requested operation(s) to evaluate during recommendation")]
+    #[arg(
+        long = "use",
+        value_enum,
+        help = "Requested operation(s) to evaluate during recommendation"
+    )]
     pub uses: Vec<UseArg>,
 }
 
@@ -68,13 +80,23 @@ pub struct SetupArgs {
     pub profile: String,
     #[arg(long, value_enum, help = "Algorithm the profile is centered on")]
     pub algorithm: AlgorithmArg,
-    #[arg(long = "use", value_enum, help = "Allowed use(s) for the profile; repeat as needed")]
+    #[arg(
+        long = "use",
+        value_enum,
+        help = "Allowed use(s) for the profile; repeat as needed"
+    )]
     pub uses: Vec<UseArg>,
     #[arg(long, value_enum, default_value_t = ModeArg::Auto, help = "Force a mode or let the tool auto-resolve one")]
     pub mode: ModeArg,
-    #[arg(long, help = "Override the state root directory instead of the default local state path")]
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
     pub state_dir: Option<PathBuf>,
-    #[arg(long, help = "Validate and resolve the profile without provisioning TPM state")]
+    #[arg(
+        long,
+        help = "Validate and resolve the profile without provisioning TPM state"
+    )]
     pub dry_run: bool,
 }
 
@@ -85,15 +107,25 @@ pub struct DeriveArgs {
     pub profile: String,
     #[arg(long, help = "High-level purpose string used for domain separation")]
     pub purpose: String,
-    #[arg(long, help = "Application or domain namespace used for domain separation")]
+    #[arg(
+        long,
+        help = "Application or domain namespace used for domain separation"
+    )]
     pub namespace: String,
     #[arg(long, help = "Optional label to further distinguish this derivation")]
     pub label: Option<String>,
     #[arg(long = "context", value_parser = parse_key_value, help = "Additional key=value context fields; repeat as needed")]
     pub context: Vec<(String, String)>,
-    #[arg(long, default_value_t = 32, help = "Number of derived bytes to produce")]
+    #[arg(
+        long,
+        default_value_t = 32,
+        help = "Number of derived bytes to produce"
+    )]
     pub length: u16,
-    #[arg(long, help = "Override the state root directory instead of the default local state path")]
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
     pub state_dir: Option<PathBuf>,
 }
 
@@ -102,9 +134,16 @@ pub struct DeriveArgs {
 pub struct SignArgs {
     #[arg(long, help = "Existing profile name to use for signing")]
     pub profile: String,
-    #[arg(long, default_value = "-", help = "Input file to sign, or '-' for stdin")]
+    #[arg(
+        long,
+        default_value = "-",
+        help = "Input file to sign, or '-' for stdin"
+    )]
     pub input: String,
-    #[arg(long, help = "Override the state root directory instead of the default local state path")]
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
     pub state_dir: Option<PathBuf>,
 }
 
@@ -113,29 +152,50 @@ pub struct SignArgs {
 pub struct VerifyArgs {
     #[arg(long, help = "Existing profile name to use for verification")]
     pub profile: String,
-    #[arg(long, default_value = "-", help = "Input file that was signed, or '-' for stdin")]
+    #[arg(
+        long,
+        default_value = "-",
+        help = "Input file that was signed, or '-' for stdin"
+    )]
     pub input: String,
     #[arg(long, help = "Signature file to verify")]
     pub signature: String,
-    #[arg(long, help = "Override the state root directory instead of the default local state path")]
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
     pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 #[command(about = "Reserved placeholder for future encryption support")]
 pub struct EncryptArgs {
-    #[arg(long, help = "Existing profile name to use once encrypt is implemented")]
+    #[arg(
+        long,
+        help = "Existing profile name to use once encrypt is implemented"
+    )]
     pub profile: String,
-    #[arg(long, default_value = "-", help = "Input file to encrypt, or '-' for stdin")]
+    #[arg(
+        long,
+        default_value = "-",
+        help = "Input file to encrypt, or '-' for stdin"
+    )]
     pub input: String,
 }
 
 #[derive(Debug, Args)]
 #[command(about = "Reserved placeholder for future decryption support")]
 pub struct DecryptArgs {
-    #[arg(long, help = "Existing profile name to use once decrypt is implemented")]
+    #[arg(
+        long,
+        help = "Existing profile name to use once decrypt is implemented"
+    )]
     pub profile: String,
-    #[arg(long, default_value = "-", help = "Input file to decrypt, or '-' for stdin")]
+    #[arg(
+        long,
+        default_value = "-",
+        help = "Input file to decrypt, or '-' for stdin"
+    )]
     pub input: String,
 }
 
@@ -146,17 +206,41 @@ pub struct ExportArgs {
     pub profile: String,
     #[arg(long, value_enum, help = "Artifact kind to export")]
     pub kind: ExportKindArg,
-    #[arg(long, help = "Destination file path; recovery-bundle export requires this")]
+    #[arg(
+        long = "format",
+        value_enum,
+        help = "Public-key encoding to emit; defaults to spki-der"
+    )]
+    pub public_key_format: Option<PublicKeyExportFormatArg>,
+    #[arg(
+        long,
+        help = "Destination file path; recovery-bundle export requires this"
+    )]
     pub output: Option<PathBuf>,
-    #[arg(long, help = "Override the state root directory instead of the default local state path")]
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
     pub state_dir: Option<PathBuf>,
-    #[arg(long, help = "Operator-provided reason required for recovery-bundle export")]
+    #[arg(
+        long,
+        help = "Operator-provided reason required for recovery-bundle export"
+    )]
     pub reason: Option<String>,
-    #[arg(long, help = "Explicitly acknowledge this is a break-glass recovery export")]
+    #[arg(
+        long,
+        help = "Explicitly acknowledge this is a break-glass recovery export"
+    )]
     pub confirm_recovery_export: bool,
-    #[arg(long, help = "Acknowledge exported material is no longer TPM-sealed at rest")]
+    #[arg(
+        long,
+        help = "Acknowledge exported material is no longer TPM-sealed at rest"
+    )]
     pub confirm_sealed_at_rest_boundary: bool,
-    #[arg(long, help = "Exact confirmation phrase required for recovery-bundle export")]
+    #[arg(
+        long,
+        help = "Exact confirmation phrase required for recovery-bundle export"
+    )]
     pub confirmation_phrase: Option<String>,
 }
 
@@ -167,9 +251,15 @@ pub struct SshAgentAddArgs {
     pub profile: String,
     #[arg(long, help = "Optional ssh-agent comment for the added key")]
     pub comment: Option<String>,
-    #[arg(long, help = "Explicit ssh-agent socket path; otherwise SSH_AUTH_SOCK is used")]
+    #[arg(
+        long,
+        help = "Explicit ssh-agent socket path; otherwise SSH_AUTH_SOCK is used"
+    )]
     pub socket: Option<PathBuf>,
-    #[arg(long, help = "Override the state root directory instead of the default local state path")]
+    #[arg(
+        long,
+        help = "Override the state root directory instead of the default local state path"
+    )]
     pub state_dir: Option<PathBuf>,
 }
 
@@ -224,6 +314,18 @@ pub enum ExportKindArg {
     RecoveryBundle,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum PublicKeyExportFormatArg {
+    /// Write binary SubjectPublicKeyInfo DER.
+    SpkiDer,
+    /// Write PEM-armored SubjectPublicKeyInfo.
+    SpkiPem,
+    /// Write lowercase hexadecimal SubjectPublicKeyInfo DER.
+    SpkiHex,
+    /// Write an OpenSSH public key line.
+    Openssh,
+}
+
 pub fn parse_key_value(value: &str) -> Result<(String, String), String> {
     let Some((key, value)) = value.split_once('=') else {
         return Err("context values must use key=value format".to_string());
@@ -234,4 +336,35 @@ pub fn parse_key_value(value: &str) -> Result<(String, String), String> {
     }
 
     Ok((key.to_string(), value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_parses_public_key_format_flag() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "export",
+            "--profile",
+            "prod-signer",
+            "--kind",
+            "public-key",
+            "--format",
+            "openssh",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Export(args) => {
+                assert_eq!(args.profile, "prod-signer");
+                assert_eq!(
+                    args.public_key_format,
+                    Some(PublicKeyExportFormatArg::Openssh)
+                );
+            }
+            other => panic!("expected export command, found {other:?}"),
+        }
+    }
 }

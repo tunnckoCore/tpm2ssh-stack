@@ -10,7 +10,8 @@ use tempfile::Builder as TempfileBuilder;
 
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
-    ModeArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
+    ModeArg, PublicKeyExportFormatArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand,
+    SshCommand, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
 use p256::ecdsa::signature::Verifier as _;
@@ -28,8 +29,8 @@ use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CommandPath, DecryptRequest, DerivationContext, DeriveRequest, EncryptRequest,
     ErrorEnvelope, ExportKind, ExportRequest, InputSource, InspectRequest, Mode, ModePreference,
-    PendingOperation, Profile, SetupRequest, SignRequest, SshAgentAddRequest, UseCase,
-    VerifyRequest,
+    PendingOperation, Profile, PublicKeyExportFormat, SetupRequest, SignRequest,
+    SshAgentAddRequest, UseCase, VerifyRequest,
 };
 use crate::ops;
 use crate::ops::native::subprocess::{
@@ -81,6 +82,17 @@ impl From<ExportKindArg> for ExportKind {
         match value {
             ExportKindArg::PublicKey => Self::PublicKey,
             ExportKindArg::RecoveryBundle => Self::RecoveryBundle,
+        }
+    }
+}
+
+impl From<PublicKeyExportFormatArg> for PublicKeyExportFormat {
+    fn from(value: PublicKeyExportFormatArg) -> Self {
+        match value {
+            PublicKeyExportFormatArg::SpkiDer => Self::SpkiDer,
+            PublicKeyExportFormatArg::SpkiPem => Self::SpkiPem,
+            PublicKeyExportFormatArg::SpkiHex => Self::SpkiHex,
+            PublicKeyExportFormatArg::Openssh => Self::Openssh,
         }
     }
 }
@@ -197,6 +209,7 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
         profile: args.profile,
         kind: args.kind.into(),
         output: args.output,
+        public_key_format: args.public_key_format.map(Into::into),
         state_dir: args.state_dir,
         reason: args.reason,
         confirm_recovery_export: args.confirm_recovery_export,
@@ -1087,6 +1100,7 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
             profile,
             kind: ExportKind::PublicKey,
             output: None,
+            public_key_format: None,
             state_dir: None,
             reason: None,
             confirm_recovery_export: false,
@@ -1131,8 +1145,8 @@ mod tests {
 
     use std::cell::RefCell;
 
-    use p256::ecdsa::signature::Signer as _;
     use p256::ecdsa::SigningKey;
+    use p256::ecdsa::signature::Signer as _;
     use p256::pkcs8::EncodePublicKey as _;
     use serde_json::Value;
     use tempfile::tempdir;
