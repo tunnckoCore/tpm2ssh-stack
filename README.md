@@ -18,7 +18,7 @@ Browser (WebAuthn) → Virtual USB → tpm2ssh-authenticator → SSH to tpm2ssh-
 
 ## Security Model
 
-1. **VPS Side**: `pre_prf_seed = HKDF(service_secret + user_id + signature_sha + pubkey)`
+1. **VPS Side**: `pre_prf_seed = HKDF(service_secret + user_id + signature_sha)`
 2. **User Side**: `final_prf = HKDF(pre_prf_seed + user_secret)`
 3. Neither side knows the complete secret
 
@@ -42,8 +42,8 @@ TPM2SSH_PRFD_SECRET=0123456789abcdef... ./target/release/tpm2ssh-prfd
 # Custom port (default: 2222)
 TPM2SSH_PRFD_PORT=22 ./target/release/tpm2ssh-prfd
 
-# Custom registry path (defaults to ~/.config/tpm2ssh-prfd/registry.json)
-TPM2SSH_PRFD_REGISTRY=/var/lib/tpm2ssh-prfd/registry.json ./target/release/tpm2ssh-prfd
+# Custom registry path (defaults to ./registry.json)
+TPM2SSH_PRFD_REGISTRY=~/.config/tpm2ssh-prfd/registry.json ./target/release/tpm2ssh-prfd
 ```
 
 ### Get Your user_id
@@ -192,7 +192,6 @@ Credentials are stored in JSON format, keyed by `user_id`:
 {
   "credentials": {
     "<sha256_of_pubkey>": {
-      "pubkey_hex": "<pubkey_bytes_as_hex>",
       "signature_sha": "<sha256_of_signature_pem_bytes>",
       "verified": true,
       "created_at": "2026-01-15T10:30:00Z",

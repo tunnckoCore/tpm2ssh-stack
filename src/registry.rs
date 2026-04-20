@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Credential {
-    pub pubkey_hex: String,
     pub signature_sha: Option<String>,
     pub verified: bool,
     pub created_at: String,
