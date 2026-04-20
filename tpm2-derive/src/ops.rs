@@ -31,10 +31,16 @@ use crate::ops::prf::{
     SubprocessPrfBackend,
 };
 use crate::ops::seed::{
-    SeedExportDestination, SeedExportFormat, SeedExportRequest, SeedOpenAuthSource,
-    SeedRecoveryBundleV1, SubprocessSeedBackend,
-    export_recovery_bundle as export_seed_recovery_bundle, seed_profile_from_profile,
+    MIN_SEED_BYTES, SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY, SEED_DERIVATION_KDF_METADATA_KEY,
+    SEED_OBJECT_LABEL_METADATA_KEY, SEED_PRIVATE_BLOB_PATH_METADATA_KEY,
+    SEED_PUBLIC_BLOB_PATH_METADATA_KEY, SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY,
+    SEED_STORAGE_KIND_METADATA_KEY, SeedBackend, SeedCreateRequest, SeedCreateSource, SeedExportDestination,
+    SeedExportFormat, SeedExportRequest, SeedOpenAuthSource, SeedProfile, SeedRecoveryBundleV1,
+    SeedStorageKind, SubprocessSeedBackend, export_recovery_bundle as export_seed_recovery_bundle,
+    seed_profile_from_profile,
 };
+
+const DEFAULT_SETUP_SEED_BYTES: usize = MIN_SEED_BYTES;
 
 pub fn inspect(probe: &dyn CapabilityProbe, request: &InspectRequest) -> CapabilityReport {
     probe.detect(request.algorithm, &normalize_uses(request.uses.clone()))
@@ -52,6 +58,68 @@ fn resolve_profile_with_runner<R>(
 where
     R: CommandRunner,
 {
+    let mut profile = build_setup_profile(probe, request)?;
+
+    let persisted = if request.dry_run {
+        false
+    } else {
+        let provisioned_dir = match profile.mode.resolved {
+            Mode::Native => {
+                materialize_native_setup(&mut profile, runner)?;
+                None
+            }
+            Mode::Prf => {
+                let layout = materialize_prf_setup(&mut profile, runner)?;
+                Some(layout.object_dir)
+            }
+            Mode::Seed => {
+                let backend =
+                    SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+                persist_seed_setup_profile(&mut profile, &backend)?;
+                None
+            }
+        };
+
+        if let Err(error) = profile.persist() {
+            if let Some(path) = provisioned_dir {
+                let _ = fs::remove_dir_all(path);
+            }
+            return Err(error);
+        }
+
+        true
+    };
+
+    Ok(SetupResult {
+        profile,
+        dry_run: request.dry_run,
+        persisted,
+    })
+}
+
+#[cfg(test)]
+fn resolve_profile_with_seed_backend(
+    probe: &dyn CapabilityProbe,
+    request: &SetupRequest,
+    seed_backend: &dyn SeedBackend,
+) -> Result<SetupResult> {
+    let mut profile = build_setup_profile(probe, request)?;
+    let persisted = if request.dry_run {
+        false
+    } else {
+        persist_seed_setup_profile(&mut profile, seed_backend)?;
+        profile.persist()?;
+        true
+    };
+
+    Ok(SetupResult {
+        profile,
+        dry_run: request.dry_run,
+        persisted,
+    })
+}
+
+fn build_setup_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> Result<Profile> {
     validate_profile_name(&request.profile)?;
 
     let uses = normalize_uses(request.uses.clone());
@@ -75,8 +143,7 @@ where
         report.recommendation_reasons.clone()
     };
 
-    let state_layout = StateLayout::from_optional_root(request.state_dir.clone());
-    let mut profile = Profile::new(
+    Ok(Profile::new(
         request.profile.clone(),
         request.algorithm,
         uses,
@@ -85,39 +152,84 @@ where
             resolved: resolved_mode,
             reasons,
         },
-        state_layout,
+        StateLayout::from_optional_root(request.state_dir.clone()),
+    ))
+}
+
+fn persist_seed_setup_profile(profile: &mut Profile, seed_backend: &dyn SeedBackend) -> Result<()> {
+    let seed_profile = SeedProfile::scaffold(
+        profile.name.clone(),
+        profile.algorithm,
+        profile.uses.clone(),
+    )?;
+    let object_dir = profile
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&seed_profile.storage.object_label);
+    let public_blob = object_dir.join("sealed.pub");
+    let private_blob = object_dir.join("sealed.priv");
+
+    seed_backend.seal_seed(&SeedCreateRequest {
+        profile: seed_profile.clone(),
+        source: SeedCreateSource::GenerateRandom {
+            bytes: DEFAULT_SETUP_SEED_BYTES,
+        },
+        overwrite_existing: false,
+    })?;
+
+    profile.metadata.insert(
+        SEED_OBJECT_LABEL_METADATA_KEY.to_string(),
+        seed_profile.storage.object_label.clone(),
+    );
+    profile.metadata.insert(
+        SEED_PUBLIC_BLOB_PATH_METADATA_KEY.to_string(),
+        state_relative_metadata_path(profile, &public_blob),
+    );
+    profile.metadata.insert(
+        SEED_PRIVATE_BLOB_PATH_METADATA_KEY.to_string(),
+        state_relative_metadata_path(profile, &private_blob),
+    );
+    profile.metadata.insert(
+        SEED_STORAGE_KIND_METADATA_KEY.to_string(),
+        seed_storage_kind_name(seed_profile.storage.kind).to_string(),
+    );
+    profile.metadata.insert(
+        SEED_DERIVATION_KDF_METADATA_KEY.to_string(),
+        seed_kdf_name(seed_profile.derivation.kdf).to_string(),
+    );
+    profile.metadata.insert(
+        SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY.to_string(),
+        seed_profile.derivation.domain_label.clone(),
+    );
+    profile.metadata.insert(
+        SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY.to_string(),
+        seed_profile
+            .derivation
+            .software_derived_at_use_time
+            .to_string(),
     );
 
-    let persisted = if request.dry_run {
-        false
-    } else {
-        let provisioned_dir = match profile.mode.resolved {
-            Mode::Native => {
-                materialize_native_setup(&mut profile, runner)?;
-                None
-            }
-            Mode::Prf => {
-                let layout = materialize_prf_setup(&mut profile, runner)?;
-                Some(layout.object_dir)
-            }
-            Mode::Seed => None,
-        };
+    Ok(())
+}
 
-        if let Err(error) = profile.persist() {
-            if let Some(path) = provisioned_dir {
-                let _ = fs::remove_dir_all(path);
-            }
-            return Err(error);
-        }
+fn state_relative_metadata_path(profile: &Profile, path: &Path) -> String {
+    path.strip_prefix(&profile.storage.state_layout.root_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
 
-        true
-    };
+fn seed_storage_kind_name(kind: SeedStorageKind) -> &'static str {
+    match kind {
+        SeedStorageKind::TpmSealed => "tpm-sealed",
+    }
+}
 
-    Ok(SetupResult {
-        profile,
-        dry_run: request.dry_run,
-        persisted,
-    })
+fn seed_kdf_name(kdf: crate::ops::seed::SeedKdf) -> &'static str {
+    match kdf {
+        crate::ops::seed::SeedKdf::HkdfSha256V1 => "hkdf-sha256-v1",
+    }
 }
 
 pub fn load_profile(profile: &str, state_dir: Option<PathBuf>) -> Result<Profile> {

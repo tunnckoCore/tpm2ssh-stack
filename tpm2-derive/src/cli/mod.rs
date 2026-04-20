@@ -446,12 +446,6 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
         .objects_dir
         .join(&profile.name)
         .join("native-sign");
-    let native_dir = profile
-        .storage
-        .state_layout
-        .objects_dir
-        .join(&profile.name)
-        .join("native");
     let output_dir = profile
         .storage
         .state_layout

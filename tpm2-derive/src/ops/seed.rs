@@ -15,12 +15,19 @@ use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, Profile, UseCase};
 
 pub const SEED_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const SEED_RECOVERY_BUNDLE_SCHEMA_VERSION: u32 = 1;
-pub const SEED_OBJECT_LABEL_METADATA_KEY: &str = "seed.object-label";
 pub const MIN_SEED_BYTES: usize = 32;
 pub const MAX_SEED_BYTES: usize = 64;
 pub const MAX_DERIVED_BYTES: usize = 4096;
 pub const DEFAULT_EXPORT_CONFIRMATION_PHRASE: &str =
     "I understand this export weakens TPM-only protection";
+pub const SEED_OBJECT_LABEL_METADATA_KEY: &str = "seed.object-label";
+pub const SEED_PUBLIC_BLOB_PATH_METADATA_KEY: &str = "seed.public-blob-path";
+pub const SEED_PRIVATE_BLOB_PATH_METADATA_KEY: &str = "seed.private-blob-path";
+pub const SEED_STORAGE_KIND_METADATA_KEY: &str = "seed.storage-kind";
+pub const SEED_DERIVATION_KDF_METADATA_KEY: &str = "seed.kdf";
+pub const SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY: &str = "seed.derivation-domain-label";
+pub const SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY: &str =
+    "seed.software-derived-at-use-time";
 
 pub type SeedMaterial = SecretBox<Vec<u8>>;
 

@@ -18,11 +18,11 @@ use super::prf::{
     TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, plan_tpm_prf_in,
 };
 use super::seed::{
-    HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
-    SeedProfile, SeedSoftwareDeriver, SoftwareSeedDerivationRequest, open_and_derive,
-    seed_profile_from_profile,
+    HkdfSha256SeedDeriver, SEED_PRIVATE_BLOB_PATH_METADATA_KEY,
+    SEED_PUBLIC_BLOB_PATH_METADATA_KEY, SeedBackend, SeedOpenAuthSource, SeedOpenOutput,
+    SeedOpenRequest, SeedProfile, SeedSoftwareDeriver, SoftwareSeedDerivationRequest,
+    SubprocessSeedBackend, open_and_derive, seed_profile_from_profile,
 };
-
 
 pub fn execute_with_defaults<R>(
     profile: &Profile,
@@ -32,7 +32,7 @@ pub fn execute_with_defaults<R>(
 where
     R: CommandRunner,
 {
-    let seed_backend = super::seed::ScaffoldSeedBackend::default();
+    let seed_backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
     let seed_deriver = HkdfSha256SeedDeriver;
     execute_with_runner(profile, request, prf_runner, &seed_backend, &seed_deriver)
 }
@@ -234,8 +234,10 @@ fn ensure_seed_material_exists(profile: &Profile, seed_profile: &SeedProfile) ->
         .state_layout
         .objects_dir
         .join(&seed_profile.storage.object_label);
-    let public_blob = object_dir.join("sealed.pub");
-    let private_blob = object_dir.join("sealed.priv");
+    let public_blob = metadata_path(profile, SEED_PUBLIC_BLOB_PATH_METADATA_KEY)
+        .unwrap_or_else(|| object_dir.join("sealed.pub"));
+    let private_blob = metadata_path(profile, SEED_PRIVATE_BLOB_PATH_METADATA_KEY)
+        .unwrap_or_else(|| object_dir.join("sealed.priv"));
 
     if public_blob.is_file() && private_blob.is_file() {
         return Ok(());
@@ -247,6 +249,16 @@ fn ensure_seed_material_exists(profile: &Profile, seed_profile: &SeedProfile) ->
         public_blob.display(),
         private_blob.display()
     )))
+}
+
+fn metadata_path(profile: &Profile, key: &str) -> Option<PathBuf> {
+    let value = profile.metadata.get(key)?;
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(profile.storage.state_layout.root_dir.join(path))
+    }
 }
 
 fn temporary_workspace_root(kind: &str, profile: &str) -> Result<PathBuf> {
