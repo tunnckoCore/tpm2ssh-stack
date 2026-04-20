@@ -1,7 +1,10 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct StateLayout {
@@ -25,6 +28,24 @@ impl StateLayout {
         Self::new(root_dir.unwrap_or_else(default_state_root))
     }
 
+    pub fn ensure_dirs(&self) -> Result<()> {
+        for path in [
+            &self.root_dir,
+            &self.profiles_dir,
+            &self.objects_dir,
+            &self.exports_dir,
+        ] {
+            fs::create_dir_all(path).map_err(|error| {
+                Error::State(format!(
+                    "failed to create state directory '{}': {error}",
+                    path.display()
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+
     pub fn profile_path(&self, profile_name: &str) -> PathBuf {
         self.profiles_dir.join(format!("{profile_name}.json"))
     }
@@ -36,8 +57,51 @@ pub fn default_state_root() -> PathBuf {
     }
 
     if let Ok(home) = env::var("HOME") {
-        return Path::new(&home).join(".local").join("state").join("tpm2-derive");
+        return Path::new(&home)
+            .join(".local")
+            .join("state")
+            .join("tpm2-derive");
     }
 
     PathBuf::from(".tpm2-derive")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+
+        env::temp_dir().join(format!(
+            "tpm2-derive-{label}-{}-{sequence}-{now}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn ensure_dirs_creates_required_layout() {
+        let root_dir = unique_temp_path("state-layout");
+        let layout = StateLayout::new(root_dir.clone());
+
+        layout
+            .ensure_dirs()
+            .expect("state layout should be created");
+
+        assert!(layout.root_dir.is_dir());
+        assert!(layout.profiles_dir.is_dir());
+        assert!(layout.objects_dir.is_dir());
+        assert!(layout.exports_dir.is_dir());
+
+        fs::remove_dir_all(root_dir).expect("temporary state layout should be removed");
+    }
 }
