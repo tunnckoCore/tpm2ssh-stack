@@ -88,6 +88,8 @@ pub struct SignArgs {
     pub profile: String,
     #[arg(long, default_value = "-")]
     pub input: String,
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

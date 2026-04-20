@@ -2,14 +2,19 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::error::Result;
-use crate::model::{CommandPath, ErrorEnvelope, OutputEnvelope};
+use crate::model::{CommandPath, Diagnostic, ErrorEnvelope, OutputEnvelope};
 
 pub fn success<T: Serialize>(json: bool, command: CommandPath, result: T) -> Result<String> {
-    render(
-        json,
-        OutputEnvelope::ok(command, result, Vec::new()),
-        false,
-    )
+    success_with_diagnostics(json, command, result, Vec::new())
+}
+
+pub fn success_with_diagnostics<T: Serialize>(
+    json: bool,
+    command: CommandPath,
+    result: T,
+    diagnostics: Vec<Diagnostic>,
+) -> Result<String> {
+    render(json, OutputEnvelope::ok(command, result, diagnostics), false)
 }
 
 pub fn failure(
