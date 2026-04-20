@@ -1,6 +1,12 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use secrecy::{ExposeSecret, SecretSlice};
 use serde::{Deserialize, Serialize};
 
+use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationVersion, OutputKind};
 use crate::error::{Error, Result};
 
@@ -97,6 +103,261 @@ pub struct PrfResponse {
     pub output: DerivedPrfOutput,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TpmPrfExecutionVersion {
+    V1,
+}
+
+impl TpmPrfExecutionVersion {
+    fn from_protocol(version: PrfProtocolVersion) -> Self {
+        match version {
+            PrfProtocolVersion::V1 => Self::V1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TpmPrfHashAlgorithm {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl TpmPrfHashAlgorithm {
+    fn as_tpm2_tools_arg(self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
+            Self::Sha512 => "sha512",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum TpmPrfKeyHandle {
+    LoadedContext {
+        context_path: PathBuf,
+    },
+    LoadableObject {
+        parent_context_path: PathBuf,
+        public_path: PathBuf,
+        private_path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TpmPrfExecutor {
+    pub version: TpmPrfExecutionVersion,
+    pub key_handle: TpmPrfKeyHandle,
+    pub hash_algorithm: TpmPrfHashAlgorithm,
+}
+
+impl TpmPrfExecutor {
+    pub fn v1(key_handle: TpmPrfKeyHandle) -> Self {
+        Self {
+            version: TpmPrfExecutionVersion::V1,
+            key_handle,
+            hash_algorithm: TpmPrfHashAlgorithm::Sha256,
+        }
+    }
+
+    pub fn with_hash_algorithm(mut self, hash_algorithm: TpmPrfHashAlgorithm) -> Self {
+        self.hash_algorithm = hash_algorithm;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TpmPrfWorkspace {
+    pub root_dir: PathBuf,
+    pub request_input_path: PathBuf,
+    pub raw_output_path: PathBuf,
+    pub transient_context_path: PathBuf,
+}
+
+impl TpmPrfWorkspace {
+    pub fn new(root_dir: impl Into<PathBuf>) -> Self {
+        let root_dir = root_dir.into();
+        Self {
+            request_input_path: root_dir.join("prf-request.bin"),
+            raw_output_path: root_dir.join("prf-raw-output.bin"),
+            transient_context_path: root_dir.join("prf-key.ctx"),
+            root_dir,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TpmPrfCommandKind {
+    LoadKey,
+    Hmac,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmPrfCommandStep {
+    pub kind: TpmPrfCommandKind,
+    pub invocation: CommandInvocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmPrfExecutionPlan {
+    pub executor: TpmPrfExecutor,
+    pub request: PrfRequest,
+    pub workspace: TpmPrfWorkspace,
+    pub steps: Vec<TpmPrfCommandStep>,
+}
+
+impl TpmPrfExecutionPlan {
+    pub fn key_context_path(&self) -> &Path {
+        match &self.executor.key_handle {
+            TpmPrfKeyHandle::LoadedContext { context_path } => context_path.as_path(),
+            TpmPrfKeyHandle::LoadableObject { .. } => {
+                self.workspace.transient_context_path.as_path()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TpmPrfExecutionResult {
+    pub raw: RawPrfOutput,
+    pub response: PrfResponse,
+}
+
+pub fn plan_tpm_prf_in(
+    request: PrfRequest,
+    executor: TpmPrfExecutor,
+    workspace_root: impl AsRef<Path>,
+) -> Result<TpmPrfExecutionPlan> {
+    request.validate()?;
+    ensure_matching_execution_version(executor.version, request.protocol_version())?;
+
+    let workspace = TpmPrfWorkspace::new(workspace_root.as_ref().to_path_buf());
+    let mut steps = Vec::new();
+
+    if let TpmPrfKeyHandle::LoadableObject {
+        parent_context_path,
+        public_path,
+        private_path,
+    } = &executor.key_handle
+    {
+        steps.push(TpmPrfCommandStep {
+            kind: TpmPrfCommandKind::LoadKey,
+            invocation: CommandInvocation::new(
+                "tpm2_load",
+                [
+                    "-C".to_string(),
+                    path_arg(parent_context_path),
+                    "-u".to_string(),
+                    path_arg(public_path),
+                    "-r".to_string(),
+                    path_arg(private_path),
+                    "-c".to_string(),
+                    path_arg(&workspace.transient_context_path),
+                ],
+            ),
+        });
+    }
+
+    let key_context_path = match &executor.key_handle {
+        TpmPrfKeyHandle::LoadedContext { context_path } => context_path.as_path(),
+        TpmPrfKeyHandle::LoadableObject { .. } => workspace.transient_context_path.as_path(),
+    };
+
+    let mut hmac_args = vec![
+        "-c".to_string(),
+        path_arg(key_context_path),
+        "-g".to_string(),
+        executor.hash_algorithm.as_tpm2_tools_arg().to_string(),
+        "-o".to_string(),
+        path_arg(&workspace.raw_output_path),
+        path_arg(&workspace.request_input_path),
+    ];
+
+    steps.push(TpmPrfCommandStep {
+        kind: TpmPrfCommandKind::Hmac,
+        invocation: CommandInvocation::new("tpm2_hmac", hmac_args.drain(..)),
+    });
+
+    Ok(TpmPrfExecutionPlan {
+        executor,
+        request,
+        workspace,
+        steps,
+    })
+}
+
+pub fn execute_tpm_prf_plan_with_runner<R>(
+    plan: &TpmPrfExecutionPlan,
+    runner: &R,
+) -> Result<TpmPrfExecutionResult>
+where
+    R: CommandRunner,
+{
+    plan.request.validate()?;
+    ensure_matching_execution_version(plan.executor.version, plan.request.protocol_version())?;
+
+    fs::create_dir_all(&plan.workspace.root_dir).map_err(|error| {
+        Error::State(format!(
+            "failed to create TPM PRF workspace '{}': {error}",
+            plan.workspace.root_dir.display()
+        ))
+    })?;
+
+    let request_bytes = plan.request.tpm_input()?;
+    fs::write(&plan.workspace.request_input_path, &request_bytes).map_err(|error| {
+        Error::State(format!(
+            "failed to write TPM PRF request input '{}': {error}",
+            plan.workspace.request_input_path.display()
+        ))
+    })?;
+
+    for step in &plan.steps {
+        let output = runner.run(&step.invocation);
+        if !command_succeeded(&output) {
+            return Err(command_failure(step, &output));
+        }
+    }
+
+    let raw_bytes = fs::read(&plan.workspace.raw_output_path).map_err(|error| {
+        Error::State(format!(
+            "TPM PRF step completed but raw output '{}' could not be read: {error}",
+            plan.workspace.raw_output_path.display()
+        ))
+    })?;
+
+    let raw = RawPrfOutput::new(plan.request.protocol_version(), raw_bytes)?;
+    let response = finalize(plan.request.clone(), raw.clone())?;
+
+    Ok(TpmPrfExecutionResult { raw, response })
+}
+
+pub fn execute_tpm_prf(
+    request: PrfRequest,
+    executor: TpmPrfExecutor,
+) -> Result<TpmPrfExecutionResult> {
+    let workspace_root = temp_workspace_root(&request.profile)?;
+    let plan = plan_tpm_prf_in(request, executor, &workspace_root)?;
+    let runner = ProcessCommandRunner;
+    let execution = execute_tpm_prf_plan_with_runner(&plan, &runner);
+    let cleanup = fs::remove_dir_all(&workspace_root).map_err(|error| {
+        Error::State(format!(
+            "failed to remove TPM PRF workspace '{}': {error}",
+            workspace_root.display()
+        ))
+    });
+
+    match (execution, cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 pub fn finalize(request: PrfRequest, raw: RawPrfOutput) -> Result<PrfResponse> {
     request.validate()?;
     ensure_matching_versions(request.protocol_version(), raw.version)?;
@@ -126,10 +387,108 @@ fn ensure_matching_versions(
     Ok(())
 }
 
+fn ensure_matching_execution_version(
+    execution_version: TpmPrfExecutionVersion,
+    request_version: PrfProtocolVersion,
+) -> Result<()> {
+    if execution_version != TpmPrfExecutionVersion::from_protocol(request_version) {
+        return Err(Error::Validation(format!(
+            "TPM PRF execution version mismatch: executor {:?}, request {:?}",
+            execution_version, request_version
+        )));
+    }
+
+    Ok(())
+}
+
+fn temp_workspace_root(profile: &str) -> Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            Error::State(format!(
+                "system clock error while creating TPM PRF workspace: {error}"
+            ))
+        })?;
+
+    let sanitized_profile = profile
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+
+    Ok(std::env::temp_dir().join(format!(
+        "tpm2-derive-prf-{}-{}-{}",
+        process::id(),
+        sanitized_profile,
+        now.as_nanos()
+    )))
+}
+
+fn command_succeeded(output: &CommandOutput) -> bool {
+    output.error.is_none() && output.exit_code == Some(0)
+}
+
+fn command_failure(step: &TpmPrfCommandStep, output: &CommandOutput) -> Error {
+    let detail = render_command_detail(output);
+    let summary = format!(
+        "TPM PRF subprocess step '{:?}' failed while running '{} {}'{}",
+        step.kind,
+        step.invocation.program,
+        step.invocation.args.join(" "),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    );
+
+    if output.error.is_some() {
+        Error::TpmUnavailable(summary)
+    } else {
+        Error::CapabilityMismatch(summary)
+    }
+}
+
+fn render_command_detail(output: &CommandOutput) -> String {
+    if let Some(error) = output.error.as_deref() {
+        return error.to_string();
+    }
+
+    let detail = if !output.stderr.trim().is_empty() {
+        output.stderr.trim()
+    } else {
+        output.stdout.trim()
+    };
+
+    preview(detail)
+}
+
+fn preview(value: &str) -> String {
+    let single_line = value.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+    let trimmed = single_line.trim();
+    const LIMIT: usize = 180;
+    if trimmed.len() > LIMIT {
+        format!("{}…", &trimmed[..LIMIT])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn path_arg(path: &Path) -> String {
+    path.display().to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PrfProtocolVersion, PrfRequest, RawPrfOutput, finalize};
-    use crate::crypto::{DerivationSpec, DerivationSpecV1};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        PrfProtocolVersion, PrfRequest, RawPrfOutput, TpmPrfCommandKind, TpmPrfExecutor,
+        TpmPrfHashAlgorithm, TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, finalize,
+        plan_tpm_prf_in,
+    };
+    use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
+    use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 
     #[test]
     fn request_tpm_input_is_canonical_and_non_empty() {
@@ -153,6 +512,77 @@ mod tests {
     }
 
     #[test]
+    fn plan_for_loaded_context_uses_only_hmac_step() {
+        let request = example_request();
+        let workspace = temp_test_dir("loaded-context-plan");
+        let executor = TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
+            context_path: workspace.join("existing.ctx"),
+        });
+
+        let plan = plan_tpm_prf_in(request, executor, &workspace).unwrap();
+
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].kind, TpmPrfCommandKind::Hmac);
+        assert_eq!(plan.steps[0].invocation.program, "tpm2_hmac");
+        assert!(
+            plan.steps[0]
+                .invocation
+                .args
+                .contains(&"sha256".to_string())
+        );
+        cleanup_test_dir(&workspace);
+    }
+
+    #[test]
+    fn plan_for_loadable_object_adds_load_step() {
+        let request = example_request();
+        let workspace = temp_test_dir("loadable-object-plan");
+        let executor = TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadableObject {
+            parent_context_path: workspace.join("parent.ctx"),
+            public_path: workspace.join("key.pub"),
+            private_path: workspace.join("key.priv"),
+        })
+        .with_hash_algorithm(TpmPrfHashAlgorithm::Sha384);
+
+        let plan = plan_tpm_prf_in(request, executor, &workspace).unwrap();
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].kind, TpmPrfCommandKind::LoadKey);
+        assert_eq!(plan.steps[0].invocation.program, "tpm2_load");
+        assert_eq!(plan.steps[1].kind, TpmPrfCommandKind::Hmac);
+        assert!(
+            plan.steps[1]
+                .invocation
+                .args
+                .contains(&"sha384".to_string())
+        );
+        cleanup_test_dir(&workspace);
+    }
+
+    #[test]
+    fn execute_plan_returns_raw_and_finalized_output() {
+        let workspace = temp_test_dir("execute-plan");
+        let request = example_request();
+        let expected_raw = b"tpm-prf-material".to_vec();
+        let plan = plan_tpm_prf_in(
+            request,
+            TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
+                context_path: workspace.join("loaded.ctx"),
+            }),
+            &workspace,
+        )
+        .unwrap();
+
+        let runner = FakeRunner::new(expected_raw.clone());
+        let result = execute_tpm_prf_plan_with_runner(&plan, &runner).unwrap();
+
+        assert_eq!(result.raw.expose_secret(), expected_raw.as_slice());
+        assert_eq!(result.response.output.expose_secret().len(), 32);
+        assert_eq!(runner.invocations().len(), 1);
+        cleanup_test_dir(&workspace);
+    }
+
+    #[test]
     fn finalize_derives_output_for_request() {
         let request = PrfRequest::new(
             "default",
@@ -171,5 +601,116 @@ mod tests {
 
         let response = finalize(request, raw).unwrap();
         assert_eq!(response.output.expose_secret().len(), 32);
+    }
+
+    fn example_request() -> PrfRequest {
+        PrfRequest::new(
+            "default",
+            DerivationSpec::V1(
+                DerivationSpecV1::software_child_key(
+                    "io.github.example",
+                    "ed25519",
+                    "m/ssh/0",
+                    OutputKind::Ed25519Seed,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn temp_test_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tpm2-derive-prf-test-{}-{}",
+            label,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn cleanup_test_dir(path: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[derive(Clone)]
+    struct FakeRunner {
+        raw_output: Vec<u8>,
+        invocations: Arc<Mutex<Vec<CommandInvocation>>>,
+    }
+
+    impl FakeRunner {
+        fn new(raw_output: Vec<u8>) -> Self {
+            Self {
+                raw_output,
+                invocations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn invocations(&self) -> Vec<CommandInvocation> {
+            self.invocations.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.invocations.lock().unwrap().push(invocation.clone());
+
+            match invocation.program.as_str() {
+                "tpm2_hmac" => {
+                    let plan = parse_hmac_invocation(invocation).unwrap();
+                    let request_bytes = std::fs::read(&plan.request_path).unwrap();
+                    assert!(request_bytes.starts_with(crate::crypto::PRF_REQUEST_V1_DOMAIN));
+                    std::fs::write(&plan.output_path, &self.raw_output).unwrap();
+                    CommandOutput {
+                        exit_code: Some(0),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: None,
+                    }
+                }
+                other => CommandOutput {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: format!("unexpected fake command: {other}"),
+                    error: None,
+                },
+            }
+        }
+    }
+
+    struct ParsedHmacInvocation {
+        request_path: PathBuf,
+        output_path: PathBuf,
+    }
+
+    fn parse_hmac_invocation(
+        invocation: &CommandInvocation,
+    ) -> Result<ParsedHmacInvocation, String> {
+        let mut output_path = None;
+        let mut index = 0;
+        while index < invocation.args.len() {
+            match invocation.args[index].as_str() {
+                "-o" => {
+                    index += 1;
+                    output_path = invocation.args.get(index).map(PathBuf::from);
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+
+        let request_path = invocation
+            .args
+            .last()
+            .map(PathBuf::from)
+            .ok_or_else(|| "missing hmac request path".to_string())?;
+        let output_path = output_path.ok_or_else(|| "missing hmac output path".to_string())?;
+
+        Ok(ParsedHmacInvocation {
+            request_path,
+            output_path,
+        })
     }
 }
