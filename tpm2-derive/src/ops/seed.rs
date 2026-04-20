@@ -1,7 +1,7 @@
 use hkdf::Hkdf;
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
@@ -11,9 +11,11 @@ use tempfile::{Builder as TempfileBuilder, NamedTempFile, TempDir};
 use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::DerivationSpec;
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, UseCase};
+use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, Profile, UseCase};
 
 pub const SEED_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const SEED_RECOVERY_BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const SEED_OBJECT_LABEL_METADATA_KEY: &str = "seed.object-label";
 pub const MIN_SEED_BYTES: usize = 32;
 pub const MAX_SEED_BYTES: usize = 64;
 pub const MAX_DERIVED_BYTES: usize = 4096;
@@ -262,6 +264,32 @@ pub struct SeedExportPlan {
     pub required_confirmations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SeedRecoveryBundleV1 {
+    pub schema_version: u32,
+    pub kind: String,
+    pub exported_at_unix_seconds: u64,
+    pub reason: String,
+    pub profile: SeedRecoveryBundleProfile,
+    pub seed: SeedRecoveryBundleSecret,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SeedRecoveryBundleProfile {
+    pub name: String,
+    pub algorithm: Algorithm,
+    pub uses: Vec<UseCase>,
+    pub derivation: SeedDerivation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SeedRecoveryBundleSecret {
+    pub encoding: String,
+    pub bytes: usize,
+    pub sha256: String,
+    pub material: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SeedBackendAction {
@@ -446,6 +474,38 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
         next_backend_action: SeedBackendAction::ExportRecoveryMaterial,
         required_confirmations: required_export_confirmations(policy),
     })
+}
+
+pub fn seed_profile_from_profile(profile: &Profile) -> Result<SeedProfile> {
+    let mut seed_profile = SeedProfile::scaffold(
+        profile.name.clone(),
+        profile.algorithm,
+        profile.uses.clone(),
+    )?;
+
+    if let Some(object_label) = profile.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY) {
+        seed_profile.storage.object_label = object_label.clone();
+    }
+
+    Ok(seed_profile)
+}
+
+pub fn export_recovery_bundle(
+    backend: &dyn SeedBackend,
+    request: &SeedExportRequest,
+) -> Result<SeedRecoveryBundleV1> {
+    plan_export(request)?;
+
+    match request.format {
+        SeedExportFormat::RecoveryBundleV1 => {
+            let seed = backend.unseal_seed(&request.profile, &request.auth_source)?;
+            Ok(build_recovery_bundle(request, seed.expose_secret()))
+        }
+        SeedExportFormat::RawSeedBase64 => Err(Error::Unsupported(
+            "raw seed export is not wired in this vertical slice; use recovery-bundle export"
+                .to_string(),
+        )),
+    }
 }
 
 pub trait SeedBackend {
@@ -967,6 +1027,30 @@ pub fn open_and_derive(
     }
 }
 
+fn build_recovery_bundle(request: &SeedExportRequest, seed: &[u8]) -> SeedRecoveryBundleV1 {
+    SeedRecoveryBundleV1 {
+        schema_version: SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
+        kind: "seed-recovery-bundle-v1".to_string(),
+        exported_at_unix_seconds: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_secs(),
+        reason: request.reason.clone(),
+        profile: SeedRecoveryBundleProfile {
+            name: request.profile.profile.clone(),
+            algorithm: request.profile.algorithm,
+            uses: request.profile.uses.clone(),
+            derivation: request.profile.derivation.clone(),
+        },
+        seed: SeedRecoveryBundleSecret {
+            encoding: "hex".to_string(),
+            bytes: seed.len(),
+            sha256: sha256_hex(seed),
+            material: hex_encode(seed),
+        },
+    }
+}
+
 pub fn validate_seed_profile(profile: &SeedProfile) -> Result<()> {
     validate_profile_name(&profile.profile)?;
 
@@ -1146,6 +1230,20 @@ fn required_export_confirmations(policy: &SeedExportPolicy) -> Vec<String> {
     confirmations
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_encode(&digest)
+}
+
 fn canonical_derivation_info(derivation: &SeedDerivation, spec: &DerivationSpec) -> String {
     let context = spec.context();
     let mut info = vec![
@@ -1256,6 +1354,59 @@ mod tests {
     }
 
     #[test]
+    fn export_recovery_bundle_materializes_seed_hex() {
+        let request = SeedExportRequest {
+            profile: seed_profile(),
+            auth_source: SeedOpenAuthSource::None,
+            destination: SeedExportDestination::ExplicitPath(
+                "/safe/location/recovery.json".to_string(),
+            ),
+            format: SeedExportFormat::RecoveryBundleV1,
+            reason: "hardware migration".to_string(),
+            confirm_recovery_export: true,
+            confirm_sealed_at_rest_boundary: true,
+            confirmation_phrase: Some(DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string()),
+        };
+
+        let seed = sample_seed();
+        let bundle = export_recovery_bundle(&FakeSeedBackend(seed.clone()), &request)
+            .expect("recovery bundle should export");
+
+        assert_eq!(bundle.schema_version, SEED_RECOVERY_BUNDLE_SCHEMA_VERSION);
+        assert_eq!(bundle.kind, "seed-recovery-bundle-v1");
+        assert_eq!(bundle.reason, "hardware migration");
+        assert_eq!(bundle.profile.name, "seed-profile");
+        assert_eq!(bundle.seed.encoding, "hex");
+        assert_eq!(bundle.seed.bytes, seed.len());
+        assert_eq!(bundle.seed.material, hex_encode(&seed));
+        assert_eq!(bundle.seed.sha256, sha256_hex(&seed));
+        assert!(bundle.exported_at_unix_seconds > 0);
+    }
+
+    #[test]
+    fn seed_profile_from_profile_uses_metadata_object_label_override() {
+        let root = tempfile::tempdir().expect("state root");
+        let mut profile = crate::model::Profile::new(
+            "seed-profile".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Derive],
+            crate::model::ModeResolution {
+                requested: crate::model::ModePreference::Seed,
+                resolved: crate::model::Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            crate::model::StateLayout::new(root.path().to_path_buf()),
+        );
+        profile.metadata.insert(
+            SEED_OBJECT_LABEL_METADATA_KEY.to_string(),
+            "portable-seed-object".to_string(),
+        );
+
+        let seed_profile = seed_profile_from_profile(&profile).expect("seed profile from host");
+        assert_eq!(seed_profile.storage.object_label, "portable-seed-object");
+    }
+
+    #[test]
     fn hkdf_derivation_is_deterministic() {
         let deriver = HkdfSha256SeedDeriver;
         let request = derivation_request();
@@ -1266,6 +1417,23 @@ mod tests {
 
         assert_eq!(left.expose_secret(), right.expose_secret());
         assert_eq!(left.expose_secret().len(), 32);
+    }
+
+    #[derive(Debug)]
+    struct FakeSeedBackend(Vec<u8>);
+
+    impl SeedBackend for FakeSeedBackend {
+        fn seal_seed(&self, _request: &SeedCreateRequest) -> Result<()> {
+            unreachable!("seed sealing is not used in export tests")
+        }
+
+        fn unseal_seed(
+            &self,
+            _profile: &SeedProfile,
+            _auth_source: &SeedOpenAuthSource,
+        ) -> Result<SeedMaterial> {
+            Ok(SecretBox::new(Box::new(self.0.clone())))
+        }
     }
 
     #[derive(Debug)]

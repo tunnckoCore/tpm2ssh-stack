@@ -203,6 +203,10 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
         kind: args.kind.into(),
         output: args.output,
         state_dir: args.state_dir,
+        reason: args.reason,
+        confirm_recovery_export: args.confirm_recovery_export,
+        confirm_sealed_at_rest_boundary: args.confirm_sealed_at_rest_boundary,
+        confirmation_phrase: args.confirmation_phrase,
     };
 
     match ops::export(&request) {
@@ -442,6 +446,12 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
         .objects_dir
         .join(&profile.name)
         .join("native-sign");
+    let native_dir = profile
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&profile.name)
+        .join("native");
     let output_dir = profile
         .storage
         .state_layout
@@ -783,6 +793,10 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
             kind: ExportKind::PublicKey,
             output: None,
             state_dir: None,
+            reason: None,
+            confirm_recovery_export: false,
+            confirm_sealed_at_rest_boundary: false,
+            confirmation_phrase: None,
         })
         .unwrap_or_default(),
         "ssh-agent add" => serde_json::to_value(SshAgentAddRequest {

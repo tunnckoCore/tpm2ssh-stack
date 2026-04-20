@@ -30,6 +30,11 @@ use crate::ops::prf::{
     PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY, PrfRootLayout,
     SubprocessPrfBackend,
 };
+use crate::ops::seed::{
+    SeedExportDestination, SeedExportFormat, SeedExportRequest, SeedOpenAuthSource,
+    SeedRecoveryBundleV1, SubprocessSeedBackend,
+    export_recovery_bundle as export_seed_recovery_bundle, seed_profile_from_profile,
+};
 
 pub fn inspect(probe: &dyn CapabilityProbe, request: &InspectRequest) -> CapabilityReport {
     probe.detect(request.algorithm, &normalize_uses(request.uses.clone()))
@@ -174,7 +179,7 @@ pub fn export(request: &ExportRequest) -> Result<ExportResult> {
     let profile = load_profile(&request.profile, request.state_dir.clone())?;
     match request.kind {
         ExportKind::PublicKey => export_public_key(&profile, request.output.as_deref()),
-        ExportKind::RecoveryBundle => export_recovery_bundle(&profile),
+        ExportKind::RecoveryBundle => export_recovery_bundle(&profile, request),
     }
 }
 
@@ -210,7 +215,19 @@ fn export_public_key(profile: &Profile, requested_output: Option<&Path>) -> Resu
     }
 }
 
-fn export_recovery_bundle(profile: &Profile) -> Result<ExportResult> {
+fn export_recovery_bundle(profile: &Profile, request: &ExportRequest) -> Result<ExportResult> {
+    let backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+    export_recovery_bundle_with_backend(profile, request, &backend)
+}
+
+fn export_recovery_bundle_with_backend<B>(
+    profile: &Profile,
+    request: &ExportRequest,
+    backend: &B,
+) -> Result<ExportResult>
+where
+    B: crate::ops::seed::SeedBackend,
+{
     if !profile.export_policy.recovery_export {
         return Err(Error::PolicyRefusal(format!(
             "profile '{}' resolved to {:?} mode, which does not allow recovery-bundle export",
@@ -218,10 +235,41 @@ fn export_recovery_bundle(profile: &Profile) -> Result<ExportResult> {
         )));
     }
 
-    Err(Error::Unsupported(format!(
-        "profile '{}' resolved to {:?} mode; recovery-bundle export is not wired in this vertical slice",
-        profile.name, profile.mode.resolved
-    )))
+    if profile.mode.resolved != Mode::Seed {
+        return Err(Error::PolicyRefusal(format!(
+            "profile '{}' resolved to {:?} mode; recovery-bundle export is only available for seed-mode profiles",
+            profile.name, profile.mode.resolved
+        )));
+    }
+
+    let destination = resolve_recovery_bundle_output_path(request.output.as_deref())?;
+    let seed_profile = seed_profile_from_profile(profile)?;
+    let bundle = export_seed_recovery_bundle(
+        backend,
+        &SeedExportRequest {
+            profile: seed_profile,
+            auth_source: SeedOpenAuthSource::None,
+            destination: SeedExportDestination::ExplicitPath(destination.display().to_string()),
+            format: SeedExportFormat::RecoveryBundleV1,
+            reason: request.reason.clone().unwrap_or_default(),
+            confirm_recovery_export: request.confirm_recovery_export,
+            confirm_sealed_at_rest_boundary: request.confirm_sealed_at_rest_boundary,
+            confirmation_phrase: request.confirmation_phrase.clone(),
+        },
+    )?;
+
+    let bytes_written = write_recovery_bundle_output(&destination, &bundle)?;
+
+    Ok(ExportResult {
+        profile: profile.name.clone(),
+        mode: profile.mode.resolved,
+        kind: ExportKind::RecoveryBundle,
+        artifact: ExportArtifact {
+            format: ExportFormat::RecoveryBundleJson,
+            path: destination,
+            bytes_written,
+        },
+    })
 }
 
 fn materialize_native_setup<R>(profile: &mut Profile, runner: &R) -> Result<()>
@@ -619,6 +667,31 @@ fn resolve_public_key_output_path(
     }
 }
 
+fn resolve_recovery_bundle_output_path(requested_output: Option<&Path>) -> Result<PathBuf> {
+    let path = requested_output.ok_or_else(|| {
+        Error::Validation(
+            "recovery-bundle export requires --output so the operator chooses an explicit destination"
+                .to_string(),
+        )
+    })?;
+
+    if path.is_dir() {
+        return Err(Error::Validation(format!(
+            "export output '{}' must be a file path, not a directory",
+            path.display()
+        )));
+    }
+
+    if path == Path::new("-") {
+        return Err(Error::Validation(
+            "recovery-bundle export may not write to stdout; choose an explicit file path"
+                .to_string(),
+        ));
+    }
+
+    Ok(path.to_path_buf())
+}
+
 fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
     if let Some(parent) = path
         .parent()
@@ -638,6 +711,33 @@ fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
             path.display()
         ))
     })
+}
+
+fn write_recovery_bundle_output(path: &Path, bundle: &SeedRecoveryBundleV1) -> Result<usize> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            Error::State(format!(
+                "failed to create export directory '{}': {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let payload = format!(
+        "{}\n",
+        serde_json::to_string_pretty(bundle).map_err(crate::error::Error::from)?
+    );
+    fs::write(path, payload.as_bytes()).map_err(|error| {
+        Error::State(format!(
+            "failed to write recovery-bundle export to '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    Ok(payload.len())
 }
 
 fn remove_path_if_present(path: &Path) {
@@ -1010,6 +1110,10 @@ mod tests {
             kind: ExportKind::PublicKey,
             output: None,
             state_dir: Some(root_dir.clone()),
+            reason: None,
+            confirm_recovery_export: false,
+            confirm_sealed_at_rest_boundary: false,
+            confirmation_phrase: None,
         })
         .expect_err("prf export should refuse");
 
@@ -1162,6 +1266,120 @@ mod tests {
             .find(|pair| pair[0] == flag)
             .map(|pair| PathBuf::from(&pair[1]))
             .unwrap_or_else(|| panic!("missing {flag} argument"))
+    }
+
+    #[test]
+    fn export_writes_seed_recovery_bundle_when_confirmed() {
+        let root_dir = unique_temp_path("export-seed-recovery-bundle");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let profile = Profile::new(
+            "seed-default".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Derive, UseCase::SshAgent],
+            ModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            state_layout.clone(),
+        );
+
+        let output_path = root_dir.join("backup").join("seed-default.recovery.json");
+        let result = export_recovery_bundle_with_backend(
+            &profile,
+            &ExportRequest {
+                profile: profile.name.clone(),
+                kind: ExportKind::RecoveryBundle,
+                output: Some(output_path.clone()),
+                state_dir: Some(root_dir.clone()),
+                reason: Some("hardware migration".to_string()),
+                confirm_recovery_export: true,
+                confirm_sealed_at_rest_boundary: true,
+                confirmation_phrase: Some(
+                    crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
+                ),
+            },
+            &FakeSeedExportBackend::new(vec![0x7a; 32]),
+        )
+        .expect("seed recovery export should succeed");
+
+        assert_eq!(result.profile, "seed-default");
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.kind, ExportKind::RecoveryBundle);
+        assert_eq!(result.artifact.format, ExportFormat::RecoveryBundleJson);
+        assert_eq!(result.artifact.path, output_path);
+
+        let payload = fs::read_to_string(&result.artifact.path).expect("recovery bundle output");
+        assert!(payload.contains("seed-recovery-bundle-v1"));
+        assert!(payload.contains("hardware migration"));
+        assert!(payload.contains("7a7a7a7a"));
+
+        fs::remove_dir_all(root_dir).expect("temporary recovery export state should be removed");
+    }
+
+    #[test]
+    fn export_recovery_bundle_requires_explicit_output_path() {
+        let root_dir = unique_temp_path("export-seed-recovery-missing-output");
+        let profile = Profile::new(
+            "seed-default".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Derive],
+            ModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            StateLayout::new(root_dir.clone()),
+        );
+
+        let error = export_recovery_bundle_with_backend(
+            &profile,
+            &ExportRequest {
+                profile: profile.name.clone(),
+                kind: ExportKind::RecoveryBundle,
+                output: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("hardware migration".to_string()),
+                confirm_recovery_export: true,
+                confirm_sealed_at_rest_boundary: true,
+                confirmation_phrase: Some(
+                    crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
+                ),
+            },
+            &FakeSeedExportBackend::new(vec![0x7a; 32]),
+        )
+        .expect_err("missing output should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("requires --output"))
+        );
+    }
+
+    #[derive(Clone)]
+    struct FakeSeedExportBackend {
+        seed: Vec<u8>,
+    }
+
+    impl FakeSeedExportBackend {
+        fn new(seed: Vec<u8>) -> Self {
+            Self { seed }
+        }
+    }
+
+    impl crate::ops::seed::SeedBackend for FakeSeedExportBackend {
+        fn seal_seed(&self, _request: &crate::ops::seed::SeedCreateRequest) -> Result<()> {
+            unreachable!("seed sealing is not used in recovery export tests")
+        }
+
+        fn unseal_seed(
+            &self,
+            _profile: &crate::ops::seed::SeedProfile,
+            _auth_source: &crate::ops::seed::SeedOpenAuthSource,
+        ) -> Result<crate::ops::seed::SeedMaterial> {
+            Ok(secrecy::SecretBox::new(Box::new(self.seed.clone())))
+        }
     }
 
     #[derive(Clone)]

@@ -20,9 +20,9 @@ use super::prf::{
 use super::seed::{
     HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
     SeedProfile, SeedSoftwareDeriver, SoftwareSeedDerivationRequest, open_and_derive,
+    seed_profile_from_profile,
 };
 
-const SEED_OBJECT_LABEL_METADATA_KEY: &str = "seed.object-label";
 
 pub fn execute_with_defaults<R>(
     profile: &Profile,
@@ -228,21 +228,6 @@ fn resolve_state_path(profile: &Profile, value: &str) -> PathBuf {
         profile.storage.state_layout.root_dir.join(path)
     }
 }
-
-fn seed_profile_from_profile(profile: &Profile) -> Result<SeedProfile> {
-    let mut seed_profile = SeedProfile::scaffold(
-        profile.name.clone(),
-        profile.algorithm,
-        profile.uses.clone(),
-    )?;
-
-    if let Some(object_label) = profile.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY) {
-        seed_profile.storage.object_label = object_label.clone();
-    }
-
-    Ok(seed_profile)
-}
-
 fn ensure_seed_material_exists(profile: &Profile, seed_profile: &SeedProfile) -> Result<()> {
     let object_dir = profile
         .storage

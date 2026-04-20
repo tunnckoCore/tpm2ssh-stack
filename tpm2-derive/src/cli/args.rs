@@ -128,6 +128,14 @@ pub struct ExportArgs {
     pub output: Option<PathBuf>,
     #[arg(long)]
     pub state_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long)]
+    pub confirm_recovery_export: bool,
+    #[arg(long)]
+    pub confirm_sealed_at_rest_boundary: bool,
+    #[arg(long)]
+    pub confirmation_phrase: Option<String>,
 }
 
 #[derive(Debug, Args)]

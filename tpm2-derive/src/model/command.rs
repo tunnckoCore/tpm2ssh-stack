@@ -91,12 +91,17 @@ pub struct ExportRequest {
     pub kind: ExportKind,
     pub output: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
+    pub reason: Option<String>,
+    pub confirm_recovery_export: bool,
+    pub confirm_sealed_at_rest_boundary: bool,
+    pub confirmation_phrase: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExportFormat {
     SpkiDer,
+    RecoveryBundleJson,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
