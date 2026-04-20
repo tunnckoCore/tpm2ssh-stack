@@ -1,5 +1,6 @@
 pub mod native;
 pub mod prf;
+pub mod seed;
 
 use crate::backend::CapabilityProbe;
 use crate::error::{Error, Result};
