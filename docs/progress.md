@@ -112,11 +112,11 @@ _As of 2026-04-20._
 5. enforce use-case boundaries:
    - valid uses: `sign`, `verify`, `ssh-agent`, `derive`, `encrypt`, `decrypt` (drop `ssh` / `ethereum`)
    - `derive` must fail for profiles without `use=derive`
-   - `ssh-agent add` must require `use=ssh-agent`
+   - `ssh-agent add` must fail for profiles without `use=ssh-agent`
    - mode/use enforcement:
-     - `prf` mode allows: `ssh-agent`, `derive`, `encrypt`, `decrypt`; throw on `sign` and `verify`
+     - `prf` mode allows: `ssh-agent`, `derive`; throw on `sign`, `verify`, `encrypt`, `decrypt`
      - `seed` mode allows: everything
-     - `native` mode allows: `sign`, `verify` (and public-key export)
+     - `native` mode allows: `sign`, `verify` (and public-key export), throw on else
    - add tests for all enforcement directions
 6. SSH UX: keep dedicated `ssh-agent add` command AND add `derive --ssh-agent-add` flag (both work)
 7. clean `docs/TPM2_DERIVE_COMBINATIONS.md`:
@@ -127,9 +127,9 @@ _As of 2026-04-20._
 8. tighten state layout on-disk permissions:
    - dirs `0700`, files `0600`
    - document what lives under `profiles/`, `objects/`, `exports/`
-9. implement `encrypt` / `decrypt`
+9. implement `encrypt` / `decrypt` for the modes: `native` and `seed` only (prf cannot, you must derive keypair from the returned prf, or just use `keygen --from-profile`)
 10. add `keygen` command:
     - no stdin; accepts `--from-profile` (`--profile` as alias) and `--kind auto|prf|seed`
     - `--kind` defaults to `auto` which tries `prf` first, then `seed`, otherwise throws
-    - emits secret/public keypair with format selection and optional output location
+    - emits secret/public keypair with `--format` output flag, and optional output location
     - this is our architecture-specific keygen, not a general-purpose keygen
