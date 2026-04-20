@@ -100,6 +100,8 @@ pub struct VerifyArgs {
     pub input: String,
     #[arg(long)]
     pub signature: String,
+    #[arg(long)]
+    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

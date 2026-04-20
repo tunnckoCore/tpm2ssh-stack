@@ -21,6 +21,7 @@ backend-tss-esapi = []
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
 hkdf = "0.12.4"
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

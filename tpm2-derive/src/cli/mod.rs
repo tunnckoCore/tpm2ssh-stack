@@ -6,11 +6,16 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use tempfile::Builder as TempfileBuilder;
+
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
     ModeArg, SetupArgs, SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
+use p256::ecdsa::signature::Verifier as _;
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
+use p256::pkcs8::DecodePublicKey as _;
 use render::{failure, success, success_with_diagnostics};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -88,13 +93,7 @@ pub fn run(cli: Cli) -> Result<String> {
         Command::Setup(args) => run_setup(cli.json, &probe, args),
         Command::Derive(args) => run_derive(cli.json, args),
         Command::Sign(args) => run_sign(cli.json, args),
-        Command::Verify(args) => run_placeholder(
-            cli.json,
-            CommandPath::from_segments(["verify"]),
-            args.profile.clone(),
-            "verify",
-            verify_summary(&args),
-        ),
+        Command::Verify(args) => run_verify(cli.json, args),
         Command::Encrypt(args) => run_placeholder(
             cli.json,
             CommandPath::from_segments(["encrypt"]),
@@ -330,14 +329,14 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
                 diagnostics,
             ),
         },
-        Mode::Prf => unsupported_sign_mode(
+        Mode::Prf => unsupported_mode_operation(
             json,
             command,
             profile.mode.resolved,
             diagnostics,
             "sign is not wired for PRF-mode profiles yet",
         ),
-        Mode::Seed => unsupported_sign_mode(
+        Mode::Seed => unsupported_mode_operation(
             json,
             command,
             profile.mode.resolved,
@@ -345,6 +344,154 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
             "sign is not wired for seed-mode profiles yet",
         ),
     }
+}
+
+fn run_verify(json: bool, args: VerifyArgs) -> Result<String> {
+    run_verify_with_runner(json, args, &ProcessCommandRunner)
+}
+
+fn run_verify_with_runner<R>(json: bool, args: VerifyArgs, runner: &R) -> Result<String>
+where
+    R: CommandRunner,
+{
+    let request = VerifyRequest {
+        profile: args.profile.clone(),
+        input: parse_input_source(&args.input),
+        signature: parse_input_source(&args.signature),
+    };
+    let command = CommandPath::from_segments(["verify"]);
+
+    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: error.code().as_str().to_string(),
+                    message: error.to_string(),
+                },
+                Vec::new(),
+            );
+        }
+    };
+
+    let mut diagnostics = vec![
+        crate::model::Diagnostic::info(
+            "loaded-profile",
+            format!(
+                "loaded profile '{}' from '{}'",
+                profile.name,
+                profile.storage.profile_path.display()
+            ),
+        ),
+        crate::model::Diagnostic::info(
+            "profile-mode",
+            format!(
+                "verify request is bound to resolved mode {:?}",
+                profile.mode.resolved
+            ),
+        ),
+    ];
+
+    match profile.mode.resolved {
+        Mode::Native => match verify_native_with_runner(&request, &profile, runner) {
+            Ok((result, verify_diagnostics)) => {
+                diagnostics.extend(verify_diagnostics);
+                success_with_diagnostics(json, command, result, diagnostics)
+            }
+            Err(error) => failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: error.code().as_str().to_string(),
+                    message: error.to_string(),
+                },
+                diagnostics,
+            ),
+        },
+        Mode::Prf => unsupported_mode_operation(
+            json,
+            command,
+            profile.mode.resolved,
+            diagnostics,
+            "verify is not wired for PRF-mode profiles yet",
+        ),
+        Mode::Seed => unsupported_mode_operation(
+            json,
+            command,
+            profile.mode.resolved,
+            diagnostics,
+            "verify is not wired for seed-mode profiles yet",
+        ),
+    }
+}
+
+fn verify_native_with_runner<R>(
+    request: &VerifyRequest,
+    profile: &Profile,
+    runner: &R,
+) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)>
+where
+    R: CommandRunner,
+{
+    if profile.algorithm != Algorithm::P256 {
+        return Err(Error::Unsupported(format!(
+            "native verify is currently wired only for p256 profiles, found {:?}",
+            profile.algorithm
+        )));
+    }
+
+    if !profile.uses.contains(&UseCase::Verify) {
+        return Err(Error::Unsupported(format!(
+            "profile '{}' is not configured with verify use",
+            profile.name
+        )));
+    }
+
+    if matches!(request.input, InputSource::Stdin)
+        && matches!(request.signature, InputSource::Stdin)
+    {
+        return Err(Error::Validation(
+            "verify cannot read both --input and --signature from stdin at the same time"
+                .to_string(),
+        ));
+    }
+
+    let input_bytes = load_input_bytes(&request.input, "verify input")?;
+    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
+    if signature_bytes.is_empty() {
+        return Err(Error::Validation(
+            "verify signature must not be empty".to_string(),
+        ));
+    }
+
+    let digest = Sha256::digest(&input_bytes).to_vec();
+    let public_key_der = export_native_public_key_der_with_runner(profile, runner)?;
+    let verifying_key = load_p256_verifying_key(&public_key_der)?;
+    let (signature, signature_format) = parse_p256_verify_signature(&signature_bytes)?;
+    let verified = verifying_key.verify(&input_bytes, &signature).is_ok();
+
+    Ok((
+        VerifyOperationResult {
+            profile: profile.clone(),
+            request: request.clone(),
+            mode: Mode::Native,
+            verified,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            digest_hex: hex_encode(&digest),
+            input_bytes: input_bytes.len(),
+            signature_bytes: signature_bytes.len(),
+            signature_format,
+        },
+        vec![crate::model::Diagnostic::info(
+            "native-public-key-exported",
+            format!(
+                "exported {} bytes of SPKI DER public key material from native TPM state for verify",
+                public_key_der.len()
+            ),
+        )],
+    ))
 }
 
 fn export_command_path(kind: ExportKind) -> CommandPath {
@@ -391,6 +538,19 @@ struct SignOperationResult {
     plan: NativeSignPlan,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct VerifyOperationResult {
+    profile: Profile,
+    request: VerifyRequest,
+    mode: Mode,
+    verified: bool,
+    digest_algorithm: DigestAlgorithm,
+    digest_hex: String,
+    input_bytes: usize,
+    signature_bytes: usize,
+    signature_format: NativeSignatureFormat,
+}
+
 #[derive(Debug, Clone)]
 struct StagedNativeSign {
     digest_algorithm: DigestAlgorithm,
@@ -402,7 +562,7 @@ struct StagedNativeSign {
     diagnostics: Vec<crate::model::Diagnostic>,
 }
 
-fn unsupported_sign_mode(
+fn unsupported_mode_operation(
     json: bool,
     command: CommandPath,
     mode: Mode,
@@ -595,7 +755,10 @@ where
         plan.command.args.iter().cloned(),
     ));
     if output.error.is_some() || output.exit_code != Some(0) {
-        return Err(classify_native_sign_failure(&plan.command.program, &output));
+        return Err(classify_native_command_failure(
+            &plan.command.program,
+            &output,
+        ));
     }
 
     let signature = finalize_native_signature_output(plan)?;
@@ -639,11 +802,11 @@ fn finalize_native_signature_output(plan: &NativeSignPlan) -> Result<Vec<u8>> {
     }
 }
 
-fn classify_native_sign_failure(program: &str, output: &CommandOutput) -> Error {
+fn classify_native_command_failure(program: &str, output: &CommandOutput) -> Error {
     let detail = render_command_failure_detail(output);
     let lower = detail.to_ascii_lowercase();
     let message = format!(
-        "native sign command '{}' failed{}{}",
+        "native TPM command '{}' failed{}{}",
         program,
         output
             .exit_code
@@ -713,21 +876,125 @@ fn parse_input_source(input: &str) -> InputSource {
 }
 
 fn load_sign_input(input: &InputSource) -> Result<Vec<u8>> {
+    load_input_bytes(input, "sign input")
+}
+
+fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
     match input {
         InputSource::Stdin => {
             let mut buffer = Vec::new();
             std::io::stdin().read_to_end(&mut buffer).map_err(|error| {
-                Error::State(format!("failed to read sign input from stdin: {error}"))
+                Error::State(format!("failed to read {label} from stdin: {error}"))
             })?;
             Ok(buffer)
         }
         InputSource::Path { path } => fs::read(path).map_err(|error| {
             Error::State(format!(
-                "failed to read sign input '{}': {error}",
+                "failed to read {label} '{}': {error}",
                 path.display()
             ))
         }),
     }
+}
+
+fn export_native_public_key_der_with_runner<R>(profile: &Profile, runner: &R) -> Result<Vec<u8>>
+where
+    R: CommandRunner,
+{
+    if profile.algorithm != Algorithm::P256 {
+        return Err(Error::Unsupported(format!(
+            "native public-key export is currently wired only for p256 profiles, got {:?}",
+            profile.algorithm
+        )));
+    }
+
+    profile.storage.state_layout.ensure_dirs()?;
+
+    let locator = ops::resolve_native_key_locator(profile)?;
+    let tempdir = TempfileBuilder::new()
+        .prefix("native-verify-public-key-")
+        .tempdir_in(&profile.storage.state_layout.exports_dir)
+        .map_err(|error| {
+            Error::State(format!(
+                "failed to create native verify workspace in '{}': {error}",
+                profile.storage.state_layout.exports_dir.display()
+            ))
+        })?;
+
+    let plan = crate::ops::native::subprocess::plan_export_public_key(
+        &crate::ops::native::NativePublicKeyExportRequest {
+            key: NativeKeyRef {
+                profile: profile.name.clone(),
+                key_id: ops::native_key_id(profile),
+            },
+            encodings: vec![crate::ops::native::NativePublicKeyEncoding::SpkiDer],
+        },
+        &crate::ops::native::subprocess::NativePublicKeyExportOptions {
+            locator,
+            output_dir: tempdir.path().to_path_buf(),
+            file_stem: profile.name.clone(),
+        },
+    )?;
+
+    for command in &plan.commands {
+        let output = runner.run(&CommandInvocation::new(
+            &command.program,
+            command.args.iter().cloned(),
+        ));
+        if output.error.is_some() || output.exit_code != Some(0) {
+            return Err(classify_native_command_failure(&command.program, &output));
+        }
+    }
+
+    let exported = plan
+        .outputs
+        .iter()
+        .find(|output| output.encoding == crate::ops::native::NativePublicKeyEncoding::SpkiDer)
+        .ok_or_else(|| {
+            Error::Internal(
+                "native verify export plan did not produce the expected SPKI DER artifact"
+                    .to_string(),
+            )
+        })?;
+
+    fs::read(&exported.path).map_err(|error| {
+        Error::State(format!(
+            "failed to read native verify public key from '{}': {error}",
+            exported.path.display()
+        ))
+    })
+}
+
+fn load_p256_verifying_key(public_key_der: &[u8]) -> Result<VerifyingKey> {
+    VerifyingKey::from_public_key_der(public_key_der).map_err(|error| {
+        Error::State(format!(
+            "native verify exported malformed SPKI DER public key material: {error}"
+        ))
+    })
+}
+
+fn parse_p256_verify_signature(
+    signature_bytes: &[u8],
+) -> Result<(P256Signature, NativeSignatureFormat)> {
+    if let Ok(signature) = P256Signature::from_der(signature_bytes) {
+        return Ok((signature, NativeSignatureFormat::Der));
+    }
+
+    if let Ok(signature) = P256Signature::from_slice(signature_bytes) {
+        return Ok((signature, NativeSignatureFormat::P1363));
+    }
+
+    Err(Error::Validation(
+        "verify signature must be either ASN.1 DER ECDSA or 64-byte P1363 for p256".to_string(),
+    ))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
 }
 
 fn ensure_dir(path: &Path, label: &str) -> Result<()> {
@@ -809,13 +1076,6 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
     }
 }
 
-fn verify_summary(args: &VerifyArgs) -> String {
-    format!(
-        "profile={} input={} signature={} state=planned",
-        args.profile, args.input, args.signature
-    )
-}
-
 fn encrypt_summary(args: &EncryptArgs) -> String {
     format!(
         "profile={} input={} state=planned",
@@ -847,6 +1107,9 @@ mod tests {
 
     use std::cell::RefCell;
 
+    use p256::ecdsa::signature::Signer as _;
+    use p256::ecdsa::SigningKey;
+    use p256::pkcs8::EncodePublicKey as _;
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -895,6 +1158,46 @@ mod tests {
         }
     }
 
+    struct RecordingNativePublicKeyRunner {
+        invocations: RefCell<Vec<CommandInvocation>>,
+        public_key_der: Vec<u8>,
+    }
+
+    impl RecordingNativePublicKeyRunner {
+        fn success(public_key_der: Vec<u8>) -> Self {
+            Self {
+                invocations: RefCell::new(Vec::new()),
+                public_key_der,
+            }
+        }
+
+        fn invocations(&self) -> Vec<CommandInvocation> {
+            self.invocations.borrow().clone()
+        }
+    }
+
+    impl CommandRunner for RecordingNativePublicKeyRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.invocations.borrow_mut().push(invocation.clone());
+            assert_eq!(invocation.program, "tpm2_readpublic");
+
+            let output_path = invocation
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-o")
+                .map(|pair| PathBuf::from(&pair[1]))
+                .expect("native public-key output path");
+            fs::write(output_path, &self.public_key_der).expect("write fake public key");
+
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            }
+        }
+    }
+
     fn native_profile(root: &Path, mode: Mode, uses: Vec<UseCase>) -> Profile {
         Profile::new(
             "prod-signer".to_string(),
@@ -906,6 +1209,24 @@ mod tests {
                 reasons: vec![format!("{mode:?} requested")],
             },
             StateLayout::new(root.to_path_buf()),
+        )
+    }
+
+    fn example_verify_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let message = b"hello from native verify".to_vec();
+        let signing_key = SigningKey::from_bytes((&[7u8; 32]).into()).expect("signing key");
+        let signature: P256Signature = signing_key.sign(&message);
+        let public_key_der = signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("public key der")
+            .as_bytes()
+            .to_vec();
+
+        (
+            message,
+            signature.to_der().as_bytes().to_vec(),
+            public_key_der,
         )
     }
 
@@ -995,6 +1316,115 @@ mod tests {
                     .contains("will execute once native setup material is present")
         }));
         assert!(runner.invocations().is_empty());
+    }
+
+    #[test]
+    fn native_verify_succeeds_for_valid_signature() {
+        let state_root = tempdir().expect("state root");
+        let profile = native_profile(
+            state_root.path(),
+            Mode::Native,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
+        profile.persist().expect("persist profile");
+
+        let handle_path = profile
+            .storage
+            .state_layout
+            .objects_dir
+            .join("prod-signer.handle");
+        fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
+        fs::write(&handle_path, b"serialized-handle").expect("handle file");
+
+        let (message, signature_der, public_key_der) = example_verify_material();
+        let input_path = state_root.path().join("input.bin");
+        let signature_path = state_root.path().join("signature.der");
+        fs::write(&input_path, &message).expect("input file");
+        fs::write(&signature_path, &signature_der).expect("signature file");
+
+        let output = run_verify_with_runner(
+            true,
+            VerifyArgs {
+                profile: profile.name.clone(),
+                input: input_path.display().to_string(),
+                signature: signature_path.display().to_string(),
+                state_dir: Some(state_root.path().to_path_buf()),
+            },
+            &RecordingNativePublicKeyRunner::success(public_key_der),
+        )
+        .expect("verify output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(value["ok"], Value::Bool(true));
+        assert_eq!(value["result"]["verified"], Value::Bool(true));
+        assert_eq!(
+            value["result"]["signature_format"],
+            Value::String("der".to_string())
+        );
+    }
+
+    #[test]
+    fn native_verify_returns_false_for_signature_mismatch() {
+        let state_root = tempdir().expect("state root");
+        let profile = native_profile(
+            state_root.path(),
+            Mode::Native,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
+        profile.persist().expect("persist profile");
+
+        let handle_path = profile
+            .storage
+            .state_layout
+            .objects_dir
+            .join("prod-signer.handle");
+        fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
+        fs::write(&handle_path, b"serialized-handle").expect("handle file");
+
+        let (_message, signature_der, public_key_der) = example_verify_material();
+        let input_path = state_root.path().join("input.bin");
+        let signature_path = state_root.path().join("signature.der");
+        fs::write(&input_path, b"wrong message").expect("input file");
+        fs::write(&signature_path, &signature_der).expect("signature file");
+
+        let runner = RecordingNativePublicKeyRunner::success(public_key_der);
+        let output = run_verify_with_runner(
+            true,
+            VerifyArgs {
+                profile: profile.name.clone(),
+                input: input_path.display().to_string(),
+                signature: signature_path.display().to_string(),
+                state_dir: Some(state_root.path().to_path_buf()),
+            },
+            &runner,
+        )
+        .expect("verify output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(value["ok"], Value::Bool(true));
+        assert_eq!(value["result"]["verified"], Value::Bool(false));
+        assert_eq!(runner.invocations().len(), 1);
+    }
+
+    #[test]
+    fn verify_rejects_double_stdin_before_reading() {
+        let state_root = tempdir().expect("state root");
+        let profile = native_profile(state_root.path(), Mode::Native, vec![UseCase::Verify]);
+
+        let error = verify_native_with_runner(
+            &VerifyRequest {
+                profile: profile.name.clone(),
+                input: InputSource::Stdin,
+                signature: InputSource::Stdin,
+            },
+            &profile,
+            &RecordingNativePublicKeyRunner::success(Vec::new()),
+        )
+        .expect_err("double stdin should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("both --input and --signature from stdin"))
+        );
     }
 
     #[test]

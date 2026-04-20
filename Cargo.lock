@@ -1064,6 +1064,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hkdf",
+ "p256",
  "secrecy",
  "serde",
  "serde_json",
