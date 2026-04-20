@@ -1,1 +1,17 @@
-/target
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Build outputs
+/target/
+**/target/
+
+# Local test keys
+ed-testkey
+ed-testkey.pub
+**/ed-testkey
+**/ed-testkey.pub
