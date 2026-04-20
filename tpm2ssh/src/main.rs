@@ -250,8 +250,8 @@ fn setup(verbose: bool) -> Result<(), String> {
 
 fn setup_managed(paths: &Tpm2SshPaths) -> Result<(), String> {
     println!("Choose algorithm to provision:");
-    println!("1: NIST P-256 (nistp256r1, p256)");
-    println!("2: Ed25519 (ed25519)");
+    println!("1: NIST P-256 (nistp256r1, p256, OpenSSH ECDSA, good for SSH + Git signing)");
+    println!("2: Ed25519 (ed25519, OpenSSH Ed25519, good for SSH + Git signing)");
     let algorithm = LoginAlgorithm::from_choice(&prompt("Algorithm", "1"));
     let default_profile_name = algorithm.default_profile_name();
     let profile_name = prompt("Managed profile name", &default_profile_name);
@@ -301,6 +301,7 @@ fn setup_managed(paths: &Tpm2SshPaths) -> Result<(), String> {
     println!("Algorithm: {}", algorithm.profile_suffix());
     println!("Resolved mode: {:?}", profile.mode.resolved);
     println!("State dir: {}", config.state_dir.display());
+    println!("This profile can back an SSH/Git identity for the selected algorithm.");
     if !profile.mode.reasons.is_empty() {
         println!("Reasons:");
         for reason in &profile.mode.reasons {
@@ -482,8 +483,8 @@ fn login(verbose: bool) -> Result<(), String> {
     let username = prompt("Identity username", &whoami::username().unwrap());
 
     println!("Choose algorithm:");
-    println!("1: NIST P-256 (nistp256r1, p256, passkey)");
-    println!("2: Ed25519 (ed, ed25519)");
+    println!("1: NIST P-256 (nistp256r1, p256, OpenSSH ECDSA, SSH + Git signing)");
+    println!("2: Ed25519 (ed, ed25519, OpenSSH Ed25519, SSH + Git signing)");
     let algorithm = LoginAlgorithm::from_choice(&prompt("Algorithm", "1"));
 
     let show_priv = prompt("Show private key for backup? (y/n)", "n").to_lowercase() == "y";
@@ -821,6 +822,8 @@ fn main() {
         login(verbose)
     } else {
         println!("Usage: tpm2ssh [--setup | --login] [-v | --verbose]");
+        println!("  --setup  provision a TPM-backed SSH/Git identity (choose P-256 or Ed25519)");
+        println!("  --login  derive/load the chosen OpenSSH key into ssh-agent");
         Ok(())
     };
 

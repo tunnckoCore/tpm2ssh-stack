@@ -4,6 +4,8 @@
 
 `tpm2ssh` is a security-first utility that leverages your computer's **TPM 2.0 (Trusted Platform Module)** to manage SSH keys. Unlike traditional setups where private keys are stored on your SSD (even if encrypted), `tpm2ssh` ensures your private key **never touches the disk**.
 
+It supports **both OpenSSH NIST P-256 (`ecdsa-sha2-nistp256`) and OpenSSH Ed25519 identities** for SSH login and Git SSH signing.
+
 ## 🧠 Motivation
 
 The primary goal is to achieve a "Stateless Security" model for developer identities:
@@ -12,6 +14,20 @@ The primary goal is to achieve a "Stateless Security" model for developer identi
 2.  **Hardware Binding:** The root secret is "sealed" into the TPM, meaning it cannot be used on any other machine, even if your entire drive is cloned or stolen.
 3.  **Unified Identity:** One hardware-backed key for both SSH (GitHub/Server access) and Git Commit Signing.
 4.  **Zero-Prompt Workflow:** Seamless integration with standard OpenSSH agents, bypassing the clunky GPG/KWallet or keyrings.
+
+## Which algorithm should I pick?
+
+Both algorithms work for **SSH** and **Git SSH signing** here.
+
+- **NIST P-256**
+  - good if you want an OpenSSH ECDSA key
+  - a good default if you also care about the repo's clearest TPM-native signing story elsewhere
+  - public key files look like `id_<user>_nistp256_tpm2.pub`
+- **Ed25519**
+  - good if you prefer an OpenSSH Ed25519 key
+  - public key files look like `id_<user>_ed25519_tpm2.pub`
+
+So the real choice is **which SSH algorithm you want**, not whether SSH is “allowed” for only one of them.
 
 ## 🛠 How It Works (The Protocol)
 
@@ -30,11 +46,11 @@ The tool operates on a deterministic derivation pipeline:
     *   The seed is passed through **HKDF-SHA256** (HMAC-based Key Derivation Function) using a secure salt and info string.
     *   This results in a deterministic 256-bit scalar.
 4.  **Key Generation:**
-    *   The scalar is used as the private key for either an **ECDSA NIST P-256 (secp256r1)** or **Ed25519** curve.
+    *   The scalar is used as the private key for either an **OpenSSH ECDSA NIST P-256 (`ecdsa-sha2-nistp256`)** or **OpenSSH Ed25519** identity.
     *   The corresponding public key is calculated.
 5.  **Injection:**
     *   The tool formats the result as an OpenSSH Private Key and pipes it directly into the `ssh-agent` memory.
-    *   The public key is written to `~/.ssh/tpm2/id_{username}_{alg}_tpm2.pub` for Git compatibility.
+    *   The public key is written to `~/.ssh/tpm2ssh/id_{username}_{alg}_tpm2.pub` for SSH/Git compatibility.
 
 ## 📋 Requirements
 
@@ -55,20 +71,32 @@ tpm2ssh --setup
 ### Every Boot (Login)
 Run this to unlock your keys into memory. It will prompt you for:
 *   Identity username (defaults to your system user).
-*   Algorithm (NIST P-256 or Ed25519).
+*   Algorithm (**NIST P-256/OpenSSH ECDSA** or **Ed25519/OpenSSH Ed25519**).
 *   Whether to display the private key for backup.
 *   Your TPM PIN.
+
+Either algorithm can then be used for normal SSH auth and for Git SSH signing.
 
 ```bash
 tpm2ssh --login
 ```
 
 ### Git Integration
-Configure Git to use your new hardware key for signing:
+Configure Git to use the public key file written during `--login` for signing.
+
+For example, if you picked P-256:
 
 ```bash
 git config --global gpg.format ssh
-git config --global user.signingkey "~/.ssh/tpm2/id_{username}_{algo}_tpm2.pub"
+git config --global user.signingkey "~/.ssh/tpm2ssh/id_${USER}_nistp256_tpm2.pub"
+git config --global commit.gpgsign true
+```
+
+Or if you picked Ed25519:
+
+```bash
+git config --global gpg.format ssh
+git config --global user.signingkey "~/.ssh/tpm2ssh/id_${USER}_ed25519_tpm2.pub"
 git config --global commit.gpgsign true
 ```
 
@@ -100,7 +128,7 @@ As long as the TPM hasn't been cleared, your seed is still safe in its hardware 
 
 #### The "TPM handle" is just an "Address"
 
-A TPM handle is like a filename or a memory address. Knowing that your seed is at `0x81006969` is exactly the same as an attacker knowing your private key is at `~/.ssh/id_ed25519`. They can see the file exists, but they cannot read its contents.
+A TPM handle is like a filename or a memory address. Knowing that your seed is at `0x81006969` is exactly the same as an attacker knowing your private key is at `~/.ssh/id_ed25519` or `~/.ssh/id_ecdsa`. They can see the file exists, but they cannot read its contents.
 
 #### Why Root/Sudo Access isn't enough
 

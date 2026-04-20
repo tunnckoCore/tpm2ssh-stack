@@ -7,8 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "tpm2-derive",
     version,
     about = "TPM-backed key operations with native, PRF, and seed modes",
-    long_about = "TPM-backed key operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'setup' to provision persistent state, and the operational subcommands ('derive', 'sign', 'verify', 'export', 'ssh agent add') to use an existing profile.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive setup --profile prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive derive --profile app-prf --purpose session --namespace com.example\n  tpm2-derive export --profile prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --profile seed-user --kind recovery-bundle --output backup.json --reason 'hardware migration' --confirm-recovery-export --confirm-sealed-at-rest-boundary --confirmation-phrase 'I understand this export weakens TPM-only protection'"
+    long_about = "TPM-backed key operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'setup' to provision persistent state, and the operational subcommands ('derive', 'sign', 'verify', 'export', 'ssh agent add') to use an existing profile.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh agent add' path currently supports seed Ed25519 and seed P-256 profiles, while higher-level wrappers such as 'tpm2ssh' can provide broader user-facing SSH/Git flows.",
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive setup --profile prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive sign --profile prod-signer --input message.bin\n  tpm2-derive derive --profile app-prf --purpose session --namespace com.example\n  tpm2-derive ssh agent add --profile seed-user\n  tpm2-derive export --profile prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --profile seed-user --kind recovery-bundle --output backup.json --reason 'hardware migration' --confirm-recovery-export --confirm-sealed-at-rest-boundary --confirmation-phrase 'I understand this export weakens TPM-only protection'\n\nSSH quick guide:\n  - Want a direct tpm2-derive ssh-agent flow today? Use a seed/ed25519 or seed/p256 profile.\n  - Want a TPM-native signer? Use p256 + native for sign/verify.\n  - Want a broader OpenSSH user-key flow? The tpm2ssh wrapper is still the higher-level path."
 )]
 pub struct Cli {
     #[arg(
@@ -29,9 +29,9 @@ pub enum Command {
     Setup(SetupArgs),
     /// Derive deterministic bytes from a persisted PRF or seed profile.
     Derive(DeriveArgs),
-    /// Sign input with a persisted profile.
+    /// Sign input with a persisted profile; native P-256 is the main wired signing path today.
     Sign(SignArgs),
-    /// Verify a signature against a persisted profile.
+    /// Verify a signature against a persisted profile; native P-256 is the main wired verify path today.
     Verify(VerifyArgs),
     /// Reserved placeholder for future encryption support.
     Encrypt(EncryptArgs),
@@ -56,7 +56,7 @@ pub enum SshCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SshAgentCommand {
-    /// Add a derived private key to ssh-agent.
+    /// Add a derived private key to ssh-agent; this direct CLI path currently supports seed ed25519 and seed p256 profiles.
     Add(SshAgentAddArgs),
 }
 
@@ -245,7 +245,9 @@ pub struct ExportArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Add a derived private key to ssh-agent")]
+#[command(
+    about = "Add a derived private key to ssh-agent (currently the direct seed ed25519 / seed p256 slice in this CLI)"
+)]
 pub struct SshAgentAddArgs {
     #[arg(long, help = "Existing profile name to derive from")]
     pub profile: String,
@@ -281,9 +283,9 @@ pub enum UseArg {
     Verify,
     /// Allow deterministic derivation operations.
     Derive,
-    /// Intended for SSH key usage.
+    /// Intended for SSH/OpenSSH identity usage; this can mean Ed25519 or P-256 depending on the consuming flow.
     Ssh,
-    /// Intended for ssh-agent loading.
+    /// Intended for ssh-agent loading; direct tpm2-derive support is currently narrow even though downstream wrappers may support more.
     SshAgent,
     /// Intended for Ethereum/secp256k1-style usage.
     Ethereum,
