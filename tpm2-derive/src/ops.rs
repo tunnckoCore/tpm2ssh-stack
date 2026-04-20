@@ -1,3 +1,8 @@
+//! High-level operations root for `tpm2-derive`.
+//!
+//! This file is the `crate::ops` module root and intentionally coexists with
+//! the `src/ops/` directory, which contains its submodules.
+
 pub mod derive;
 pub mod native;
 pub mod prf;
@@ -17,8 +22,8 @@ use crate::model::{
     StateLayout, UseCase,
 };
 use crate::ops::native::subprocess::{
-    plan_export_public_key, plan_setup, NativeCommandSpec, NativeKeyLocator,
-    NativePersistentHandle, NativePublicKeyExportOptions, NativeSetupArtifacts,
+    NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
+    NativeSetupArtifacts, plan_export_public_key, plan_setup,
 };
 use crate::ops::native::{
     NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativeKeyRef, NativeKeyUse,
@@ -34,10 +39,10 @@ use crate::ops::seed::{
     MIN_SEED_BYTES, SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY, SEED_DERIVATION_KDF_METADATA_KEY,
     SEED_OBJECT_LABEL_METADATA_KEY, SEED_PRIVATE_BLOB_PATH_METADATA_KEY,
     SEED_PUBLIC_BLOB_PATH_METADATA_KEY, SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY,
-    SEED_STORAGE_KIND_METADATA_KEY, SeedBackend, SeedCreateRequest, SeedCreateSource, SeedExportDestination,
-    SeedExportFormat, SeedExportRequest, SeedOpenAuthSource, SeedProfile, SeedRecoveryBundleV1,
-    SeedStorageKind, SubprocessSeedBackend, export_recovery_bundle as export_seed_recovery_bundle,
-    seed_profile_from_profile,
+    SEED_STORAGE_KIND_METADATA_KEY, SeedBackend, SeedCreateRequest, SeedCreateSource,
+    SeedExportDestination, SeedExportFormat, SeedExportRequest, SeedOpenAuthSource, SeedProfile,
+    SeedRecoveryBundleV1, SeedStorageKind, SubprocessSeedBackend,
+    export_recovery_bundle as export_seed_recovery_bundle, seed_profile_from_profile,
 };
 
 const DEFAULT_SETUP_SEED_BYTES: usize = MIN_SEED_BYTES;
@@ -261,10 +266,8 @@ fn materialize_prf_setup<R>(profile: &mut Profile, runner: &R) -> Result<PrfRoot
 where
     R: CommandRunner,
 {
-    let backend = SubprocessPrfBackend::with_runner(
-        profile.storage.state_layout.objects_dir.clone(),
-        runner,
-    );
+    let backend =
+        SubprocessPrfBackend::with_runner(profile.storage.state_layout.objects_dir.clone(), runner);
     let layout = backend.provision_root(&profile.name)?;
     apply_prf_root_metadata(profile, &layout)?;
     Ok(layout)
@@ -1035,12 +1038,14 @@ mod tests {
             result.profile.metadata.get("native.persistent_handle"),
             Some(&"0x81010002".to_string())
         );
-        assert!(!root_dir
-            .join("objects")
-            .join("prod-signer")
-            .join("native")
-            .join("setup-work")
-            .exists());
+        assert!(
+            !root_dir
+                .join("objects")
+                .join("prod-signer")
+                .join("native")
+                .join("setup-work")
+                .exists()
+        );
 
         let loaded = load_profile("prod-signer", Some(root_dir.clone())).expect("profile loads");
         assert_eq!(loaded, result.profile);
@@ -1138,6 +1143,97 @@ mod tests {
         );
 
         fs::remove_dir_all(root_dir).expect("temporary prf setup state should be removed");
+    }
+
+    #[test]
+    fn setup_seed_persists_relative_metadata_and_records_backend_request() {
+        let root_dir = unique_temp_path("setup-seed-provision");
+        let request = SetupRequest {
+            profile: "seed-default".to_string(),
+            algorithm: Algorithm::Ed25519,
+            uses: vec![UseCase::Derive, UseCase::SshAgent],
+            requested_mode: ModePreference::Seed,
+            state_dir: Some(root_dir.clone()),
+            dry_run: false,
+        };
+        let probe = StaticCapabilityProbe::seed();
+        let backend = RecordingSeedSetupBackend::new(root_dir.join("objects"));
+
+        let result = resolve_profile_with_seed_backend(&probe, &request, &backend)
+            .expect("seed setup should succeed");
+        let object_dir = root_dir.join("objects").join("seed-default");
+
+        assert!(result.persisted);
+        assert!(object_dir.join("sealed.pub").is_file());
+        assert!(object_dir.join("sealed.priv").is_file());
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_OBJECT_LABEL_METADATA_KEY)
+                .map(String::as_str),
+            Some("seed-default")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_PUBLIC_BLOB_PATH_METADATA_KEY)
+                .map(String::as_str),
+            Some("objects/seed-default/sealed.pub")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_PRIVATE_BLOB_PATH_METADATA_KEY)
+                .map(String::as_str),
+            Some("objects/seed-default/sealed.priv")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_STORAGE_KIND_METADATA_KEY)
+                .map(String::as_str),
+            Some("tpm-sealed")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_DERIVATION_KDF_METADATA_KEY)
+                .map(String::as_str),
+            Some("hkdf-sha256-v1")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY)
+                .map(String::as_str),
+            Some("tpm2-derive.seed.software-derived")
+        );
+        assert_eq!(
+            result
+                .profile
+                .metadata
+                .get(SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let loaded = load_profile("seed-default", Some(root_dir.clone())).expect("profile loads");
+        assert_eq!(loaded.metadata, result.profile.metadata);
+        assert_eq!(
+            backend.calls(),
+            vec![SeedSealCall {
+                object_label: "seed-default".to_string(),
+                bytes: DEFAULT_SETUP_SEED_BYTES,
+            }]
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary seed setup state should be removed");
     }
 
     #[test]
@@ -1311,6 +1407,26 @@ mod tests {
                 },
             }
         }
+
+        fn seed() -> Self {
+            Self {
+                report: CapabilityReport {
+                    tpm: TpmStatus {
+                        present: Some(true),
+                        accessible: Some(true),
+                    },
+                    native: NativeCapabilitySummary {
+                        supported_algorithms: Vec::new(),
+                        supported_uses: Vec::new(),
+                    },
+                    prf_available: Some(false),
+                    seed_available: Some(true),
+                    recommended_mode: Some(Mode::Seed),
+                    recommendation_reasons: vec!["fake sealed-seed support".to_string()],
+                    diagnostics: vec![Diagnostic::info("fake-probe", "seed mode is supported")],
+                },
+            }
+        }
     }
 
     impl CapabilityProbe for StaticCapabilityProbe {
@@ -1368,6 +1484,76 @@ mod tests {
                 stderr: String::new(),
                 error: None,
             }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SeedSealCall {
+        object_label: String,
+        bytes: usize,
+    }
+
+    #[derive(Clone)]
+    struct RecordingSeedSetupBackend {
+        objects_dir: PathBuf,
+        calls: Arc<Mutex<Vec<SeedSealCall>>>,
+    }
+
+    impl RecordingSeedSetupBackend {
+        fn new(objects_dir: PathBuf) -> Self {
+            Self {
+                objects_dir,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn calls(&self) -> Vec<SeedSealCall> {
+            self.calls.lock().expect("seed setup calls").clone()
+        }
+    }
+
+    impl SeedBackend for RecordingSeedSetupBackend {
+        fn seal_seed(&self, request: &SeedCreateRequest) -> Result<()> {
+            let bytes = match request.source {
+                SeedCreateSource::GenerateRandom { bytes } => bytes,
+                SeedCreateSource::Import { .. } => {
+                    return Err(Error::Validation(
+                        "seed setup test backend only supports generated seed material".to_string(),
+                    ));
+                }
+            };
+
+            self.calls
+                .lock()
+                .expect("seed setup calls")
+                .push(SeedSealCall {
+                    object_label: request.profile.storage.object_label.clone(),
+                    bytes,
+                });
+
+            let object_dir = self.objects_dir.join(&request.profile.storage.object_label);
+            fs::create_dir_all(&object_dir).map_err(|error| {
+                Error::State(format!(
+                    "failed to create fake seed object directory '{}': {error}",
+                    object_dir.display()
+                ))
+            })?;
+            fs::write(object_dir.join("sealed.pub"), b"seed-public").map_err(|error| {
+                Error::State(format!("failed to write fake seed public blob: {error}"))
+            })?;
+            fs::write(object_dir.join("sealed.priv"), b"seed-private").map_err(|error| {
+                Error::State(format!("failed to write fake seed private blob: {error}"))
+            })?;
+
+            Ok(())
+        }
+
+        fn unseal_seed(
+            &self,
+            _profile: &SeedProfile,
+            _auth_source: &SeedOpenAuthSource,
+        ) -> Result<crate::ops::seed::SeedMaterial> {
+            unreachable!("seed setup tests do not unseal material")
         }
     }
 
