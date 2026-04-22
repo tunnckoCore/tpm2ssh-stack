@@ -665,7 +665,7 @@ fn persist_formatted_signature(
                     }),
             }
         }
-        Format::Pem | Format::Openssh | Format::EthereumAddress => Err(Error::Validation(
+        Format::Pem | Format::Openssh | Format::Eth => Err(Error::Validation(
             "sign formats are: der, hex, base64".to_string(),
         )),
     };
@@ -699,7 +699,7 @@ fn validate_sign_output_format(
             }
             Ok(())
         }
-        Format::Pem | Format::Openssh | Format::EthereumAddress => Err(Error::Validation(
+        Format::Pem | Format::Openssh | Format::Eth => Err(Error::Validation(
             "sign formats are: der, hex, base64".to_string(),
         )),
     }

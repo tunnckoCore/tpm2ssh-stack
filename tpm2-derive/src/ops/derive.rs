@@ -4,8 +4,9 @@ use secrecy::ExposeSecret;
 
 use crate::backend::CommandRunner;
 use crate::error::{Error, Result};
-use crate::model::{DeriveRequest, DeriveResult, Identity, Mode};
+use crate::model::{DeriveRequest, DeriveResult, Format, Identity, Mode};
 
+use super::keygen::{derive_identity_key_material, public_key_spki_der_from_material};
 use super::seed::{
     HkdfSha256SeedDeriver, SEED_PRIVATE_BLOB_PATH_METADATA_KEY, SEED_PUBLIC_BLOB_PATH_METADATA_KEY,
     SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest, SeedSoftwareDeriver,
@@ -51,17 +52,56 @@ where
     }
 
     crate::model::UseCase::validate_for_mode(&identity.uses, identity.mode.resolved)?;
+    super::shared::ensure_derivation_overrides_allowed(identity, &request.derivation)?;
 
-    let effective = resolve_effective_derivation_inputs(identity, &request.derivation)?;
-    let spec = derive_command_spec(&effective, request.length)?;
+    match request.format {
+        Format::Hex | Format::Base64 => {
+            let effective = resolve_effective_derivation_inputs(identity, &request.derivation)?;
+            let spec = derive_command_spec(&effective, request.length)?;
 
-    match identity.mode.resolved {
-        Mode::Native => Err(Error::Unsupported(format!(
-            "identity '{}' resolved to native mode; derive is currently wired only for PRF and seed identities",
-            identity.name
-        ))),
-        Mode::Prf => execute_prf(identity, request, spec, prf_runner),
-        Mode::Seed => execute_seed(identity, request, spec, seed_backend, seed_deriver),
+            match identity.mode.resolved {
+                Mode::Native => Err(Error::Unsupported(format!(
+                    "identity '{}' resolved to native mode; derive is currently wired only for PRF and seed identities",
+                    identity.name
+                ))),
+                Mode::Prf => execute_prf(identity, request, spec, prf_runner),
+                Mode::Seed => execute_seed(identity, request, spec, seed_backend, seed_deriver),
+            }
+        }
+        Format::Der | Format::Pem | Format::Openssh => {
+            if request.length != 32 {
+                return Err(Error::Validation(
+                    "derive --format der|pem|openssh derives the effective child public key and requires --length 32"
+                        .to_string(),
+                ));
+            }
+
+            match identity.mode.resolved {
+                Mode::Native => Err(Error::Unsupported(format!(
+                    "identity '{}' resolved to native mode; derive is currently wired only for PRF and seed identities",
+                    identity.name
+                ))),
+                Mode::Prf | Mode::Seed => {
+                    let material = derive_identity_key_material(
+                        identity,
+                        &request.derivation,
+                        prf_runner,
+                        seed_backend,
+                        seed_deriver,
+                    )?;
+                    build_public_key_result(
+                        identity,
+                        identity.mode.resolved,
+                        request.format,
+                        request.output.as_deref(),
+                        &material,
+                    )
+                }
+            }
+        }
+        Format::Eth => Err(Error::Validation(
+            "derive formats are: der, pem, openssh, hex, base64".to_string(),
+        )),
     }
 }
 
@@ -134,7 +174,7 @@ fn build_result(
         crate::model::Format::Hex | crate::model::Format::Base64
     ) {
         return Err(Error::Validation(
-            "derive formats are: hex, base64".to_string(),
+            "derive formats are: der, pem, openssh, hex, base64".to_string(),
         ));
     }
 
@@ -168,6 +208,75 @@ fn build_result(
             })?),
         }),
     }
+}
+
+fn build_public_key_result(
+    identity: &Identity,
+    mode: Mode,
+    format: crate::model::Format,
+    output: Option<&Path>,
+    material: &[u8],
+) -> Result<DeriveResult> {
+    let spki_der = public_key_spki_der_from_material(identity, material)?;
+    let rendered = match format {
+        Format::Der => spki_der,
+        Format::Pem => pem_wrap_public_key(&spki_der).into_bytes(),
+        Format::Openssh => {
+            crate::ops::ssh::openssh_public_key_from_material(identity, material)?.into_bytes()
+        }
+        Format::Hex | Format::Base64 | Format::Eth => {
+            return Err(Error::Validation(
+                "derive formats are: der, pem, openssh, hex, base64".to_string(),
+            ));
+        }
+    };
+
+    match output {
+        Some(path) => {
+            write_output_file(path, &rendered)?;
+            Ok(DeriveResult {
+                identity: identity.name.clone(),
+                mode,
+                length: 32,
+                format,
+                output_path: Some(path.to_path_buf()),
+                bytes_written: rendered.len(),
+                material: None,
+            })
+        }
+        None => match format {
+            Format::Der => Err(Error::Validation(
+                "derive --format der requires --output because DER public-key output is binary"
+                    .to_string(),
+            )),
+            Format::Pem | Format::Openssh => Ok(DeriveResult {
+                identity: identity.name.clone(),
+                mode,
+                length: 32,
+                format,
+                output_path: None,
+                bytes_written: rendered.len(),
+                material: Some(String::from_utf8(rendered).map_err(|error| {
+                    Error::State(format!(
+                        "derived output for identity '{}' could not be rendered as text: {error}",
+                        identity.name
+                    ))
+                })?),
+            }),
+            Format::Hex | Format::Base64 | Format::Eth => unreachable!("validated derive format"),
+        },
+    }
+}
+
+fn pem_wrap_public_key(spki_der: &[u8]) -> String {
+    let body = crate::ops::shared::base64_encode(spki_der);
+    let mut output = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for chunk in body.as_bytes().chunks(64) {
+        output.push_str(std::str::from_utf8(chunk).expect("base64 output is ASCII"));
+        output.push('\n');
+    }
+    output.push_str("-----END PUBLIC KEY-----\n");
+    output
 }
 
 fn ensure_seed_material_exists(identity: &Identity) -> Result<()> {
@@ -277,6 +386,68 @@ mod tests {
             format!("objects/{}/prf-root.ctx", identity.name),
         );
         identity
+    }
+
+    #[test]
+    fn derive_pem_returns_public_key_for_effective_child_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let identity = prf_identity(temp.path());
+        let runner = RecordingPrfRunner::new(b"tpm-prf-material");
+        let request = DeriveRequest {
+            identity: identity.name.clone(),
+            derivation: DerivationOverrides::default(),
+            length: 32,
+            format: Format::Pem,
+            output: None,
+        };
+
+        let result = execute_with_runner(
+            &identity,
+            &request,
+            &runner,
+            &crate::ops::seed::SubprocessSeedBackend::new(
+                identity.storage.state_layout.objects_dir.clone(),
+            ),
+            &crate::ops::seed::HkdfSha256SeedDeriver,
+        )
+        .expect("derive pem executes");
+
+        assert_eq!(result.mode, Mode::Prf);
+        assert!(
+            result
+                .material
+                .expect("inline pem")
+                .contains("BEGIN PUBLIC KEY")
+        );
+    }
+
+    #[test]
+    fn derive_der_requires_output_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let identity = prf_identity(temp.path());
+        let runner = RecordingPrfRunner::new(b"tpm-prf-material");
+        let request = DeriveRequest {
+            identity: identity.name.clone(),
+            derivation: DerivationOverrides::default(),
+            length: 32,
+            format: Format::Der,
+            output: None,
+        };
+
+        let error = execute_with_runner(
+            &identity,
+            &request,
+            &runner,
+            &crate::ops::seed::SubprocessSeedBackend::new(
+                identity.storage.state_layout.objects_dir.clone(),
+            ),
+            &crate::ops::seed::HkdfSha256SeedDeriver,
+        )
+        .expect_err("derive der without output should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("requires --output"))
+        );
     }
 
     #[test]

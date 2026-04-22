@@ -88,6 +88,9 @@ impl From<ExportKindArg> for ExportKind {
 impl From<DeriveFormatArg> for Format {
     fn from(value: DeriveFormatArg) -> Self {
         match value {
+            DeriveFormatArg::Der => Self::Der,
+            DeriveFormatArg::Pem => Self::Pem,
+            DeriveFormatArg::Openssh => Self::Openssh,
             DeriveFormatArg::Hex => Self::Hex,
             DeriveFormatArg::Base64 => Self::Base64,
         }
@@ -121,7 +124,7 @@ impl From<ExportFormatArg> for Format {
             ExportFormatArg::Der => Self::Der,
             ExportFormatArg::Pem => Self::Pem,
             ExportFormatArg::Openssh => Self::Openssh,
-            ExportFormatArg::EthereumAddress => Self::EthereumAddress,
+            ExportFormatArg::Eth => Self::Eth,
             ExportFormatArg::Hex => Self::Hex,
             ExportFormatArg::Base64 => Self::Base64,
         }

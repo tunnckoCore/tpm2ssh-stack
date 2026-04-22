@@ -287,7 +287,7 @@ pub(crate) fn encode_textual_output_bytes(format: Format, bytes: &[u8]) -> Resul
         Format::Hex => Ok(hex_encode(bytes).into_bytes()),
         Format::Base64 => Ok(base64_encode(bytes).into_bytes()),
         Format::Der => Ok(bytes.to_vec()),
-        Format::Pem | Format::Openssh | Format::EthereumAddress => Err(Error::Validation(format!(
+        Format::Pem | Format::Openssh | Format::Eth => Err(Error::Validation(format!(
             "format '{format:?}' is not valid for this output"
         ))),
     }
@@ -312,9 +312,9 @@ pub(crate) fn decode_input_bytes(
             }
             Ok((bytes.to_vec(), InputFormat::Raw))
         }
-        InputFormat::Pem | InputFormat::Openssh | InputFormat::EthereumAddress => Err(
-            Error::Validation(format!("format '{format:?}' is not valid for {label}")),
-        ),
+        InputFormat::Pem | InputFormat::Openssh | InputFormat::Eth => Err(Error::Validation(
+            format!("format '{format:?}' is not valid for {label}"),
+        )),
     }
 }
 
@@ -323,7 +323,7 @@ pub(crate) fn output_format_extension(format: Format) -> &'static str {
         Format::Der => "der",
         Format::Pem => "pem",
         Format::Openssh => "openssh",
-        Format::EthereumAddress => "ethaddr",
+        Format::Eth => "eth",
         Format::Hex => "hex",
         Format::Base64 => "base64",
     }

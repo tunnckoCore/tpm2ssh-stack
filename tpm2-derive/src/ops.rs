@@ -632,9 +632,7 @@ fn render_secret_key_export(
             shared::base64_encode(secret_key_bytes).into_bytes(),
             ExportFormat::Base64,
         )),
-        Format::EthereumAddress => Err(Error::Validation(
-            "secret-key export formats are: der, pem, openssh, hex, base64".to_string(),
-        )),
+        Format::Eth => Ok((hex_encode(secret_key_bytes).into_bytes(), ExportFormat::Hex)),
     }
 }
 
@@ -708,21 +706,37 @@ fn render_keypair_json(
                 "value": shared::base64_encode(&raw_public),
             }),
         ),
-        Format::EthereumAddress => {
-            return Err(Error::Validation(
-                "keypair export formats are: der, pem, openssh, hex, base64; output remains JSON and the format applies to both embedded key values"
-                    .to_string(),
-            ));
+        Format::Eth => {
+            ensure_ethereum_address_algorithm(identity)?;
+            (
+                serde_json::json!({
+                    "format": "hex",
+                    "value": hex_encode(&secret_key_bytes),
+                }),
+                serde_json::json!({
+                    "format": "hex",
+                    "value": hex_encode(&raw_public),
+                }),
+            )
         }
     };
 
-    Ok(serde_json::json!({
+    let mut payload = serde_json::json!({
         "identity": identity.name.clone(),
         "mode": identity.mode.resolved,
         "algorithm": identity.algorithm,
         "private_key": private_key,
         "public_key": public_key,
-    }))
+    });
+
+    if format == Format::Eth {
+        payload["address"] = serde_json::json!({
+            "format": "eth",
+            "value": ethereum_address_from_raw_public_bytes(&raw_public)?,
+        });
+    }
+
+    Ok(payload)
 }
 
 fn export_format_name(format: ExportFormat) -> &'static str {
@@ -734,7 +748,7 @@ fn export_format_name(format: ExportFormat) -> &'static str {
         ExportFormat::Pkcs8Der => "pkcs8-der",
         ExportFormat::Pkcs8Pem => "pkcs8-pem",
         ExportFormat::Openssh => "openssh",
-        ExportFormat::EthereumAddress => "ethereum-address",
+        ExportFormat::Eth => "eth",
         ExportFormat::Hex => "hex",
         ExportFormat::Base64 => "base64",
         ExportFormat::Json => "json",
@@ -1438,21 +1452,24 @@ fn resolve_public_key_export_format(format: Option<Format>) -> Result<Format> {
 fn resolve_secret_key_export_format(format: Option<Format>) -> Result<Format> {
     let format = format.unwrap_or(Format::Pem);
     match format {
-        Format::Der | Format::Pem | Format::Openssh | Format::Hex | Format::Base64 => Ok(format),
-        Format::EthereumAddress => Err(Error::Validation(
-            "secret-key export formats are: der, pem, openssh, hex, base64".to_string(),
-        )),
+        Format::Der
+        | Format::Pem
+        | Format::Openssh
+        | Format::Eth
+        | Format::Hex
+        | Format::Base64 => Ok(format),
     }
 }
 
 fn resolve_keypair_export_format(format: Option<Format>) -> Result<Format> {
     let format = format.unwrap_or(Format::Pem);
     match format {
-        Format::Der | Format::Pem | Format::Openssh | Format::Hex | Format::Base64 => Ok(format),
-        Format::EthereumAddress => Err(Error::Validation(
-            "keypair export formats are: der, pem, openssh, hex, base64; output remains JSON and the format applies to both embedded key values"
-                .to_string(),
-        )),
+        Format::Der
+        | Format::Pem
+        | Format::Openssh
+        | Format::Eth
+        | Format::Hex
+        | Format::Base64 => Ok(format),
     }
 }
 
@@ -1494,12 +1511,12 @@ fn render_public_key_export_from_spki(
             render_openssh_public_key(identity, spki_der)?.into_bytes(),
             ExportFormat::Openssh,
         )),
-        Format::EthereumAddress => {
+        Format::Eth => {
             ensure_ethereum_address_algorithm(identity)?;
             let raw_public = raw_public_key_bytes_from_spki(identity, spki_der)?;
             Ok((
                 ethereum_address_from_raw_public_bytes(&raw_public)?.into_bytes(),
-                ExportFormat::EthereumAddress,
+                ExportFormat::Eth,
             ))
         }
         Format::Hex => {
@@ -1532,12 +1549,12 @@ fn render_derived_public_key_export(
             crate::ops::ssh::openssh_public_key_from_material(identity, material)?.into_bytes(),
             ExportFormat::Openssh,
         )),
-        Format::EthereumAddress => {
+        Format::Eth => {
             ensure_ethereum_address_algorithm(identity)?;
             let raw_public = raw_public_key_bytes_from_material(identity, material)?;
             Ok((
                 ethereum_address_from_raw_public_bytes(&raw_public)?.into_bytes(),
-                ExportFormat::EthereumAddress,
+                ExportFormat::Eth,
             ))
         }
         Format::Hex => {
@@ -1605,7 +1622,7 @@ fn raw_public_key_bytes_from_material(identity: &Identity, material: &[u8]) -> R
 fn ensure_ethereum_address_algorithm(identity: &Identity) -> Result<()> {
     if identity.algorithm != Algorithm::Secp256k1 {
         return Err(Error::Validation(
-            "ethereum-address export is supported only for secp256k1 identities".to_string(),
+            "eth export is supported only for secp256k1 identities".to_string(),
         ));
     }
 
@@ -1615,7 +1632,7 @@ fn ensure_ethereum_address_algorithm(identity: &Identity) -> Result<()> {
 fn ethereum_address_from_raw_public_bytes(raw_public_key: &[u8]) -> Result<String> {
     if raw_public_key.len() != 65 || raw_public_key.first().copied() != Some(0x04) {
         return Err(Error::Validation(
-            "ethereum-address export requires an uncompressed 65-byte SEC1 public key".to_string(),
+            "eth export requires an uncompressed 65-byte SEC1 public key".to_string(),
         ));
     }
 
@@ -1710,7 +1727,7 @@ fn public_key_export_default_suffix(format: Format) -> &'static str {
         Format::Der => "public-key.der",
         Format::Pem => "public-key.pem",
         Format::Openssh => "public-key.openssh.pub",
-        Format::EthereumAddress => "public-key.eth-address.txt",
+        Format::Eth => "public-key.eth",
         Format::Hex => "public-key.hex",
         Format::Base64 => "public-key.base64",
     }
@@ -1723,7 +1740,7 @@ fn secret_key_export_default_suffix(format: Format) -> &'static str {
         Format::Openssh => "secret-key.openssh",
         Format::Hex => "secret-key.hex",
         Format::Base64 => "secret-key.base64",
-        Format::EthereumAddress => unreachable!("validated secret-key export suffix format"),
+        Format::Eth => "secret-key.hex",
     }
 }
 
@@ -2408,7 +2425,7 @@ mod tests {
 
     #[test]
     fn export_writes_seed_secp256k1_ethereum_address() {
-        let root_dir = unique_temp_path("export-seed-secp256k1-ethereum-address");
+        let root_dir = unique_temp_path("export-seed-secp256k1-eth");
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
@@ -2429,7 +2446,7 @@ mod tests {
         let result = export_seed_public_key_with_backend(
             &identity,
             Some(output_path.as_path()),
-            Format::EthereumAddress,
+            Format::Eth,
             &FakeSeedExportBackend::new(seed.clone()),
             &HkdfSha256SeedDeriver,
         )
@@ -2441,7 +2458,7 @@ mod tests {
             Algorithm::Secp256k1,
         );
 
-        assert_eq!(result.artifact.format, ExportFormat::EthereumAddress);
+        assert_eq!(result.artifact.format, ExportFormat::Eth);
         assert_eq!(
             fs::read_to_string(&result.artifact.path).expect("ethereum address output"),
             expected
@@ -2452,7 +2469,7 @@ mod tests {
 
     #[test]
     fn export_rejects_p256_ethereum_address() {
-        let root_dir = unique_temp_path("export-seed-p256-ethereum-address-rejected");
+        let root_dir = unique_temp_path("export-seed-p256-eth-rejected");
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
@@ -2471,7 +2488,7 @@ mod tests {
         let error = export_seed_public_key_with_backend(
             &identity,
             Some(root_dir.join("exports").join("seed-p256.eth.txt").as_path()),
-            Format::EthereumAddress,
+            Format::Eth,
             &FakeSeedExportBackend::new(vec![0x33; 32]),
             &HkdfSha256SeedDeriver,
         )
@@ -2861,6 +2878,98 @@ mod tests {
         )
         .expect("parse seed keypair json");
         assert_eq!(payload["identity"], identity.name);
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn export_seed_eth_formats_behave_as_requested() {
+        let root_dir = unique_temp_path("export-seed-eth-formats");
+        let identity = persisted_seed_export_identity(
+            &root_dir,
+            Algorithm::Secp256k1,
+            vec![UseCase::Sign, UseCase::ExportSecret],
+        );
+        let backend = FakeSeedExportBackend::new(vec![0x66; 32]);
+
+        let secret_eth = export_secret_key_with_dependencies(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: Some(root_dir.join("exports").join("secret.eth.txt")),
+                format: Some(Format::Eth),
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: true,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secret-key eth export");
+        let secret_hex = export_secret_key_with_dependencies(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: Some(root_dir.join("exports").join("secret.hex")),
+                format: Some(Format::Hex),
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: true,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secret-key hex export");
+        assert_eq!(secret_eth.artifact.format, ExportFormat::Hex);
+        assert_eq!(
+            fs::read_to_string(&secret_eth.artifact.path).expect("eth secret output"),
+            fs::read_to_string(&secret_hex.artifact.path).expect("hex secret output")
+        );
+
+        let keypair_result = export_keypair_with_dependencies(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::Keypair,
+                output: Some(root_dir.join("exports").join("keypair.eth.json")),
+                format: Some(Format::Eth),
+                state_dir: Some(root_dir.clone()),
+                reason: Some("migration".to_string()),
+                confirm: true,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed keypair eth export");
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&keypair_result.artifact.path).expect("eth keypair output"),
+        )
+        .expect("parse eth keypair json");
+        assert_eq!(payload["private_key"]["format"], "hex");
+        assert_eq!(payload["public_key"]["format"], "hex");
+        assert_eq!(payload["address"]["format"], "eth");
+
+        let effective = crate::ops::shared::resolve_effective_derivation_inputs(
+            &identity,
+            &DerivationOverrides::default(),
+        )
+        .expect("effective derivation inputs");
+        let expected_address = expected_ethereum_address(
+            &[0x66; 32],
+            crate::ops::shared::identity_key_spec(identity.algorithm, &effective)
+                .expect("identity key spec"),
+            Algorithm::Secp256k1,
+        );
+        assert_eq!(payload["address"]["value"], expected_address);
 
         fs::remove_dir_all(root_dir).expect("cleanup");
     }
@@ -3377,7 +3486,7 @@ mod tests {
             .expect("expected 32-byte derived key material");
 
         let raw_public = match algorithm {
-            Algorithm::Ed25519 => panic!("ethereum-address does not apply to ed25519"),
+            Algorithm::Ed25519 => panic!("eth does not apply to ed25519"),
             Algorithm::Secp256k1 => k256::SecretKey::from_slice(&secret_bytes)
                 .expect("valid secp256k1 scalar")
                 .public_key()

@@ -228,7 +228,13 @@ tpm2x export --kind keypair --confirm --reason "hardware migration" --output acm
 tpm2x export --kind secret-key --confirm --reason "hardware migration" --format hex --output acme-secret.key
 
 # prints to stdout
-tpm2x export --kind public-key --format <spki-pem/ssh/der...>
+tpm2x export --kind public-key --format <pem/openssh/der/eth/hex/base64>
+
+# secp256k1-only ethereum address surface
+
+tpm2x export --kind public-key --format eth
+
+tpm2x export --kind keypair --format eth --confirm --reason "wallet migration" --output acme-wallet.json
 ```
 
 In short: `--kind keypair` and `--kind secret-key` require `export-secret` use bit on the identity to be enabled. The `--kind public-key` is perfectly valid even without the `export-secret` use bit.
@@ -416,12 +422,14 @@ That means:
 
 - no extra HKDF layer beyond the mode’s normal derivation flow
 - no double expansion
-- the bytes returned by `derive` are the direct surfaced output of the effective PRF/seed derivation path
+- `derive --format hex|base64` returns the direct surfaced derived bytes from the effective PRF/seed derivation path
+- `derive --format der|pem|openssh` derives the effective child asymmetric identity key and renders its public key
 
 More specifically:
 
 - for `prf`, the command must return the single derived output of the PRF pipeline for the effective derivation inputs/spec
 - for `seed`, the command must return the single derived output of the seed HKDF pipeline for the effective derivation inputs/spec
+- the public-key rendering forms are only valid when the selected algorithm/container pairing is actually supported (`openssh` remains limited to the currently supported SSH key shapes)
 
 `derive` is therefore the third-party integration escape hatch for PRF/seed identities.
 
@@ -434,6 +442,15 @@ tpm2x derive \
   --purpose session \
   --context tenant=alpha \
   --length 32
+
+# derived public key form of the effective child identity
+
+tpm2x derive \
+  --with wgwprf \
+  --org com.example \
+  --purpose session \
+  --context tenant=alpha \
+  --format pem
 ```
 
 ### 11. Export rules are unified at the command level and differentiated by mode

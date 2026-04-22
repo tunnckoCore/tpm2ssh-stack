@@ -48,7 +48,8 @@ pub enum Format {
     Der,
     Pem,
     Openssh,
-    EthereumAddress,
+    #[serde(alias = "ethereum-address")]
+    Eth,
     Hex,
     Base64,
 }
@@ -61,7 +62,8 @@ pub enum InputFormat {
     Der,
     Pem,
     Openssh,
-    EthereumAddress,
+    #[serde(alias = "ethereum-address")]
+    Eth,
     Hex,
     Base64,
 }
@@ -171,7 +173,8 @@ pub enum ExportFormat {
     Pkcs8Der,
     Pkcs8Pem,
     Openssh,
-    EthereumAddress,
+    #[serde(alias = "ethereum-address")]
+    Eth,
     Hex,
     Base64,
     Json,

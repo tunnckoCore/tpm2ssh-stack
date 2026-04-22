@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     version,
     about = "TPM-backed identity operations with native, PRF, and seed modes",
     long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind secret-key --format der --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format pem --confirm --reason \"hardware migration\" --output app-prf.json"
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format pem\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format pem --output prod-signer.pem\n  tpm2-derive export --with wallet-seed --kind public-key --format eth --output wallet.address\n  tpm2-derive export --with app-prf --kind secret-key --format der --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format pem --confirm --reason \"hardware migration\" --output app-prf.json"
 )]
 pub struct Cli {
     #[arg(
@@ -27,7 +27,7 @@ pub enum Command {
     Inspect(InspectArgs),
     /// Create or update an identity and materialize backend state unless --dry-run is used.
     Identity(IdentityArgs),
-    /// Derive deterministic bytes from a persisted PRF or seed identity.
+    /// Derive deterministic bytes or a derived public key from a persisted PRF or seed identity.
     Derive(DeriveArgs),
     /// Sign input with a persisted identity.
     Sign(SignArgs),
@@ -98,7 +98,7 @@ pub struct DerivationInputArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Derive deterministic bytes from a persisted identity")]
+#[command(about = "Derive deterministic bytes or a derived public key from a persisted identity")]
 pub struct DeriveArgs {
     #[arg(long = "with", help = "Existing identity name to use")]
     pub identity: String,
@@ -114,7 +114,7 @@ pub struct DeriveArgs {
         long = "format",
         value_enum,
         default_value_t = DeriveFormatArg::Hex,
-        help = "Output format for derived bytes"
+        help = "Output format for derived output (hex/base64 return derived bytes; der/pem/openssh return the derived public key for the effective child identity and require --length 32; der also requires --output)"
     )]
     pub format: DeriveFormatArg,
     #[arg(
@@ -248,7 +248,7 @@ pub struct ExportArgs {
     #[arg(
         long = "format",
         value_enum,
-        help = "Artifact format; valid values depend on --kind (public-key: der|pem|openssh [ed25519/p256 only]|ethereum-address [secp256k1 only]|hex|base64, secret-key: der|pem|openssh [ed25519/p256 only]|hex|base64, keypair: der|pem|openssh [ed25519/p256 only]|hex|base64 inside JSON; public-key hex/base64 use raw public bytes)"
+        help = "Artifact format; valid values depend on --kind (public-key: der|pem|openssh [ed25519/p256 only]|eth [secp256k1 only]|hex|base64, secret-key: der|pem|openssh [ed25519/p256 only]|eth [aliases hex]|hex|base64, keypair: der|pem|openssh [ed25519/p256 only]|eth [secp256k1 only; hex keys + address] inside JSON; public-key hex/base64 use raw public bytes)"
     )]
     pub format: Option<ExportFormatArg>,
     #[arg(long, help = "Destination file path")]
@@ -340,12 +340,18 @@ pub enum ExportKindArg {
     PublicKey,
     /// Export a derived secret key.
     SecretKey,
-    /// Export both derived secret and public key material together as JSON; --format applies to both embedded key values.
+    /// Export both derived secret and public key material together as JSON; --format applies to the embedded key values, and `eth` (secp256k1 only) also adds an address field.
     Keypair,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 pub enum DeriveFormatArg {
+    /// Write binary DER public-key output for the effective derived child identity.
+    Der,
+    /// Write PEM public-key output for the effective derived child identity.
+    Pem,
+    /// Write an OpenSSH public key for the effective derived child identity when supported.
+    Openssh,
     /// Write lowercase hexadecimal text.
     Hex,
     /// Write base64 text.
@@ -382,8 +388,9 @@ pub enum ExportFormatArg {
     Pem,
     /// Write an OpenSSH-formatted key.
     Openssh,
-    /// Write an Ethereum address for a secp256k1 public key.
-    EthereumAddress,
+    /// Write Ethereum-oriented output (`eth`); for public-key this is the address, for secret-key this aliases hex, and for keypair JSON it includes hex keys plus the address.
+    #[value(alias = "ethereum-address")]
+    Eth,
     /// Write lowercase hexadecimal text.
     Hex,
     /// Write base64 text.
@@ -484,6 +491,24 @@ mod tests {
     }
 
     #[test]
+    fn derive_parses_public_key_formats() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "derive",
+            "--with",
+            "app-prf",
+            "--format",
+            "pem",
+        ])
+        .expect("derive pem should parse");
+
+        match cli.command {
+            Command::Derive(args) => assert_eq!(args.format, DeriveFormatArg::Pem),
+            other => panic!("expected derive command, found {other:?}"),
+        }
+    }
+
+    #[test]
     fn sign_and_verify_parse_format_flags() {
         let sign = Cli::try_parse_from([
             "tpm2-derive",
@@ -546,6 +571,38 @@ mod tests {
                 assert_eq!(args.identity, "prod-signer");
                 assert_eq!(args.format, Some(ExportFormatArg::Openssh));
             }
+            other => panic!("expected export command, found {other:?}"),
+        }
+
+        let eth = Cli::try_parse_from([
+            "tpm2-derive",
+            "export",
+            "--with",
+            "prod-signer",
+            "--kind",
+            "public-key",
+            "--format",
+            "eth",
+        ])
+        .expect("eth format should parse");
+        match eth.command {
+            Command::Export(args) => assert_eq!(args.format, Some(ExportFormatArg::Eth)),
+            other => panic!("expected export command, found {other:?}"),
+        }
+
+        let legacy_alias = Cli::try_parse_from([
+            "tpm2-derive",
+            "export",
+            "--with",
+            "prod-signer",
+            "--kind",
+            "public-key",
+            "--format",
+            "ethereum-address",
+        ])
+        .expect("ethereum-address alias should parse");
+        match legacy_alias.command {
+            Command::Export(args) => assert_eq!(args.format, Some(ExportFormatArg::Eth)),
             other => panic!("expected export command, found {other:?}"),
         }
     }

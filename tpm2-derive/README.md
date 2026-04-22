@@ -134,12 +134,24 @@ tpm2-derive derive \
   --format base64 \
   --output session.key
 
+tpm2-derive derive \
+  --with app-prf \
+  --org com.example \
+  --purpose session \
+  --context tenant=alpha \
+  --format pem
+
 tpm2-derive export \
   --with app-prf \
   --kind public-key \
   --format pem \
   --output app-prf.pem
 
+tpm2-derive export \
+  --with wallet-seed \
+  --kind public-key \
+  --format eth \
+  --output wallet.address
 
 tpm2-derive ssh-add --with app-prf --org com.example --context account=prod
 ```
@@ -181,8 +193,12 @@ tpm2-derive export \
 
 - `--use all` expands according to the resolved mode and the native capability matrix.
 - `ssh-add` is intentionally separate from `use=ssh` and rejects native identities.
+- `derive --format hex|base64` returns derived bytes; `derive --format der|pem|openssh` returns the derived public key for the effective child identity. `der` requires `--output`, and `openssh` is currently wired for ed25519 and p256.
 - `export --kind public-key --format hex|base64` emits raw public key bytes (Ed25519 raw key bytes; secp curves as uncompressed SEC1 bytes), not SPKI-wrapped bytes.
 - `export --format openssh` is currently wired for the SSH-capable key shapes in this project (ed25519 and p256), not secp256k1.
+- `export --kind public-key --format eth` emits a checksummed Ethereum address for secp256k1 identities.
+- `export --kind secret-key --format eth` aliases the secret key to hex output.
+- `export --kind keypair --format eth` is secp256k1-only and writes JSON with hex-encoded `private_key`, hex-encoded uncompressed `public_key`, and an `address` entry with format `eth`.
 - `export --kind keypair` always writes JSON with explicit `private_key` and `public_key` entries, and each entry declares its own emitted format.
 - The legacy `keygen` command is no longer part of the public ADR surface; use `export --kind ...` instead.
 - The accepted ADR for this CLI is in `decisions/2026-04-22-unify-cli-surface-across-native-prf-seed.md`.
