@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::model::{Algorithm, CapabilityReport, Diagnostic, DiagnosticLevel, UseCase};
@@ -85,9 +85,53 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessCommandRunner;
 
+pub fn resolve_trusted_program_path(program: &str) -> std::io::Result<PathBuf> {
+    if program.contains(std::path::MAIN_SEPARATOR) {
+        return Ok(PathBuf::from(program));
+    }
+
+    for directory in [
+        "/run/current-system/sw/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ] {
+        let candidate = Path::new(directory).join(program);
+        if let Ok(metadata) = std::fs::metadata(&candidate) {
+            if metadata.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    if metadata.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                }
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("trusted executable '{program}' was not found in the allowed search paths"),
+    ))
+}
+
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
-        match Command::new(&invocation.program)
+        let program = match resolve_trusted_program_path(&invocation.program) {
+            Ok(path) => path,
+            Err(error) => {
+                return CommandOutput {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+
+        match Command::new(&program)
             .args(&invocation.args)
             .output()
         {

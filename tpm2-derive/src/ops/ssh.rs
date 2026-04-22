@@ -1,5 +1,8 @@
 use std::env;
+use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -14,7 +17,7 @@ use ssh_key::{
     },
 };
 
-use crate::backend::{CommandRunner, ProcessCommandRunner};
+use crate::backend::{CommandRunner, ProcessCommandRunner, resolve_trusted_program_path};
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{Algorithm, Identity, SshAddRequest, SshAddResult, UseCase};
@@ -31,7 +34,11 @@ pub struct ProcessSshAddClient;
 
 impl SshAddClient for ProcessSshAddClient {
     fn add_private_key(&self, socket: &Path, private_key_openssh: &str) -> Result<()> {
-        let mut child = Command::new("ssh-add")
+        let program = resolve_trusted_program_path("ssh-add").map_err(|error| {
+            Error::State(format!("failed to resolve trusted ssh-add binary: {error}"))
+        })?;
+
+        let mut child = Command::new(program)
             .args(["-q", "-"])
             .env("SSH_AUTH_SOCK", socket)
             .stdin(Stdio::piped())
@@ -350,22 +357,46 @@ fn default_comment(identity: &Identity) -> String {
 }
 
 fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = explicit_socket {
-        return Ok(path.to_path_buf());
+    let path = if let Some(path) = explicit_socket {
+        path.to_path_buf()
+    } else {
+        match env::var_os("SSH_AUTH_SOCK") {
+            Some(value) if !value.is_empty() => PathBuf::from(value),
+            _ => {
+                return Err(Error::State(
+                    "ssh-add requires --socket or SSH_AUTH_SOCK to point at a running agent"
+                        .to_string(),
+                ))
+            }
+        }
+    };
+
+    let metadata = fs::metadata(&path).map_err(|error| {
+        Error::State(format!(
+            "ssh-add requires a valid agent socket path '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        if !metadata.file_type().is_socket() {
+            return Err(Error::Validation(format!(
+                "ssh-add requires '{}' to be a Unix-domain socket",
+                path.display()
+            )));
+        }
     }
 
-    match env::var_os("SSH_AUTH_SOCK") {
-        Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
-        _ => Err(Error::State(
-            "ssh-add requires --socket or SSH_AUTH_SOCK to point at a running agent".to_string(),
-        )),
-    }
+    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
 
     use secrecy::SecretBox;
     use tempfile::tempdir;
@@ -489,9 +520,34 @@ mod tests {
         identity
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_socket_rejects_non_socket_paths() {
+        let temp = tempdir().expect("tempdir");
+        let file_path = temp.path().join("not-a-socket");
+        std::fs::write(&file_path, b"nope").expect("file");
+
+        let error = resolve_socket(Some(&file_path)).expect_err("non-socket should be rejected");
+        assert!(matches!(error, Error::Validation(message) if message.contains("Unix-domain socket")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_socket_accepts_current_user_socket() {
+        let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+
+        let resolved = resolve_socket(Some(&socket_path)).expect("socket should validate");
+        assert_eq!(resolved, socket_path);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn ssh_add_seed_adds_private_key_to_agent_client() {
         let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
         let identity = seed_identity(temp.path());
         let client = RecordingSshAddClient::default();
         let result = add_with_backend(
@@ -499,7 +555,7 @@ mod tests {
             &SshAddRequest {
                 identity: identity.name.clone(),
                 comment: Some("seed@test".to_string()),
-                socket: Some(temp.path().join("agent.sock")),
+                socket: Some(socket_path),
                 state_dir: Some(temp.path().to_path_buf()),
                 derivation: DerivationOverrides::default(),
             },
@@ -516,9 +572,12 @@ mod tests {
         assert_eq!(client.keys().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_add_prf_adds_private_key_to_agent_client() {
         let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
         let identity = prf_identity(temp.path());
         let client = RecordingSshAddClient::default();
         let result = add_with_backend(
@@ -526,7 +585,7 @@ mod tests {
             &SshAddRequest {
                 identity: identity.name.clone(),
                 comment: Some("prf@test".to_string()),
-                socket: Some(temp.path().join("agent.sock")),
+                socket: Some(socket_path),
                 state_dir: Some(temp.path().to_path_buf()),
                 derivation: DerivationOverrides::default(),
             },

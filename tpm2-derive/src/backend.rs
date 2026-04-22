@@ -11,7 +11,7 @@ mod tss_esapi;
 
 pub use subprocess::{
     CapabilityGroup, CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner,
-    SubprocessCapabilityProbe, ToolAvailability, default_probe,
+    SubprocessCapabilityProbe, ToolAvailability, default_probe, resolve_trusted_program_path,
 };
 #[cfg(feature = "backend-tss-esapi")]
 pub use tss_esapi::TssEsapiCapabilityProbe;
