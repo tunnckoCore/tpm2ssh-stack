@@ -30,6 +30,7 @@ The plan is written so multiple parallel agents can work on it.
 - `--org`, `--purpose`, `--context` are the public derivation-input flags.
 - `native` rejects derivation-input flags.
 - `prf` and `seed` share the same top-level command surface.
+- coupled use rules are enforced: `verify` requires `sign`, `decrypt` requires `encrypt`, and `ssh` requires `sign`.
 - `derive` must not do double HKDF expansion.
 - `auto` must choose exactly one mode or fail.
 
@@ -581,7 +582,7 @@ Before calling the refactor done:
 - [x] `derive` does not double-expand PRF output
 - [x] `export-secret` gates secret-bearing export
 - [x] `keygen` cannot bypass secret-export policy
-- [x] `ssh-add` works for PRF and seed, and rejects native
+- [x] `ssh-add` works for PRF and seed on the currently supported SSH algorithms (`ed25519`, `p256`), and rejects native
 - [x] native support advertised by inspect matches real backend execution
 - [x] README/help/examples match the accepted ADR
 

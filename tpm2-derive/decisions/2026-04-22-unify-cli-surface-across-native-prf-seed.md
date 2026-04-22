@@ -168,6 +168,14 @@ The `--use all` remains supported, but its expansion depends on the resolved mod
 
 The `--use` flag is required. This helps users be mindful and explicit about what their identity should be able to do.
 
+The use contract also has coupling rules:
+
+- `verify` requires `sign`
+- `decrypt` requires `encrypt`
+- `ssh` requires `sign`
+
+Those pairings are intentional because the current implementation derives the same signing/encryption identity material for those coupled operations.
+
 #### 5.1 Native use rules
 
 A `native` identity may declare only the native-compatible uses that are actually supported for its algorithm on the current TPM.
@@ -303,6 +311,13 @@ This command supports only:
 
 - `prf`
 - `seed`
+
+For now, `ssh-add` is implemented only for algorithms that map cleanly to the current SSH/OpenSSH support in this project:
+
+- `ed25519`
+- `p256`
+
+It is not currently implemented for `secp256k1`.
 
 It must reject `native` identities.
 
@@ -465,15 +480,16 @@ Important: exporting the secret key or the keypair requires `export-secret` use 
 |------------|:------:|:---:|:----:|
 | sign       | yes    | yes | yes  |
 | verify     | yes    | yes | yes  |
-| encrypt    | yes*   | yes | yes  |
-| decrypt    | yes*   | yes | yes  |
+| encrypt    | yes¹   | yes | yes  |
+| decrypt    | yes¹   | yes | yes  |
 | derive     | no     | yes | yes  |
 | export public key | yes | yes | yes |
-| export secret key | no | yes** | yes** |
-| ssh-add    | no     | yes | yes  |
+| export secret key | no | yes² | yes² |
+| ssh-add    | no     | yes³ | yes³  |
 
-- `yes*` means subject to per-algorithm native TPM capability.
-- `yes**` means supported, but only if the identity has `export-secret` use bit set.
+- `yes¹` means subject to per-algorithm native TPM capability.
+- `yes²` means supported, but only if the identity has `export-secret` use bit set.
+- `yes³` means currently implemented for `ed25519` and `p256`, but not `secp256k1`.
 
 #### 12.2 The `use` matrix
 
