@@ -94,6 +94,28 @@ impl UseCase {
                 )));
             }
         }
+
+        if uses.contains(&UseCase::Verify) && !uses.contains(&UseCase::Sign) {
+            return Err(crate::error::Error::PolicyRefusal(
+                "use=verify requires use=sign because this tool derives the same signing identity for sign/verify"
+                    .to_string(),
+            ));
+        }
+
+        if uses.contains(&UseCase::Decrypt) && !uses.contains(&UseCase::Encrypt) {
+            return Err(crate::error::Error::PolicyRefusal(
+                "use=decrypt requires use=encrypt because this tool derives the same encryption identity for encrypt/decrypt"
+                    .to_string(),
+            ));
+        }
+
+        if uses.contains(&UseCase::Ssh) && !uses.contains(&UseCase::Sign) {
+            return Err(crate::error::Error::PolicyRefusal(
+                "use=ssh requires use=sign because ssh-backed identity flows depend on signing-capable key material"
+                    .to_string(),
+            ));
+        }
+
         Ok(())
     }
 }

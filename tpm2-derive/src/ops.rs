@@ -1932,7 +1932,7 @@ mod tests {
         let request = IdentityCreateRequest {
             identity: "seed-default".to_string(),
             algorithm: Algorithm::Ed25519,
-            uses: vec![UseCase::Derive, UseCase::Ssh],
+            uses: vec![UseCase::Sign, UseCase::Derive, UseCase::Ssh],
             requested_mode: ModePreference::Seed,
             defaults: crate::model::DerivationOverrides::default(),
             state_dir: Some(root_dir.clone()),
@@ -2130,7 +2130,7 @@ mod tests {
         let identity = Identity::new(
             "seed-ed25519".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -2917,7 +2917,7 @@ mod tests {
         let identity = Identity::new(
             "seed-default".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Derive, UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Derive, UseCase::Ssh],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -3371,7 +3371,7 @@ mod tests {
             identity: crate::ops::seed::SeedRecoveryBundleIdentity {
                 name: profile_name.to_string(),
                 algorithm: Algorithm::Ed25519,
-                uses: vec![UseCase::Derive, UseCase::Ssh],
+                uses: vec![UseCase::Sign, UseCase::Derive, UseCase::Ssh],
                 derivation: crate::ops::seed::SeedDerivation::hkdf_sha256_v1(),
             },
             seed: crate::ops::seed::SeedRecoveryBundleSecret {

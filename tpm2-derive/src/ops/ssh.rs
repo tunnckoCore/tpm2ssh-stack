@@ -527,7 +527,7 @@ mod tests {
         Identity::new(
             "seed-ssh".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -541,7 +541,7 @@ mod tests {
         let mut identity = Identity::new(
             "prf-ssh".to_string(),
             Algorithm::P256,
-            vec![UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh],
             IdentityModeResolution {
                 requested: ModePreference::Prf,
                 resolved: Mode::Prf,
@@ -656,7 +656,7 @@ mod tests {
         let identity = Identity::new(
             "native-ssh".to_string(),
             Algorithm::P256,
-            vec![UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh],
             IdentityModeResolution {
                 requested: ModePreference::Native,
                 resolved: Mode::Native,

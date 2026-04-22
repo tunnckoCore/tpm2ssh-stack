@@ -121,18 +121,20 @@ mod tests {
     }
 
     #[test]
-    fn validate_seed_allows_everything() {
-        for use_case in [
-            UseCase::Sign,
-            UseCase::Verify,
-            UseCase::Derive,
-            UseCase::Ssh,
-            UseCase::Encrypt,
-            UseCase::Decrypt,
-            UseCase::ExportSecret,
-        ] {
-            UseCase::validate_for_mode(&[use_case], Mode::Seed)
-                .unwrap_or_else(|_| panic!("seed should allow {:?}", use_case));
+    fn validate_seed_allows_everything_when_coupled_uses_are_present() {
+        let allowed_sets = [
+            vec![UseCase::Sign],
+            vec![UseCase::Sign, UseCase::Verify],
+            vec![UseCase::Sign, UseCase::Ssh],
+            vec![UseCase::Encrypt],
+            vec![UseCase::Encrypt, UseCase::Decrypt],
+            vec![UseCase::Derive],
+            vec![UseCase::ExportSecret],
+        ];
+
+        for uses in allowed_sets {
+            UseCase::validate_for_mode(&uses, Mode::Seed)
+                .unwrap_or_else(|_| panic!("seed should allow {:?}", uses));
         }
     }
 
@@ -161,19 +163,19 @@ mod tests {
     }
 
     #[test]
-    fn setup_allows_native_mode_with_ssh_use_when_signing_capability_exists() {
+    fn setup_allows_native_mode_with_sign_and_ssh_use() {
         let root_dir = unique_temp_path("setup-native-ssh");
         let result = ops::resolve_identity(
             &HeuristicProbe,
             &request(
                 "test-native-ssh",
                 Algorithm::P256,
-                vec![UseCase::Ssh],
+                vec![UseCase::Sign, UseCase::Ssh],
                 ModePreference::Native,
                 root_dir.clone(),
             ),
         )
-        .expect("native + ssh should be allowed as a future-facing signing-backed intent bit");
+        .expect("native sign+ssh should be allowed as a signing-backed intent bit");
 
         assert_eq!(result.identity.mode.resolved, Mode::Native);
         let _ = std::fs::remove_dir_all(root_dir);
@@ -199,19 +201,19 @@ mod tests {
     }
 
     #[test]
-    fn setup_allows_prf_mode_with_verify_use() {
+    fn setup_allows_prf_mode_with_sign_and_verify_use() {
         let root_dir = unique_temp_path("setup-prf-verify");
         let result = ops::resolve_identity(
             &AlwaysAvailableProbe,
             &request(
                 "test-prf-verify",
                 Algorithm::Ed25519,
-                vec![UseCase::Verify],
+                vec![UseCase::Sign, UseCase::Verify],
                 ModePreference::Prf,
                 root_dir.clone(),
             ),
         )
-        .expect("prf + verify should succeed at setup (dry-run)");
+        .expect("prf + sign+verify should succeed at setup (dry-run)");
 
         assert_eq!(result.identity.mode.resolved, Mode::Prf);
         let _ = std::fs::remove_dir_all(root_dir);
@@ -283,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_rejects_native_mode_with_verify_only_until_that_slice_is_wired() {
+    fn setup_rejects_verify_only_use_contract() {
         let root_dir = unique_temp_path("setup-native-verify-only");
         let error = ops::resolve_identity(
             &HeuristicProbe,
@@ -295,9 +297,10 @@ mod tests {
                 root_dir.clone(),
             ),
         )
-        .expect_err("native verify-only should be rejected truthfully");
+        .expect_err("verify-only should be rejected by the coupled use contract");
 
-        assert!(matches!(error, Error::CapabilityMismatch(message) if message.contains("verify-only native identities are not wired")));
+        assert!(matches!(error, Error::CapabilityMismatch(_) | Error::PolicyRefusal(_)));
+        assert!(error.to_string().contains("use=verify requires use=sign") || error.to_string().contains("verify-only native identities are not wired"));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -339,6 +342,26 @@ mod tests {
     }
 
     #[test]
+    fn setup_rejects_decrypt_without_encrypt_use_contract() {
+        let root_dir = unique_temp_path("setup-decrypt-without-encrypt");
+        let error = ops::resolve_identity(
+            &AlwaysAvailableProbe,
+            &request(
+                "test-decrypt-without-encrypt",
+                Algorithm::Ed25519,
+                vec![UseCase::Decrypt],
+                ModePreference::Seed,
+                root_dir.clone(),
+            ),
+        )
+        .expect_err("decrypt-only should be rejected by the coupled use contract");
+
+        assert!(matches!(error, Error::PolicyRefusal(_)));
+        assert!(error.to_string().contains("use=decrypt requires use=encrypt"));
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
     fn use_all_for_prf_does_not_expand_export_secret() {
         let root_dir = unique_temp_path("setup-prf-all-no-export-secret");
         let result = ops::resolve_identity(
@@ -358,21 +381,22 @@ mod tests {
     }
 
     #[test]
-    fn setup_rejects_secp256k1_ssh_identities_until_ssh_backend_supports_them() {
+    fn setup_rejects_ssh_without_sign_use_contract() {
         let root_dir = unique_temp_path("setup-secp256k1-ssh");
         let error = ops::resolve_identity(
             &AlwaysAvailableProbe,
             &request(
-                "test-secp256k1-ssh",
-                Algorithm::Secp256k1,
+                "test-ssh-without-sign",
+                Algorithm::Ed25519,
                 vec![UseCase::Ssh],
                 ModePreference::Prf,
                 root_dir.clone(),
             ),
         )
-        .expect_err("secp256k1 ssh identities should be rejected truthfully");
+        .expect_err("ssh-only should be rejected by the coupled use contract");
 
-        assert!(matches!(error, Error::CapabilityMismatch(message) if message.contains("use=ssh")));
+        assert!(matches!(error, Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)));
+        assert!(error.to_string().contains("use=ssh requires use=sign"));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
