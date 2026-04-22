@@ -843,54 +843,68 @@ fn validate_secret_bearing_output_path(path: &Path) -> Result<()> {
 }
 
 fn write_secret_output(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|error| {
-            Error::State(format!(
-                "failed to create export directory '{}': {error}",
-                parent.display()
-            ))
-        })?;
-    }
+        .unwrap_or_else(|| Path::new("."));
+
+    fs::create_dir_all(parent).map_err(|error| {
+        Error::State(format!(
+            "failed to create export directory '{}': {error}",
+            parent.display()
+        ))
+    })?;
 
     validate_secret_bearing_output_path(path)?;
 
-    if path.exists() {
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-            Error::State(format!(
-                "failed to set permissions on '{}': {error}",
-                path.display()
-            ))
-        })?;
-    }
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("secret-export"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
 
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
 
-    let mut file = options.open(path).map_err(|error| {
+    let mut file = options.open(&temp_path).map_err(|error| {
         Error::State(format!(
-            "failed to open secret-bearing export destination '{}': {error}",
-            path.display()
+            "failed to create secret-bearing export temp file '{}': {error}",
+            temp_path.display()
         ))
     })?;
 
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
             Error::State(format!(
                 "failed to set permissions on '{}': {error}",
-                path.display()
+                temp_path.display()
             ))
         })?;
 
-    file.write_all(bytes).map_err(|error| {
-        Error::State(format!(
+    if let Err(error) = file.write_all(bytes) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(Error::State(format!(
             "failed to write secret-bearing export to '{}': {error}",
+            temp_path.display()
+        )));
+    }
+    drop(file);
+
+    fs::rename(&temp_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        Error::State(format!(
+            "failed to move secret-bearing export into place '{}' -> '{}': {error}",
+            temp_path.display(),
             path.display()
         ))
     })?;

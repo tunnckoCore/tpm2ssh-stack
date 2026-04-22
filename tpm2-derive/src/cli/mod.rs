@@ -612,17 +612,86 @@ fn try_hex_decode(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn write_output_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(|e| {
-            Error::State(format!(
-                "failed to create output directory '{}': {e}",
-                parent.display()
-            ))
-        })?;
-    }
-    fs::write(path, data).map_err(|e| {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| {
         Error::State(format!(
+            "failed to create output directory '{}': {e}",
+            parent.display()
+        ))
+    })?;
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(Error::Validation(format!(
+                "output '{}' must not be a symlink",
+                path.display()
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(Error::Validation(format!(
+                "output '{}' must be a regular file path",
+                path.display()
+            )));
+        }
+    }
+
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("output"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(&temp_path).map_err(|e| {
+        Error::State(format!(
+            "failed to create temp output file '{}': {e}",
+            temp_path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                let _ = fs::remove_file(&temp_path);
+                Error::State(format!(
+                    "failed to harden temp output permissions '{}': {e}",
+                    temp_path.display()
+                ))
+            })?;
+    }
+    use std::io::Write as _;
+    if let Err(e) = file.write_all(data) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(Error::State(format!(
             "failed to write output to '{}': {e}",
+            temp_path.display()
+        )));
+    }
+    drop(file);
+
+    fs::rename(&temp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        Error::State(format!(
+            "failed to move output into place '{}' -> '{}': {e}",
+            temp_path.display(),
             path.display()
         ))
     })
