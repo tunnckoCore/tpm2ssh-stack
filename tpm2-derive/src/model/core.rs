@@ -42,25 +42,32 @@ pub enum Algorithm {
 pub enum UseCase {
     Sign,
     Verify,
-    SshAgent,
+    Ssh,
     Derive,
     Encrypt,
     Decrypt,
+    ExportSecret,
 }
 
 impl UseCase {
     /// Returns the set of use-cases allowed for the given mode.
     pub fn allowed_for_mode(mode: Mode) -> &'static [UseCase] {
         match mode {
-            Mode::Prf => &[UseCase::SshAgent, UseCase::Derive],
-            Mode::Native => &[UseCase::Sign, UseCase::Verify],
-            Mode::Seed => &[
+            Mode::Native => &[
                 UseCase::Sign,
                 UseCase::Verify,
-                UseCase::SshAgent,
+                UseCase::Encrypt,
+                UseCase::Decrypt,
+                UseCase::Ssh,
+            ],
+            Mode::Prf | Mode::Seed => &[
+                UseCase::Sign,
+                UseCase::Verify,
+                UseCase::Ssh,
                 UseCase::Derive,
                 UseCase::Encrypt,
                 UseCase::Decrypt,
+                UseCase::ExportSecret,
             ],
         }
     }

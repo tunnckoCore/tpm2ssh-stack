@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Algorithm, Mode, ModePreference, Profile, UseCase};
+use crate::model::{Algorithm, Identity, Mode, ModePreference, UseCase};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct InspectRequest {
@@ -12,41 +12,40 @@ pub struct InspectRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SetupRequest {
-    pub profile: String,
+pub struct IdentityCreateRequest {
+    pub identity: String,
     pub algorithm: Algorithm,
     pub uses: Vec<UseCase>,
     pub requested_mode: ModePreference,
+    pub defaults: DerivationOverrides,
     pub state_dir: Option<PathBuf>,
     pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SetupResult {
-    pub profile: Profile,
+pub struct IdentityCreateResult {
+    pub identity: Identity,
     pub dry_run: bool,
     pub persisted: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DerivationContext {
-    pub version: u32,
-    pub purpose: String,
-    pub namespace: String,
-    pub label: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct DerivationOverrides {
+    pub org: Option<String>,
+    pub purpose: Option<String>,
     pub context: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeriveRequest {
-    pub profile: String,
-    pub context: DerivationContext,
+    pub identity: String,
+    pub derivation: DerivationOverrides,
     pub length: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeriveResult {
-    pub profile: String,
+    pub identity: String,
     pub mode: Mode,
     pub length: u16,
     pub encoding: String,
@@ -55,27 +54,27 @@ pub struct DeriveResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SignRequest {
-    pub profile: String,
+    pub identity: String,
     pub input: InputSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct VerifyRequest {
-    pub profile: String,
+    pub identity: String,
     pub input: InputSource,
     pub signature: InputSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EncryptRequest {
-    pub profile: String,
+    pub identity: String,
     pub input: InputSource,
     pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EncryptResult {
-    pub profile: String,
+    pub identity: String,
     pub mode: Mode,
     pub algorithm: Algorithm,
     pub input_bytes: usize,
@@ -88,14 +87,14 @@ pub struct EncryptResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DecryptRequest {
-    pub profile: String,
+    pub identity: String,
     pub input: InputSource,
     pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DecryptResult {
-    pub profile: String,
+    pub identity: String,
     pub mode: Mode,
     pub algorithm: Algorithm,
     pub ciphertext_bytes: usize,
@@ -122,7 +121,7 @@ pub enum KeygenFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KeygenRequest {
-    pub from_profile: String,
+    pub identity: String,
     pub kind: KeygenKind,
     pub format: KeygenFormat,
     pub output: Option<PathBuf>,
@@ -130,7 +129,7 @@ pub struct KeygenRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KeygenResult {
-    pub profile: String,
+    pub identity: String,
     pub mode: Mode,
     pub algorithm: Algorithm,
     pub secret_key_hex: String,
@@ -147,7 +146,7 @@ pub enum ExportKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ExportRequest {
-    pub profile: String,
+    pub identity: String,
     pub kind: ExportKind,
     pub output: Option<PathBuf>,
     pub public_key_format: Option<PublicKeyExportFormat>,
@@ -196,7 +195,7 @@ pub struct ExportArtifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ExportResult {
-    pub profile: String,
+    pub identity: String,
     pub mode: Mode,
     pub kind: ExportKind,
     pub artifact: ExportArtifact,
@@ -205,29 +204,29 @@ pub struct ExportResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RecoveryImportRequest {
     pub bundle_path: PathBuf,
-    pub profile: Option<String>,
+    pub identity: Option<String>,
     pub state_dir: Option<PathBuf>,
     pub overwrite_existing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RecoveryImportResult {
-    pub profile: Profile,
-    pub restored_from_profile: String,
+    pub identity: Identity,
+    pub restored_from_identity: String,
     pub seed_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SshAgentAddRequest {
-    pub profile: String,
+pub struct SshAddRequest {
+    pub identity: String,
     pub comment: Option<String>,
     pub socket: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SshAgentAddResult {
-    pub profile: String,
+pub struct SshAddResult {
+    pub identity: String,
     pub mode: Mode,
     pub algorithm: Algorithm,
     pub socket: PathBuf,
@@ -246,6 +245,6 @@ pub enum InputSource {
 pub struct PendingOperation {
     pub implemented: bool,
     pub operation: String,
-    pub profile: Option<String>,
+    pub identity: Option<String>,
     pub summary: String,
 }

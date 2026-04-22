@@ -7,32 +7,32 @@ use p256::SecretKey;
 use secrecy::ExposeSecret;
 use sha2::{Digest as _, Sha256};
 use ssh_key::{
-    private::{EcdsaKeypair, Ed25519Keypair, KeypairData},
     LineEnding, PrivateKey,
+    private::{EcdsaKeypair, Ed25519Keypair, KeypairData},
 };
 
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, Mode, Profile, SshAgentAddRequest, SshAgentAddResult, UseCase};
+use crate::model::{Algorithm, Identity, Mode, SshAddRequest, SshAddResult, UseCase};
 
 use super::seed::{
-    open_and_derive, seed_profile_from_profile, HkdfSha256SeedDeriver, SeedBackend,
-    SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest, SeedSoftwareDeriver,
-    SoftwareSeedDerivationRequest, SubprocessSeedBackend,
+    HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
+    SeedSoftwareDeriver, SoftwareSeedDerivationRequest, SubprocessSeedBackend, open_and_derive,
+    seed_profile_from_profile,
 };
 
 const SSH_CHILD_KEY_NAMESPACE: &str = "tpm2-derive.ssh";
 const SSH_CHILD_KEY_PATH: &str = "m/openssh/agent/default";
 const SSH_P256_SCALAR_FALLBACK_DOMAIN: &[u8] = b"tpm2-derive\0ssh\0p256-scalar-fallback\0v1";
 
-pub trait SshAgentClient {
+pub trait SshAddClient {
     fn add_private_key(&self, socket: &Path, private_key_openssh: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ProcessSshAgentClient;
+pub struct ProcessSshAddClient;
 
-impl SshAgentClient for ProcessSshAgentClient {
+impl SshAddClient for ProcessSshAddClient {
     fn add_private_key(&self, socket: &Path, private_key_openssh: &str) -> Result<()> {
         let mut child = Command::new("ssh-add")
             .args(["-q", "-"])
@@ -88,91 +88,89 @@ impl SshAgentClient for ProcessSshAgentClient {
     }
 }
 
-pub fn add_with_defaults(
-    profile: &Profile,
-    request: &SshAgentAddRequest,
-) -> Result<SshAgentAddResult> {
-    let seed_backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+pub fn add_with_defaults(identity: &Identity, request: &SshAddRequest) -> Result<SshAddResult> {
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     let seed_deriver = HkdfSha256SeedDeriver;
-    let client = ProcessSshAgentClient;
+    let client = ProcessSshAddClient;
 
-    add_with_backend(profile, request, &seed_backend, &seed_deriver, &client)
+    add_with_backend(identity, request, &seed_backend, &seed_deriver, &client)
 }
 
 pub fn add_with_backend<B, D, C>(
-    profile: &Profile,
-    request: &SshAgentAddRequest,
+    identity: &Identity,
+    request: &SshAddRequest,
     seed_backend: &B,
     seed_deriver: &D,
     client: &C,
-) -> Result<SshAgentAddResult>
+) -> Result<SshAddResult>
 where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
-    C: SshAgentClient,
+    C: SshAddClient,
 {
-    match profile.mode.resolved {
+    match identity.mode.resolved {
         Mode::Native => Err(Error::Unsupported(format!(
-            "profile '{}' resolved to native mode; ssh-agent add cannot export a TPM-native private key into a software agent",
-            profile.name
+            "identity '{}' resolved to native mode; ssh-add cannot export a TPM-native private key into a software agent",
+            identity.name
         ))),
         Mode::Prf => Err(Error::Unsupported(format!(
-            "profile '{}' resolved to PRF mode; ssh-agent add is not wired for PRF-mode profiles yet",
-            profile.name
+            "identity '{}' resolved to PRF mode; ssh-add is not wired for PRF-mode identities yet",
+            identity.name
         ))),
-        Mode::Seed => add_seed_profile(profile, request, seed_backend, seed_deriver, client),
+        Mode::Seed => add_seed_profile(identity, request, seed_backend, seed_deriver, client),
     }
 }
 
 fn add_seed_profile<B, D, C>(
-    profile: &Profile,
-    request: &SshAgentAddRequest,
+    identity: &Identity,
+    request: &SshAddRequest,
     seed_backend: &B,
     seed_deriver: &D,
     client: &C,
-) -> Result<SshAgentAddResult>
+) -> Result<SshAddResult>
 where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
-    C: SshAgentClient,
+    C: SshAddClient,
 {
-    ensure_ssh_use(profile)?;
+    ensure_ssh_use(identity)?;
 
     // Enforce mode/use compatibility at operation dispatch time.
-    UseCase::validate_for_mode(&profile.uses, profile.mode.resolved)?;
+    UseCase::validate_for_mode(&identity.uses, identity.mode.resolved)?;
 
-    if !matches!(profile.algorithm, Algorithm::Ed25519 | Algorithm::P256) {
+    if !matches!(identity.algorithm, Algorithm::Ed25519 | Algorithm::P256) {
         return Err(Error::Unsupported(format!(
-            "profile '{}' resolved to seed mode, but ssh-agent add currently supports only ed25519 and p256 seed profiles; found {:?}",
-            profile.name, profile.algorithm
+            "identity '{}' resolved to seed mode, but ssh-add currently supports only ed25519 and p256 seed identities; found {:?}",
+            identity.name, identity.algorithm
         )));
     }
 
     let comment = request
         .comment
         .clone()
-        .unwrap_or_else(|| default_comment(profile));
+        .unwrap_or_else(|| default_comment(identity));
     let socket = resolve_socket(request.socket.as_deref())?;
-    let private_key = derive_seed_private_key(profile, seed_backend, seed_deriver, &comment)?;
+    let private_key = derive_seed_private_key(identity, seed_backend, seed_deriver, &comment)?;
     let public_key_openssh = private_key.public_key().to_openssh().map_err(|error| {
         Error::Internal(format!(
-            "failed to render OpenSSH public key for profile '{}': {error}",
-            profile.name
+            "failed to render OpenSSH public key for identity '{}': {error}",
+            identity.name
         ))
     })?;
     let private_key_openssh = private_key.to_openssh(LineEnding::LF).map_err(|error| {
         Error::Internal(format!(
-            "failed to render OpenSSH private key for profile '{}': {error}",
-            profile.name
+            "failed to render OpenSSH private key for identity '{}': {error}",
+            identity.name
         ))
     })?;
 
     client.add_private_key(&socket, private_key_openssh.as_ref())?;
 
-    Ok(SshAgentAddResult {
-        profile: profile.name.clone(),
-        mode: profile.mode.resolved,
-        algorithm: profile.algorithm,
+    Ok(SshAddResult {
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
         socket,
         comment,
         public_key_openssh,
@@ -180,7 +178,7 @@ where
 }
 
 fn derive_seed_private_key<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     seed_backend: &B,
     seed_deriver: &D,
     comment: &str,
@@ -189,20 +187,20 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    match profile.algorithm {
+    match identity.algorithm {
         Algorithm::Ed25519 => {
-            derive_ed25519_private_key(profile, seed_backend, seed_deriver, comment)
+            derive_ed25519_private_key(identity, seed_backend, seed_deriver, comment)
         }
-        Algorithm::P256 => derive_p256_private_key(profile, seed_backend, seed_deriver, comment),
+        Algorithm::P256 => derive_p256_private_key(identity, seed_backend, seed_deriver, comment),
         other => Err(Error::Unsupported(format!(
-            "profile '{}' resolved to seed mode, but ssh-agent add does not derive {:?} private keys yet",
-            profile.name, other
+            "identity '{}' resolved to seed mode, but ssh-add does not derive {:?} private keys yet",
+            identity.name, other
         ))),
     }
 }
 
 fn derive_ed25519_private_key<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     seed_backend: &B,
     seed_deriver: &D,
     comment: &str,
@@ -212,7 +210,7 @@ where
     D: SeedSoftwareDeriver,
 {
     let derived_seed = derive_seed_bytes(
-        profile,
+        identity,
         seed_backend,
         seed_deriver,
         ssh_ed25519_derivation_spec()?,
@@ -227,14 +225,14 @@ where
 
     PrivateKey::new(KeypairData::from(keypair), comment).map_err(|error| {
         Error::Internal(format!(
-            "failed to construct an OpenSSH ed25519 private key for profile '{}': {error}",
-            profile.name
+            "failed to construct an OpenSSH ed25519 private key for identity '{}': {error}",
+            identity.name
         ))
     })
 }
 
 fn derive_p256_private_key<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     seed_backend: &B,
     seed_deriver: &D,
     comment: &str,
@@ -244,13 +242,13 @@ where
     D: SeedSoftwareDeriver,
 {
     let scalar_bytes = derive_seed_bytes(
-        profile,
+        identity,
         seed_backend,
         seed_deriver,
         ssh_p256_derivation_spec()?,
         "p256 scalar",
     )?;
-    let secret_key = p256_secret_key_from_material(profile, &scalar_bytes)?;
+    let secret_key = p256_secret_key_from_material(identity, &scalar_bytes)?;
     let public_key = secret_key.public_key();
 
     PrivateKey::new(
@@ -262,14 +260,14 @@ where
     )
     .map_err(|error| {
         Error::Internal(format!(
-            "failed to construct an OpenSSH p256 private key for profile '{}': {error}",
-            profile.name
+            "failed to construct an OpenSSH p256 private key for identity '{}': {error}",
+            identity.name
         ))
     })
 }
 
 fn derive_seed_bytes<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     seed_backend: &B,
     seed_deriver: &D,
     spec: DerivationSpec,
@@ -280,9 +278,9 @@ where
     D: SeedSoftwareDeriver,
 {
     let output_bytes = usize::from(spec.output().length);
-    let seed_profile = seed_profile_from_profile(profile)?;
+    let seed_profile = seed_profile_from_profile(identity)?;
     let request = SeedOpenRequest {
-        profile: seed_profile,
+        identity: seed_profile,
         auth_source: SeedOpenAuthSource::None,
         output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest { spec, output_bytes }),
         require_fresh_unseal: true,
@@ -293,8 +291,8 @@ where
         .map(|derived| derived.expose_secret().to_vec())
         .map_err(|error| {
             Error::State(format!(
-                "failed to derive ssh-agent {output_name} for profile '{}': {error}",
-                profile.name
+                "failed to derive ssh-agent {output_name} for identity '{}': {error}",
+                identity.name
             ))
         })
 }
@@ -317,7 +315,7 @@ fn ssh_p256_derivation_spec() -> Result<DerivationSpec> {
     )?))
 }
 
-fn p256_secret_key_from_material(profile: &Profile, material: &[u8]) -> Result<SecretKey> {
+fn p256_secret_key_from_material(identity: &Identity, material: &[u8]) -> Result<SecretKey> {
     if let Ok(secret_key) = SecretKey::from_slice(material) {
         return Ok(secret_key);
     }
@@ -334,28 +332,28 @@ fn p256_secret_key_from_material(profile: &Profile, material: &[u8]) -> Result<S
     }
 
     Err(Error::Internal(format!(
-        "failed to normalize p256 ssh-agent scalar material for profile '{}'",
-        profile.name
+        "failed to normalize p256 ssh-agent scalar material for identity '{}'",
+        identity.name
     )))
 }
 
-fn ensure_ssh_use(profile: &Profile) -> Result<()> {
-    if profile
+fn ensure_ssh_use(identity: &Identity) -> Result<()> {
+    if identity
         .uses
         .iter()
-        .any(|use_case| matches!(use_case, UseCase::SshAgent))
+        .any(|use_case| matches!(use_case, UseCase::Ssh))
     {
         return Ok(());
     }
 
     Err(Error::PolicyRefusal(format!(
-        "profile '{}' is not configured with use=ssh-agent",
-        profile.name
+        "identity '{}' is not configured with use=ssh",
+        identity.name
     )))
 }
 
-fn default_comment(profile: &Profile) -> String {
-    format!("{}@tpm2-derive", profile.name)
+fn default_comment(identity: &Identity) -> String {
+    format!("{}@tpm2-derive", identity.name)
 }
 
 fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
@@ -366,8 +364,7 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
     match env::var_os("SSH_AUTH_SOCK") {
         Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
         _ => Err(Error::State(
-            "ssh-agent add requires --socket or SSH_AUTH_SOCK to point at a running agent"
-                .to_string(),
+            "ssh-add requires --socket or SSH_AUTH_SOCK to point at a running agent".to_string(),
         )),
     }
 }
@@ -380,15 +377,15 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::model::{ModePreference, ModeResolution, StateLayout};
-    use crate::ops::seed::{SeedCreateRequest, SeedMaterial, SeedProfile};
+    use crate::model::{IdentityModeResolution, ModePreference, StateLayout};
+    use crate::ops::seed::{SeedCreateRequest, SeedIdentity, SeedMaterial};
 
     #[derive(Debug, Clone)]
-    struct RecordingSshAgentClient {
+    struct RecordingSshAddClient {
         state: Arc<Mutex<Vec<(PathBuf, String)>>>,
     }
 
-    impl RecordingSshAgentClient {
+    impl RecordingSshAddClient {
         fn new() -> Self {
             Self {
                 state: Arc::new(Mutex::new(Vec::new())),
@@ -400,7 +397,7 @@ mod tests {
         }
     }
 
-    impl SshAgentClient for RecordingSshAgentClient {
+    impl SshAddClient for RecordingSshAddClient {
         fn add_private_key(&self, socket: &Path, private_key_openssh: &str) -> Result<()> {
             self.state
                 .lock()
@@ -429,19 +426,19 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.seed.clone())))
         }
     }
 
-    fn seed_profile(root: &Path, mode: Mode, algorithm: Algorithm, uses: Vec<UseCase>) -> Profile {
-        Profile::new(
+    fn seed_profile(root: &Path, mode: Mode, algorithm: Algorithm, uses: Vec<UseCase>) -> Identity {
+        Identity::new(
             "seed-ssh".to_string(),
             algorithm,
             uses,
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: mode,
                 reasons: vec![format!("{mode:?} requested")],
@@ -453,19 +450,19 @@ mod tests {
     #[test]
     fn adds_ed25519_seed_profile_to_requested_agent_socket() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Mode::Seed,
             Algorithm::Ed25519,
-            vec![UseCase::SshAgent],
+            vec![UseCase::Ssh],
         );
         let backend = FakeSeedBackend::new(&[0x42; 32]);
-        let client = RecordingSshAgentClient::new();
+        let client = RecordingSshAddClient::new();
 
         let result = add_with_backend(
-            &profile,
-            &SshAgentAddRequest {
-                profile: profile.name.clone(),
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
                 comment: Some("seed-ssh@example".to_string()),
                 socket: Some(state_root.path().join("agent.sock")),
                 state_dir: Some(state_root.path().to_path_buf()),
@@ -474,7 +471,7 @@ mod tests {
             &HkdfSha256SeedDeriver,
             &client,
         )
-        .expect("ssh-agent add should succeed");
+        .expect("ssh-add should succeed");
 
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.algorithm, Algorithm::Ed25519);
@@ -484,26 +481,28 @@ mod tests {
         let records = client.records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, state_root.path().join("agent.sock"));
-        assert!(records[0]
-            .1
-            .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(
+            records[0]
+                .1
+                .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+        );
     }
 
     #[test]
     fn rejects_non_seed_modes_explicitly() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Mode::Prf,
             Algorithm::Ed25519,
-            vec![UseCase::SshAgent],
+            vec![UseCase::Ssh],
         );
         let backend = FakeSeedBackend::new(&[0x24; 32]);
-        let client = RecordingSshAgentClient::new();
+        let client = RecordingSshAddClient::new();
         let error = add_with_backend(
-            &profile,
-            &SshAgentAddRequest {
-                profile: profile.name.clone(),
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
                 comment: None,
                 socket: Some(state_root.path().join("agent.sock")),
                 state_dir: Some(state_root.path().to_path_buf()),
@@ -515,24 +514,24 @@ mod tests {
         .expect_err("prf mode should stay unsupported");
 
         assert_eq!(error.code(), crate::ErrorCode::Unsupported);
-        assert!(error.to_string().contains("PRF-mode profiles yet"));
+        assert!(error.to_string().contains("PRF-mode identities yet"));
     }
 
     #[test]
     fn rejects_seed_profiles_without_ssh_use() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Mode::Seed,
             Algorithm::Ed25519,
             vec![UseCase::Derive],
         );
         let backend = FakeSeedBackend::new(&[0x11; 32]);
-        let client = RecordingSshAgentClient::new();
+        let client = RecordingSshAddClient::new();
         let error = add_with_backend(
-            &profile,
-            &SshAgentAddRequest {
-                profile: profile.name.clone(),
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
                 comment: None,
                 socket: Some(state_root.path().join("agent.sock")),
                 state_dir: Some(state_root.path().to_path_buf()),
@@ -544,27 +543,25 @@ mod tests {
         .expect_err("ssh use should be required");
 
         assert_eq!(error.code(), crate::ErrorCode::PolicyRefusal);
-        assert!(error
-            .to_string()
-            .contains("not configured with use=ssh-agent"));
+        assert!(error.to_string().contains("not configured with use=ssh"));
     }
 
     #[test]
     fn adds_p256_seed_profile_to_requested_agent_socket() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Mode::Seed,
             Algorithm::P256,
-            vec![UseCase::SshAgent],
+            vec![UseCase::Ssh],
         );
         let backend = FakeSeedBackend::new(&[0x33; 32]);
-        let client = RecordingSshAgentClient::new();
+        let client = RecordingSshAddClient::new();
 
         let result = add_with_backend(
-            &profile,
-            &SshAgentAddRequest {
-                profile: profile.name.clone(),
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
                 comment: Some("seed-p256@example".to_string()),
                 socket: Some(state_root.path().join("agent.sock")),
                 state_dir: Some(state_root.path().to_path_buf()),
@@ -573,39 +570,43 @@ mod tests {
             &HkdfSha256SeedDeriver,
             &client,
         )
-        .expect("p256 seed ssh-agent add should succeed");
+        .expect("p256 seed ssh-add should succeed");
 
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.algorithm, Algorithm::P256);
         assert_eq!(result.comment, "seed-p256@example");
-        assert!(result
-            .public_key_openssh
-            .starts_with("ecdsa-sha2-nistp256 "));
+        assert!(
+            result
+                .public_key_openssh
+                .starts_with("ecdsa-sha2-nistp256 ")
+        );
 
         let records = client.records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, state_root.path().join("agent.sock"));
-        assert!(records[0]
-            .1
-            .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(
+            records[0]
+                .1
+                .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+        );
     }
 
     #[test]
     fn p256_seed_profile_normalizes_zero_scalar_material() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Mode::Seed,
             Algorithm::P256,
-            vec![UseCase::SshAgent],
+            vec![UseCase::Ssh],
         );
         let backend = FakeSeedBackend::new(&[0u8; 32]);
-        let client = RecordingSshAgentClient::new();
+        let client = RecordingSshAddClient::new();
 
         let result = add_with_backend(
-            &profile,
-            &SshAgentAddRequest {
-                profile: profile.name.clone(),
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
                 comment: None,
                 socket: Some(state_root.path().join("agent.sock")),
                 state_dir: Some(state_root.path().to_path_buf()),
@@ -616,8 +617,10 @@ mod tests {
         )
         .expect("zero scalar material should be normalized into a valid p256 key");
 
-        assert!(result
-            .public_key_openssh
-            .starts_with("ecdsa-sha2-nistp256 "));
+        assert!(
+            result
+                .public_key_openssh
+                .starts_with("ecdsa-sha2-nistp256 ")
+        );
     }
 }

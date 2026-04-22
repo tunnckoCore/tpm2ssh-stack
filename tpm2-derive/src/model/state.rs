@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct StateLayout {
     pub root_dir: PathBuf,
-    pub profiles_dir: PathBuf,
+    pub identities_dir: PathBuf,
     pub objects_dir: PathBuf,
     pub exports_dir: PathBuf,
 }
@@ -19,7 +19,7 @@ pub struct StateLayout {
 impl StateLayout {
     pub fn new(root_dir: PathBuf) -> Self {
         Self {
-            profiles_dir: root_dir.join("profiles"),
+            identities_dir: root_dir.join("identities"),
             objects_dir: root_dir.join("objects"),
             exports_dir: root_dir.join("exports"),
             root_dir,
@@ -33,7 +33,7 @@ impl StateLayout {
     pub fn ensure_dirs(&self) -> Result<()> {
         for path in [
             &self.root_dir,
-            &self.profiles_dir,
+            &self.identities_dir,
             &self.objects_dir,
             &self.exports_dir,
         ] {
@@ -45,21 +45,19 @@ impl StateLayout {
             })?;
 
             #[cfg(unix)]
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(
-                |error| {
-                    Error::State(format!(
-                        "failed to set permissions on '{}': {error}",
-                        path.display()
-                    ))
-                },
-            )?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                Error::State(format!(
+                    "failed to set permissions on '{}': {error}",
+                    path.display()
+                ))
+            })?;
         }
 
         Ok(())
     }
 
-    pub fn profile_path(&self, profile_name: &str) -> PathBuf {
-        self.profiles_dir.join(format!("{profile_name}.json"))
+    pub fn identity_path(&self, identity_name: &str) -> PathBuf {
+        self.identities_dir.join(format!("{identity_name}.json"))
     }
 }
 
@@ -110,7 +108,7 @@ mod tests {
             .expect("state layout should be created");
 
         assert!(layout.root_dir.is_dir());
-        assert!(layout.profiles_dir.is_dir());
+        assert!(layout.identities_dir.is_dir());
         assert!(layout.objects_dir.is_dir());
         assert!(layout.exports_dir.is_dir());
 
@@ -128,15 +126,11 @@ mod tests {
 
         for path in [
             &layout.root_dir,
-            &layout.profiles_dir,
+            &layout.identities_dir,
             &layout.objects_dir,
             &layout.exports_dir,
         ] {
-            let mode = fs::metadata(path)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode = fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "directory {} should be 0700", path.display());
         }
 

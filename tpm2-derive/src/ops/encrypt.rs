@@ -1,4 +1,4 @@
-//! Encrypt/decrypt operations using symmetric keys derived from profile material.
+//! Encrypt/decrypt operations using symmetric keys derived from identity material.
 //!
 //! - **seed** mode: unseal seed, derive a 256-bit symmetric key via HKDF, then
 //!   encrypt/decrypt with ChaCha20-Poly1305 AEAD.
@@ -7,8 +7,8 @@
 //! - **native** mode: scaffolded – returns an explicit unsupported error with a plan.
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit},
 };
 use rand::RngCore;
 use secrecy::ExposeSecret;
@@ -16,12 +16,12 @@ use secrecy::ExposeSecret;
 use crate::backend::CommandRunner;
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
-use crate::model::{EncryptResult, DecryptResult, Mode, Profile};
+use crate::model::{DecryptResult, EncryptResult, Identity, Mode};
 
 use super::prf::{
-    PrfRequest, TpmPrfExecutor, TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner,
-    plan_tpm_prf_in, PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
-    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY,
+    PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
+    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY, PrfRequest, TpmPrfExecutor,
+    TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, plan_tpm_prf_in,
 };
 use super::seed::{
     HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
@@ -40,20 +40,27 @@ const NONCE_LEN: usize = 12;
 // ---------------------------------------------------------------------------
 
 pub fn encrypt_with_defaults<R>(
-    profile: &Profile,
+    identity: &Identity,
     plaintext: &[u8],
     prf_runner: &R,
 ) -> Result<EncryptResult>
 where
     R: CommandRunner,
 {
-    let seed_backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     let seed_deriver = HkdfSha256SeedDeriver;
-    encrypt(profile, plaintext, prf_runner, &seed_backend, &seed_deriver)
+    encrypt(
+        identity,
+        plaintext,
+        prf_runner,
+        &seed_backend,
+        &seed_deriver,
+    )
 }
 
 pub fn encrypt<R, B, D>(
-    profile: &Profile,
+    identity: &Identity,
     plaintext: &[u8],
     prf_runner: &R,
     seed_backend: &B,
@@ -64,13 +71,13 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let key_material = derive_symmetric_key(profile, prf_runner, seed_backend, seed_deriver)?;
+    let key_material = derive_symmetric_key(identity, prf_runner, seed_backend, seed_deriver)?;
     let ciphertext = aead_encrypt(&key_material, plaintext)?;
 
     Ok(EncryptResult {
-        profile: profile.name.clone(),
-        mode: profile.mode.resolved,
-        algorithm: profile.algorithm,
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
         input_bytes: plaintext.len(),
         ciphertext_bytes: ciphertext.len(),
         nonce_bytes: NONCE_LEN,
@@ -81,20 +88,27 @@ where
 }
 
 pub fn decrypt_with_defaults<R>(
-    profile: &Profile,
+    identity: &Identity,
     ciphertext: &[u8],
     prf_runner: &R,
 ) -> Result<DecryptResult>
 where
     R: CommandRunner,
 {
-    let seed_backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     let seed_deriver = HkdfSha256SeedDeriver;
-    decrypt(profile, ciphertext, prf_runner, &seed_backend, &seed_deriver)
+    decrypt(
+        identity,
+        ciphertext,
+        prf_runner,
+        &seed_backend,
+        &seed_deriver,
+    )
 }
 
 pub fn decrypt<R, B, D>(
-    profile: &Profile,
+    identity: &Identity,
     ciphertext: &[u8],
     prf_runner: &R,
     seed_backend: &B,
@@ -105,13 +119,13 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let key_material = derive_symmetric_key(profile, prf_runner, seed_backend, seed_deriver)?;
+    let key_material = derive_symmetric_key(identity, prf_runner, seed_backend, seed_deriver)?;
     let plaintext = aead_decrypt(&key_material, ciphertext)?;
 
     Ok(DecryptResult {
-        profile: profile.name.clone(),
-        mode: profile.mode.resolved,
-        algorithm: profile.algorithm,
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
         ciphertext_bytes: ciphertext.len(),
         plaintext_bytes: plaintext.len(),
         output_path: None,
@@ -125,7 +139,7 @@ where
 // ---------------------------------------------------------------------------
 
 fn derive_symmetric_key<R, B, D>(
-    profile: &Profile,
+    identity: &Identity,
     prf_runner: &R,
     seed_backend: &B,
     seed_deriver: &D,
@@ -135,20 +149,20 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    match profile.mode.resolved {
+    match identity.mode.resolved {
         Mode::Native => Err(Error::Unsupported(
-            "encrypt/decrypt with native-mode profiles is not implemented yet; native TPM \
+            "encrypt/decrypt with native-mode identities is not implemented yet; native TPM \
              symmetric encrypt would require RSA-OAEP wrapping or TPM2_EncryptDecrypt2 which \
-             is not universally available – use a seed or prf profile instead"
+             is not universally available – use a seed or prf identity instead"
                 .to_string(),
         )),
-        Mode::Seed => derive_seed_symmetric_key(profile, seed_backend, seed_deriver),
-        Mode::Prf => derive_prf_symmetric_key(profile, prf_runner),
+        Mode::Seed => derive_seed_symmetric_key(identity, seed_backend, seed_deriver),
+        Mode::Prf => derive_prf_symmetric_key(identity, prf_runner),
     }
 }
 
 fn derive_seed_symmetric_key<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     backend: &B,
     deriver: &D,
 ) -> Result<[u8; 32]>
@@ -156,10 +170,10 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let seed_profile = seed_profile_from_profile(profile)?;
+    let seed_profile = seed_profile_from_profile(identity)?;
     let spec = encrypt_derivation_spec()?;
     let request = SeedOpenRequest {
-        profile: seed_profile,
+        identity: seed_profile,
         auth_source: SeedOpenAuthSource::None,
         output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
             spec,
@@ -173,14 +187,14 @@ where
     to_key_bytes(derived.expose_secret())
 }
 
-fn derive_prf_symmetric_key<R>(profile: &Profile, runner: &R) -> Result<[u8; 32]>
+fn derive_prf_symmetric_key<R>(identity: &Identity, runner: &R) -> Result<[u8; 32]>
 where
     R: CommandRunner,
 {
-    let executor = resolve_prf_executor(profile)?;
+    let executor = resolve_prf_executor(identity)?;
     let spec = encrypt_derivation_spec()?;
-    let request = PrfRequest::new(profile.name.clone(), spec)?;
-    let workspace_root = temporary_workspace_root("encrypt", &profile.name)?;
+    let request = PrfRequest::new(identity.name.clone(), spec)?;
+    let workspace_root = temporary_workspace_root("encrypt", &identity.name)?;
     let plan = plan_tpm_prf_in(request, executor, &workspace_root)?;
     let execution = execute_tpm_prf_plan_with_runner(&plan, runner);
     let _ = std::fs::remove_dir_all(&workspace_root);
@@ -225,9 +239,9 @@ fn aead_decrypt(key: &[u8; 32], envelope: &[u8]) -> Result<Vec<u8>> {
     let nonce = Nonce::from_slice(nonce_bytes);
     let cipher = ChaCha20Poly1305::new(key.into());
 
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| Error::Validation("AEAD decryption failed: invalid ciphertext or key".to_string()))
+    cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        Error::Validation("AEAD decryption failed: invalid ciphertext or key".to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -252,22 +266,26 @@ fn to_key_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
     })
 }
 
-fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
+fn resolve_prf_executor(identity: &Identity) -> Result<TpmPrfExecutor> {
     // Reuse the same resolution logic from derive.rs.
-    let object_dir = profile.storage.state_layout.objects_dir.join(&profile.name);
+    let object_dir = identity
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&identity.name);
 
-    let metadata_parent = profile
+    let metadata_parent = identity
         .metadata
         .get(PRF_PARENT_CONTEXT_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
-    let metadata_public = profile
+        .map(|path| resolve_state_path(identity, path));
+    let metadata_public = identity
         .metadata
         .get(PRF_PUBLIC_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
-    let metadata_private = profile
+        .map(|path| resolve_state_path(identity, path));
+    let metadata_private = identity
         .metadata
         .get(PRF_PRIVATE_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
+        .map(|path| resolve_state_path(identity, path));
 
     if let (Some(parent_context_path), Some(public_path), Some(private_path)) =
         (metadata_parent, metadata_public, metadata_private)
@@ -295,10 +313,10 @@ fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
         }
     }
 
-    if let Some(context_path) = profile
+    if let Some(context_path) = identity
         .metadata
         .get(PRF_CONTEXT_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path))
+        .map(|path| resolve_state_path(identity, path))
     {
         return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
             context_path,
@@ -315,26 +333,26 @@ fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
     }
 
     Err(Error::Unsupported(format!(
-        "profile '{}' resolved to PRF mode but no PRF root material was found for encrypt/decrypt",
-        profile.name
+        "identity '{}' resolved to PRF mode but no PRF root material was found for encrypt/decrypt",
+        identity.name
     )))
 }
 
-fn resolve_state_path(profile: &Profile, value: &str) -> std::path::PathBuf {
+fn resolve_state_path(identity: &Identity, value: &str) -> std::path::PathBuf {
     let path = std::path::PathBuf::from(value);
     if path.is_absolute() {
         path
     } else {
-        profile.storage.state_layout.root_dir.join(path)
+        identity.storage.state_layout.root_dir.join(path)
     }
 }
 
-fn temporary_workspace_root(kind: &str, profile: &str) -> Result<std::path::PathBuf> {
+fn temporary_workspace_root(kind: &str, identity: &str) -> Result<std::path::PathBuf> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::State(format!("system clock error: {e}")))?;
-    let sanitized = profile
+    let sanitized = identity
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>();
@@ -363,10 +381,8 @@ mod tests {
 
     use super::*;
     use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
-    use crate::model::{
-        Algorithm, ModePreference, ModeResolution, StateLayout, UseCase,
-    };
-    use crate::ops::seed::{SeedCreateRequest, SeedMaterial, SeedProfile, SeedOpenAuthSource};
+    use crate::model::{Algorithm, IdentityModeResolution, ModePreference, StateLayout, UseCase};
+    use crate::ops::seed::{SeedCreateRequest, SeedIdentity, SeedMaterial, SeedOpenAuthSource};
 
     // -----------------------------------------------------------------------
     // Fakes
@@ -377,7 +393,9 @@ mod tests {
 
     impl FakeSeedBackend {
         fn new(seed: &[u8]) -> Self {
-            Self { seed: seed.to_vec() }
+            Self {
+                seed: seed.to_vec(),
+            }
         }
     }
 
@@ -387,7 +405,7 @@ mod tests {
         }
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.seed.clone())))
@@ -406,20 +424,21 @@ mod tests {
         }
     }
 
-    fn seed_profile_fixture(root: &std::path::Path) -> Profile {
-        Profile {
-            schema_version: crate::model::PROFILE_SCHEMA_VERSION,
+    fn seed_profile_fixture(root: &std::path::Path) -> Identity {
+        Identity {
+            schema_version: crate::model::IDENTITY_SCHEMA_VERSION,
             name: "enc-seed".to_string(),
             algorithm: Algorithm::Ed25519,
             uses: vec![UseCase::Encrypt, UseCase::Decrypt],
-            mode: ModeResolution {
+            mode: IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed".to_string()],
             },
-            storage: crate::model::ProfileStorage {
+            defaults: crate::model::IdentityDerivationDefaults::default(),
+            storage: crate::model::IdentityStorage {
                 state_layout: StateLayout::new(root.to_path_buf()),
-                profile_path: PathBuf::new(),
+                identity_path: PathBuf::new(),
                 root_material_kind: crate::model::RootMaterialKind::SealedSeed,
             },
             export_policy: crate::model::ExportPolicy::for_mode(Mode::Seed),
@@ -434,13 +453,13 @@ mod tests {
     #[test]
     fn seed_encrypt_decrypt_round_trip() {
         let root = tempfile::tempdir().unwrap();
-        let profile = seed_profile_fixture(root.path());
+        let identity = seed_profile_fixture(root.path());
         let backend = FakeSeedBackend::new(&[0xAA; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
         let plaintext = b"hello, tpm2-derive encrypt!";
-        let enc_result = encrypt(&profile, plaintext, &runner, &backend, &deriver)
+        let enc_result = encrypt(&identity, plaintext, &runner, &backend, &deriver)
             .expect("encrypt should succeed");
 
         assert_eq!(enc_result.mode, Mode::Seed);
@@ -450,7 +469,7 @@ mod tests {
         let ct_hex = enc_result.ciphertext.as_ref().unwrap();
         let ciphertext = hex_decode(ct_hex);
 
-        let dec_result = decrypt(&profile, &ciphertext, &runner, &backend, &deriver)
+        let dec_result = decrypt(&identity, &ciphertext, &runner, &backend, &deriver)
             .expect("decrypt should succeed");
 
         let pt_hex = dec_result.plaintext.as_ref().unwrap();
@@ -461,12 +480,12 @@ mod tests {
     #[test]
     fn decrypt_rejects_truncated_ciphertext() {
         let root = tempfile::tempdir().unwrap();
-        let profile = seed_profile_fixture(root.path());
+        let identity = seed_profile_fixture(root.path());
         let backend = FakeSeedBackend::new(&[0xBB; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let err = decrypt(&profile, &[0u8; 10], &runner, &backend, &deriver)
+        let err = decrypt(&identity, &[0u8; 10], &runner, &backend, &deriver)
             .expect_err("truncated ciphertext should fail");
         assert!(err.to_string().contains("too short"));
     }
@@ -474,18 +493,18 @@ mod tests {
     #[test]
     fn decrypt_rejects_tampered_ciphertext() {
         let root = tempfile::tempdir().unwrap();
-        let profile = seed_profile_fixture(root.path());
+        let identity = seed_profile_fixture(root.path());
         let backend = FakeSeedBackend::new(&[0xCC; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let enc = encrypt(&profile, b"secret", &runner, &backend, &deriver).unwrap();
+        let enc = encrypt(&identity, b"secret", &runner, &backend, &deriver).unwrap();
         let mut ct = hex_decode(enc.ciphertext.as_ref().unwrap());
         // Tamper with last byte (inside tag)
         let last = ct.len() - 1;
         ct[last] ^= 0xFF;
 
-        let err = decrypt(&profile, &ct, &runner, &backend, &deriver)
+        let err = decrypt(&identity, &ct, &runner, &backend, &deriver)
             .expect_err("tampered ciphertext should fail");
         assert!(err.to_string().contains("AEAD decryption failed"));
     }
@@ -493,14 +512,14 @@ mod tests {
     #[test]
     fn native_mode_returns_unsupported() {
         let root = tempfile::tempdir().unwrap();
-        let mut profile = seed_profile_fixture(root.path());
-        profile.mode.resolved = Mode::Native;
+        let mut identity = seed_profile_fixture(root.path());
+        identity.mode.resolved = Mode::Native;
 
         let backend = FakeSeedBackend::new(&[0xDD; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let err = encrypt(&profile, b"data", &runner, &backend, &deriver)
+        let err = encrypt(&identity, b"data", &runner, &backend, &deriver)
             .expect_err("native should be unsupported");
         assert!(err.to_string().contains("not implemented yet"));
     }

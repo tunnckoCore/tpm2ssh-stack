@@ -5,12 +5,12 @@
 
 pub mod derive;
 pub mod encrypt;
+mod enforcement;
 pub mod keygen;
 pub mod native;
 pub mod prf;
 pub mod seed;
 pub mod ssh;
-mod enforcement;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -34,18 +34,17 @@ use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CapabilityReport, ExportArtifact, ExportFormat, ExportKind, ExportRequest,
-    ExportResult, InspectRequest, Mode, ModePreference, ModeResolution, Profile,
-    PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult, SetupRequest, SetupResult,
-    StateLayout, UseCase,
+    ExportResult, Identity, IdentityCreateRequest, IdentityCreateResult,
+    IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode, ModePreference,
+    PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult, StateLayout, UseCase,
 };
 use crate::ops::native::subprocess::{
-    plan_export_public_key, plan_setup, NativeCommandSpec, NativeKeyLocator,
-    NativePersistentHandle, NativePublicKeyExportOptions, NativeSetupArtifacts,
+    NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
+    NativeSetupArtifacts, plan_export_public_key, plan_setup,
 };
 use crate::ops::native::{
-    NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativeKeyRef, NativeKeyUse,
-    NativePrivateKeyPolicy, NativePublicKeyEncoding, NativePublicKeyExportRequest,
-    NativeSetupRequest,
+    NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativeIdentityCreateRequest, NativeKeyRef,
+    NativeKeyUse, NativePrivateKeyPolicy, NativePublicKeyEncoding, NativePublicKeyExportRequest,
 };
 use crate::ops::prf::{
     PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
@@ -58,7 +57,7 @@ use crate::ops::seed::{
     SEED_PRIVATE_BLOB_PATH_METADATA_KEY, SEED_PUBLIC_BLOB_PATH_METADATA_KEY,
     SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY, SEED_STORAGE_KIND_METADATA_KEY, SeedBackend,
     SeedCreateRequest, SeedCreateSource, SeedExportDestination, SeedExportFormat,
-    SeedExportRequest, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest, SeedProfile,
+    SeedExportRequest, SeedIdentity, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
     SeedRecoveryBundleV1, SeedRecoveryImportRequest, SeedSoftwareDeriver, SeedStorageKind,
     SoftwareSeedDerivationRequest, SubprocessSeedBackend,
     export_recovery_bundle as export_seed_recovery_bundle, open_and_derive,
@@ -76,41 +75,44 @@ pub fn inspect(probe: &dyn CapabilityProbe, request: &InspectRequest) -> Capabil
     probe.detect(request.algorithm, &normalize_uses(request.uses.clone()))
 }
 
-pub fn resolve_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> Result<SetupResult> {
-    resolve_profile_with_runner(probe, request, &ProcessCommandRunner)
+pub fn resolve_identity(
+    probe: &dyn CapabilityProbe,
+    request: &IdentityCreateRequest,
+) -> Result<IdentityCreateResult> {
+    resolve_identity_with_runner(probe, request, &ProcessCommandRunner)
 }
 
-fn resolve_profile_with_runner<R>(
+fn resolve_identity_with_runner<R>(
     probe: &dyn CapabilityProbe,
-    request: &SetupRequest,
+    request: &IdentityCreateRequest,
     runner: &R,
-) -> Result<SetupResult>
+) -> Result<IdentityCreateResult>
 where
     R: CommandRunner,
 {
-    let mut profile = build_setup_profile(probe, request)?;
+    let mut identity = build_identity_record(probe, request)?;
 
     let persisted = if request.dry_run {
         false
     } else {
-        let provisioned_dir = match profile.mode.resolved {
+        let provisioned_dir = match identity.mode.resolved {
             Mode::Native => {
-                materialize_native_setup(&mut profile, runner)?;
+                materialize_native_setup(&mut identity, runner)?;
                 None
             }
             Mode::Prf => {
-                let layout = materialize_prf_setup(&mut profile, runner)?;
+                let layout = materialize_prf_setup(&mut identity, runner)?;
                 Some(layout.object_dir)
             }
             Mode::Seed => {
                 let backend =
-                    SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
-                persist_seed_setup_profile(&mut profile, &backend)?;
+                    SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+                persist_seed_identity(&mut identity, &backend)?;
                 None
             }
         };
 
-        if let Err(error) = profile.persist() {
+        if let Err(error) = identity.persist() {
             if let Some(path) = provisioned_dir {
                 let _ = fs::remove_dir_all(path);
             }
@@ -120,42 +122,45 @@ where
         true
     };
 
-    Ok(SetupResult {
-        profile,
+    Ok(IdentityCreateResult {
+        identity,
         dry_run: request.dry_run,
         persisted,
     })
 }
 
 #[cfg(test)]
-fn resolve_profile_with_seed_backend(
+fn resolve_identity_with_seed_backend(
     probe: &dyn CapabilityProbe,
-    request: &SetupRequest,
+    request: &IdentityCreateRequest,
     seed_backend: &dyn SeedBackend,
-) -> Result<SetupResult> {
-    let mut profile = build_setup_profile(probe, request)?;
+) -> Result<IdentityCreateResult> {
+    let mut identity = build_identity_record(probe, request)?;
     let persisted = if request.dry_run {
         false
     } else {
-        persist_seed_setup_profile(&mut profile, seed_backend)?;
-        profile.persist()?;
+        persist_seed_identity(&mut identity, seed_backend)?;
+        identity.persist()?;
         true
     };
 
-    Ok(SetupResult {
-        profile,
+    Ok(IdentityCreateResult {
+        identity,
         dry_run: request.dry_run,
         persisted,
     })
 }
 
-fn build_setup_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> Result<Profile> {
-    validate_profile_name(&request.profile)?;
+fn build_identity_record(
+    probe: &dyn CapabilityProbe,
+    request: &IdentityCreateRequest,
+) -> Result<Identity> {
+    validate_profile_name(&request.identity)?;
 
     let uses = normalize_uses(request.uses.clone());
     if uses.is_empty() {
         return Err(Error::Validation(
-            "at least one --use value is required for setup".to_string(),
+            "at least one --use value is required for identity creation".to_string(),
         ));
     }
 
@@ -177,40 +182,45 @@ fn build_setup_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> R
         report.recommendation_reasons.clone()
     };
 
-    Ok(Profile::new(
-        request.profile.clone(),
+    Ok(Identity::with_defaults(
+        request.identity.clone(),
         request.algorithm,
         uses,
-        ModeResolution {
+        IdentityModeResolution {
             requested: request.requested_mode,
             resolved: resolved_mode,
             reasons,
+        },
+        IdentityDerivationDefaults {
+            org: request.defaults.org.clone(),
+            purpose: request.defaults.purpose.clone(),
+            context: request.defaults.context.clone(),
         },
         StateLayout::from_optional_root(request.state_dir.clone()),
     ))
 }
 
-fn persist_seed_setup_profile(profile: &mut Profile, seed_backend: &dyn SeedBackend) -> Result<()> {
-    let seed_profile = SeedProfile::scaffold(
-        profile.name.clone(),
-        profile.algorithm,
-        profile.uses.clone(),
+fn persist_seed_identity(identity: &mut Identity, seed_backend: &dyn SeedBackend) -> Result<()> {
+    let seed_profile = SeedIdentity::scaffold(
+        identity.name.clone(),
+        identity.algorithm,
+        identity.uses.clone(),
     )?;
 
     seed_backend.seal_seed(&SeedCreateRequest {
-        profile: seed_profile.clone(),
+        identity: seed_profile.clone(),
         source: SeedCreateSource::GenerateRandom {
             bytes: DEFAULT_SETUP_SEED_BYTES,
         },
         overwrite_existing: false,
     })?;
 
-    apply_seed_profile_metadata(profile, &seed_profile);
+    apply_seed_profile_metadata(identity, &seed_profile);
     Ok(())
 }
 
-fn apply_seed_profile_metadata(profile: &mut Profile, seed_profile: &SeedProfile) {
-    let object_dir = profile
+fn apply_seed_profile_metadata(identity: &mut Identity, seed_profile: &SeedIdentity) {
+    let object_dir = identity
         .storage
         .state_layout
         .objects_dir
@@ -218,31 +228,31 @@ fn apply_seed_profile_metadata(profile: &mut Profile, seed_profile: &SeedProfile
     let public_blob = object_dir.join("sealed.pub");
     let private_blob = object_dir.join("sealed.priv");
 
-    profile.metadata.insert(
+    identity.metadata.insert(
         SEED_OBJECT_LABEL_METADATA_KEY.to_string(),
         seed_profile.storage.object_label.clone(),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         SEED_PUBLIC_BLOB_PATH_METADATA_KEY.to_string(),
-        state_relative_metadata_path(profile, &public_blob),
+        state_relative_metadata_path(identity, &public_blob),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         SEED_PRIVATE_BLOB_PATH_METADATA_KEY.to_string(),
-        state_relative_metadata_path(profile, &private_blob),
+        state_relative_metadata_path(identity, &private_blob),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         SEED_STORAGE_KIND_METADATA_KEY.to_string(),
         seed_storage_kind_name(seed_profile.storage.kind).to_string(),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         SEED_DERIVATION_KDF_METADATA_KEY.to_string(),
         seed_kdf_name(seed_profile.derivation.kdf).to_string(),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY.to_string(),
         seed_profile.derivation.domain_label.clone(),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY.to_string(),
         seed_profile
             .derivation
@@ -251,8 +261,8 @@ fn apply_seed_profile_metadata(profile: &mut Profile, seed_profile: &SeedProfile
     );
 }
 
-fn state_relative_metadata_path(profile: &Profile, path: &Path) -> String {
-    path.strip_prefix(&profile.storage.state_layout.root_dir)
+fn state_relative_metadata_path(identity: &Identity, path: &Path) -> String {
+    path.strip_prefix(&identity.storage.state_layout.root_dir)
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
@@ -270,9 +280,9 @@ fn seed_kdf_name(kdf: crate::ops::seed::SeedKdf) -> &'static str {
     }
 }
 
-pub fn load_profile(profile: &str, state_dir: Option<PathBuf>) -> Result<Profile> {
-    validate_profile_name(profile)?;
-    Profile::load_named(profile, state_dir)
+pub fn load_identity(identity: &str, state_dir: Option<PathBuf>) -> Result<Identity> {
+    validate_profile_name(identity)?;
+    Identity::load_named(identity, state_dir)
 }
 
 pub fn import_recovery_bundle(request: &RecoveryImportRequest) -> Result<RecoveryImportResult> {
@@ -301,9 +311,9 @@ where
     B: SeedBackend,
 {
     let target_profile = request
-        .profile
+        .identity
         .clone()
-        .unwrap_or_else(|| bundle.profile.name.clone());
+        .unwrap_or_else(|| bundle.identity.name.clone());
     validate_profile_name(&target_profile)?;
     ensure_recovery_import_target_available(
         &target_profile,
@@ -319,26 +329,26 @@ where
             overwrite_existing: request.overwrite_existing,
         },
     )?;
-    let mut profile = Profile::new(
-        restored.profile.profile.clone(),
-        restored.profile.algorithm,
-        restored.profile.uses.clone(),
-        ModeResolution {
+    let mut identity = Identity::new(
+        restored.identity.identity.clone(),
+        restored.identity.algorithm,
+        restored.identity.uses.clone(),
+        IdentityModeResolution {
             requested: ModePreference::Seed,
             resolved: Mode::Seed,
             reasons: vec![format!(
-                "restored from seed recovery bundle for profile '{}'",
-                restored.restored_from_profile
+                "restored from seed recovery bundle for identity '{}'",
+                restored.restored_from_identity
             )],
         },
         state_layout,
     );
-    apply_seed_profile_metadata(&mut profile, &restored.profile);
-    profile.persist()?;
+    apply_seed_profile_metadata(&mut identity, &restored.identity);
+    identity.persist()?;
 
     Ok(RecoveryImportResult {
-        profile,
-        restored_from_profile: restored.restored_from_profile,
+        identity,
+        restored_from_identity: restored.restored_from_identity,
         seed_bytes: restored.seed_bytes,
     })
 }
@@ -370,11 +380,11 @@ fn ensure_recovery_import_target_available(
         return Ok(());
     }
 
-    let profile_path = state_layout.profile_path(target_profile);
+    let identity_path = state_layout.identity_path(target_profile);
     let object_dir = state_layout.objects_dir.join(target_profile);
-    if profile_path.exists() || object_dir.exists() {
+    if identity_path.exists() || object_dir.exists() {
         return Err(Error::State(format!(
-            "recovery import target '{}' already exists; pass --overwrite-existing to replace the persisted profile and sealed seed state",
+            "recovery import target '{}' already exists; pass --overwrite-existing to replace the persisted identity and sealed seed state",
             target_profile
         )));
     }
@@ -382,34 +392,36 @@ fn ensure_recovery_import_target_available(
     Ok(())
 }
 
-fn apply_prf_root_metadata(profile: &mut Profile, layout: &PrfRootLayout) -> Result<()> {
-    profile.metadata.insert(
+fn apply_prf_root_metadata(identity: &mut Identity, layout: &PrfRootLayout) -> Result<()> {
+    identity.metadata.insert(
         PRF_PARENT_CONTEXT_PATH_METADATA_KEY.to_string(),
-        persistable_state_path(&profile.storage.state_layout, &layout.parent_context_path)?,
+        persistable_state_path(&identity.storage.state_layout, &layout.parent_context_path)?,
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         PRF_PUBLIC_PATH_METADATA_KEY.to_string(),
-        persistable_state_path(&profile.storage.state_layout, &layout.public_path)?,
+        persistable_state_path(&identity.storage.state_layout, &layout.public_path)?,
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         PRF_PRIVATE_PATH_METADATA_KEY.to_string(),
-        persistable_state_path(&profile.storage.state_layout, &layout.private_path)?,
+        persistable_state_path(&identity.storage.state_layout, &layout.private_path)?,
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
-        persistable_state_path(&profile.storage.state_layout, &layout.loaded_context_path)?,
+        persistable_state_path(&identity.storage.state_layout, &layout.loaded_context_path)?,
     );
     Ok(())
 }
 
-fn materialize_prf_setup<R>(profile: &mut Profile, runner: &R) -> Result<PrfRootLayout>
+fn materialize_prf_setup<R>(identity: &mut Identity, runner: &R) -> Result<PrfRootLayout>
 where
     R: CommandRunner,
 {
-    let backend =
-        SubprocessPrfBackend::with_runner(profile.storage.state_layout.objects_dir.clone(), runner);
-    let layout = backend.provision_root(&profile.name)?;
-    apply_prf_root_metadata(profile, &layout)?;
+    let backend = SubprocessPrfBackend::with_runner(
+        identity.storage.state_layout.objects_dir.clone(),
+        runner,
+    );
+    let layout = backend.provision_root(&identity.name)?;
+    apply_prf_root_metadata(identity, &layout)?;
     Ok(layout)
 }
 
@@ -429,7 +441,7 @@ fn persistable_state_path(state_layout: &StateLayout, path: &Path) -> Result<Str
 }
 
 pub fn export(request: &ExportRequest) -> Result<ExportResult> {
-    validate_profile_name(&request.profile)?;
+    validate_profile_name(&request.identity)?;
 
     if request.kind != ExportKind::PublicKey && request.public_key_format.is_some() {
         return Err(Error::Validation(
@@ -437,56 +449,56 @@ pub fn export(request: &ExportRequest) -> Result<ExportResult> {
         ));
     }
 
-    let profile = load_profile(&request.profile, request.state_dir.clone())?;
+    let identity = load_identity(&request.identity, request.state_dir.clone())?;
     match request.kind {
         ExportKind::PublicKey => export_public_key(
-            &profile,
+            &identity,
             request.output.as_deref(),
             request.public_key_format,
         ),
-        ExportKind::RecoveryBundle => export_recovery_bundle(&profile, request),
+        ExportKind::RecoveryBundle => export_recovery_bundle(&identity, request),
     }
 }
 
 fn export_public_key(
-    profile: &Profile,
+    identity: &Identity,
     requested_output: Option<&Path>,
     requested_format: Option<PublicKeyExportFormat>,
 ) -> Result<ExportResult> {
     let format = requested_format.unwrap_or(PublicKeyExportFormat::SpkiDer);
-    match profile.mode.resolved {
+    match identity.mode.resolved {
         Mode::Prf => Err(Error::PolicyRefusal(format!(
-            "profile '{}' resolved to PRF mode; PRF roots do not expose a standalone public key",
-            profile.name
+            "identity '{}' resolved to PRF mode; PRF roots do not expose a standalone public key",
+            identity.name
         ))),
         Mode::Native => {
-            if !profile.export_policy.public_key_export {
+            if !identity.export_policy.public_key_export {
                 return Err(Error::PolicyRefusal(format!(
-                    "profile '{}' resolved to {:?} mode, which does not allow public-key export",
-                    profile.name, profile.mode.resolved
+                    "identity '{}' resolved to {:?} mode, which does not allow public-key export",
+                    identity.name, identity.mode.resolved
                 )));
             }
 
             export_native_public_key_with_runner(
-                profile,
+                identity,
                 requested_output,
                 format,
                 &ProcessCommandRunner,
             )
         }
         Mode::Seed => {
-            if !profile.export_policy.public_key_export {
+            if !identity.export_policy.public_key_export {
                 return Err(Error::PolicyRefusal(format!(
-                    "profile '{}' resolved to {:?} mode, which does not allow public-key export",
-                    profile.name, profile.mode.resolved
+                    "identity '{}' resolved to {:?} mode, which does not allow public-key export",
+                    identity.name, identity.mode.resolved
                 )));
             }
 
             let backend =
-                SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+                SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
             let deriver = HkdfSha256SeedDeriver;
             export_seed_public_key_with_backend(
-                profile,
+                identity,
                 requested_output,
                 format,
                 &backend,
@@ -496,39 +508,39 @@ fn export_public_key(
     }
 }
 
-fn export_recovery_bundle(profile: &Profile, request: &ExportRequest) -> Result<ExportResult> {
-    let backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
-    export_recovery_bundle_with_backend(profile, request, &backend)
+fn export_recovery_bundle(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
+    let backend = SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    export_recovery_bundle_with_backend(identity, request, &backend)
 }
 
 fn export_recovery_bundle_with_backend<B>(
-    profile: &Profile,
+    identity: &Identity,
     request: &ExportRequest,
     backend: &B,
 ) -> Result<ExportResult>
 where
     B: crate::ops::seed::SeedBackend,
 {
-    if !profile.export_policy.recovery_export {
+    if !identity.export_policy.recovery_export {
         return Err(Error::PolicyRefusal(format!(
-            "profile '{}' resolved to {:?} mode, which does not allow recovery-bundle export",
-            profile.name, profile.mode.resolved
+            "identity '{}' resolved to {:?} mode, which does not allow recovery-bundle export",
+            identity.name, identity.mode.resolved
         )));
     }
 
-    if profile.mode.resolved != Mode::Seed {
+    if identity.mode.resolved != Mode::Seed {
         return Err(Error::PolicyRefusal(format!(
-            "profile '{}' resolved to {:?} mode; recovery-bundle export is only available for seed-mode profiles",
-            profile.name, profile.mode.resolved
+            "identity '{}' resolved to {:?} mode; recovery-bundle export is only available for seed-mode identities",
+            identity.name, identity.mode.resolved
         )));
     }
 
     let destination = resolve_recovery_bundle_output_path(request.output.as_deref())?;
-    let seed_profile = seed_profile_from_profile(profile)?;
+    let seed_profile = seed_profile_from_profile(identity)?;
     let bundle = export_seed_recovery_bundle(
         backend,
         &SeedExportRequest {
-            profile: seed_profile,
+            identity: seed_profile,
             auth_source: SeedOpenAuthSource::None,
             destination: SeedExportDestination::ExplicitPath(destination.display().to_string()),
             format: SeedExportFormat::RecoveryBundleV1,
@@ -541,8 +553,8 @@ where
     let bytes_written = write_recovery_bundle_output(&destination, &bundle)?;
 
     Ok(ExportResult {
-        profile: profile.name.clone(),
-        mode: profile.mode.resolved,
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
         kind: ExportKind::RecoveryBundle,
         artifact: ExportArtifact {
             format: ExportFormat::RecoveryBundleJson,
@@ -553,7 +565,7 @@ where
 }
 
 fn export_seed_public_key_with_backend<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     requested_output: Option<&Path>,
     format: PublicKeyExportFormat,
     backend: &B,
@@ -563,15 +575,15 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let seed_profile = seed_profile_from_profile(profile)?;
+    let seed_profile = seed_profile_from_profile(identity)?;
     let derived = open_and_derive(
         backend,
         deriver,
         &SeedOpenRequest {
-            profile: seed_profile,
+            identity: seed_profile,
             auth_source: SeedOpenAuthSource::None,
             output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
-                spec: seed_public_key_derivation_spec(profile)?,
+                spec: seed_public_key_derivation_spec(identity)?,
                 output_bytes: 32,
             }),
             require_fresh_unseal: true,
@@ -579,14 +591,14 @@ where
         },
     )?;
 
-    let public_key_der = seed_public_key_spki_der(profile, derived.expose_secret())?;
-    let rendered_public_key = render_seed_public_key_export(profile, format, &public_key_der)?;
-    let destination = resolve_public_key_output_path(profile, requested_output, format)?;
+    let public_key_der = seed_public_key_spki_der(identity, derived.expose_secret())?;
+    let rendered_public_key = render_seed_public_key_export(identity, format, &public_key_der)?;
+    let destination = resolve_public_key_output_path(identity, requested_output, format)?;
     write_public_key_output(&destination, &rendered_public_key)?;
 
     Ok(ExportResult {
-        profile: profile.name.clone(),
-        mode: profile.mode.resolved,
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
         kind: ExportKind::PublicKey,
         artifact: ExportArtifact {
             format: format.into(),
@@ -596,13 +608,13 @@ where
     })
 }
 
-fn seed_public_key_derivation_spec(profile: &Profile) -> Result<DerivationSpec> {
-    match profile.algorithm {
+fn seed_public_key_derivation_spec(identity: &Identity) -> Result<DerivationSpec> {
+    match identity.algorithm {
         Algorithm::Ed25519
-            if profile
+            if identity
                 .uses
                 .iter()
-                .any(|use_case| matches!(use_case, UseCase::SshAgent)) =>
+                .any(|use_case| matches!(use_case, UseCase::Ssh)) =>
         {
             crate::ops::ssh::ssh_ed25519_derivation_spec()
         }
@@ -626,16 +638,16 @@ fn seed_software_child_key_spec(
     )?))
 }
 
-fn seed_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
-    match profile.algorithm {
-        Algorithm::Ed25519 => seed_ed25519_public_key_spki_der(profile, derived_secret),
-        Algorithm::Secp256k1 => seed_secp256k1_public_key_spki_der(profile, derived_secret),
-        Algorithm::P256 => seed_p256_public_key_spki_der(profile, derived_secret),
+fn seed_public_key_spki_der(identity: &Identity, derived_secret: &[u8]) -> Result<Vec<u8>> {
+    match identity.algorithm {
+        Algorithm::Ed25519 => seed_ed25519_public_key_spki_der(identity, derived_secret),
+        Algorithm::Secp256k1 => seed_secp256k1_public_key_spki_der(identity, derived_secret),
+        Algorithm::P256 => seed_p256_public_key_spki_der(identity, derived_secret),
     }
 }
 
-fn seed_ed25519_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
-    let seed_bytes = seed_secret_bytes(profile, derived_secret)?;
+fn seed_ed25519_public_key_spki_der(identity: &Identity, derived_secret: &[u8]) -> Result<Vec<u8>> {
+    let seed_bytes = seed_secret_bytes(identity, derived_secret)?;
     let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
     signing_key
         .verifying_key()
@@ -643,20 +655,23 @@ fn seed_ed25519_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) ->
         .map(|document| document.as_bytes().to_vec())
         .map_err(|error| {
             Error::Internal(format!(
-                "failed to encode ed25519 seed public key for profile '{}': {error}",
-                profile.name
+                "failed to encode ed25519 seed public key for identity '{}': {error}",
+                identity.name
             ))
         })
 }
 
-fn seed_secp256k1_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
-    let scalar_bytes = seed_valid_ec_scalar_bytes(profile, derived_secret, |candidate| {
+fn seed_secp256k1_public_key_spki_der(
+    identity: &Identity,
+    derived_secret: &[u8],
+) -> Result<Vec<u8>> {
+    let scalar_bytes = seed_valid_ec_scalar_bytes(identity, derived_secret, |candidate| {
         k256::SecretKey::from_slice(candidate).is_ok()
     })?;
     let secret_key = k256::SecretKey::from_slice(&scalar_bytes).map_err(|error| {
         Error::Internal(format!(
-            "failed to materialize secp256k1 seed secret key for profile '{}': {error}",
-            profile.name
+            "failed to materialize secp256k1 seed secret key for identity '{}': {error}",
+            identity.name
         ))
     })?;
 
@@ -666,20 +681,20 @@ fn seed_secp256k1_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) 
         .map(|document| document.as_bytes().to_vec())
         .map_err(|error| {
             Error::Internal(format!(
-                "failed to encode secp256k1 seed public key for profile '{}': {error}",
-                profile.name
+                "failed to encode secp256k1 seed public key for identity '{}': {error}",
+                identity.name
             ))
         })
 }
 
-fn seed_p256_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Result<Vec<u8>> {
-    let scalar_bytes = seed_valid_ec_scalar_bytes(profile, derived_secret, |candidate| {
+fn seed_p256_public_key_spki_der(identity: &Identity, derived_secret: &[u8]) -> Result<Vec<u8>> {
+    let scalar_bytes = seed_valid_ec_scalar_bytes(identity, derived_secret, |candidate| {
         p256::SecretKey::from_slice(candidate).is_ok()
     })?;
     let secret_key = p256::SecretKey::from_slice(&scalar_bytes).map_err(|error| {
         Error::Internal(format!(
-            "failed to materialize p256 seed secret key for profile '{}': {error}",
-            profile.name
+            "failed to materialize p256 seed secret key for identity '{}': {error}",
+            identity.name
         ))
     })?;
 
@@ -689,45 +704,45 @@ fn seed_p256_public_key_spki_der(profile: &Profile, derived_secret: &[u8]) -> Re
         .map(|document| document.as_bytes().to_vec())
         .map_err(|error| {
             Error::Internal(format!(
-                "failed to encode p256 seed public key for profile '{}': {error}",
-                profile.name
+                "failed to encode p256 seed public key for identity '{}': {error}",
+                identity.name
             ))
         })
 }
 
-fn seed_secret_bytes(profile: &Profile, derived_secret: &[u8]) -> Result<[u8; 32]> {
+fn seed_secret_bytes(identity: &Identity, derived_secret: &[u8]) -> Result<[u8; 32]> {
     derived_secret.try_into().map_err(|_| {
         Error::Internal(format!(
-            "seed public-key derivation for profile '{}' unexpectedly produced {} bytes instead of 32",
-            profile.name,
+            "seed public-key derivation for identity '{}' unexpectedly produced {} bytes instead of 32",
+            identity.name,
             derived_secret.len()
         ))
     })
 }
 
 fn seed_valid_ec_scalar_bytes<F>(
-    profile: &Profile,
+    identity: &Identity,
     derived_secret: &[u8],
     is_valid: F,
 ) -> Result<[u8; 32]>
 where
     F: Fn(&[u8]) -> bool,
 {
-    let seed_bytes = seed_secret_bytes(profile, derived_secret)?;
+    let seed_bytes = seed_secret_bytes(identity, derived_secret)?;
     if is_valid(&seed_bytes) {
         return Ok(seed_bytes);
     }
 
     for counter in 1..=SEED_SCALAR_RETRY_LIMIT {
-        let candidate = seed_scalar_retry_bytes(&seed_bytes, profile.algorithm, counter);
+        let candidate = seed_scalar_retry_bytes(&seed_bytes, identity.algorithm, counter);
         if is_valid(&candidate) {
             return Ok(candidate);
         }
     }
 
     Err(Error::Internal(format!(
-        "seed public-key derivation could not produce a valid {:?} scalar for profile '{}' after {} retries",
-        profile.algorithm, profile.name, SEED_SCALAR_RETRY_LIMIT
+        "seed public-key derivation could not produce a valid {:?} scalar for identity '{}' after {} retries",
+        identity.algorithm, identity.name, SEED_SCALAR_RETRY_LIMIT
     )))
 }
 
@@ -744,7 +759,7 @@ fn seed_scalar_retry_bytes(seed_bytes: &[u8; 32], algorithm: Algorithm, counter:
     hasher.finalize().into()
 }
 
-/// Standalone EC scalar validation that doesn't require a `Profile` reference.
+/// Standalone EC scalar validation that doesn't require a `Identity` reference.
 /// Used by the CLI seed sign/verify paths.
 pub fn seed_valid_ec_scalar_bytes_standalone(
     derived_secret: &[u8],
@@ -758,8 +773,12 @@ pub fn seed_valid_ec_scalar_bytes_standalone(
     })?;
 
     let is_valid: Box<dyn Fn(&[u8]) -> bool> = match algorithm {
-        Algorithm::P256 => Box::new(|candidate: &[u8]| p256::SecretKey::from_slice(candidate).is_ok()),
-        Algorithm::Secp256k1 => Box::new(|candidate: &[u8]| k256::SecretKey::from_slice(candidate).is_ok()),
+        Algorithm::P256 => {
+            Box::new(|candidate: &[u8]| p256::SecretKey::from_slice(candidate).is_ok())
+        }
+        Algorithm::Secp256k1 => {
+            Box::new(|candidate: &[u8]| k256::SecretKey::from_slice(candidate).is_ok())
+        }
         Algorithm::Ed25519 => return Ok(seed_bytes),
     };
 
@@ -779,25 +798,25 @@ pub fn seed_valid_ec_scalar_bytes_standalone(
     )))
 }
 
-fn materialize_native_setup<R>(profile: &mut Profile, runner: &R) -> Result<()>
+fn materialize_native_setup<R>(identity: &mut Identity, runner: &R) -> Result<()>
 where
     R: CommandRunner,
 {
-    if profile.algorithm != Algorithm::P256 {
+    if identity.algorithm != Algorithm::P256 {
         return Err(Error::Unsupported(format!(
-            "native setup is currently wired only for P-256 profiles, got {:?}",
-            profile.algorithm
+            "native setup is currently wired only for P-256 identities, got {:?}",
+            identity.algorithm
         )));
     }
 
-    let allowed_uses = native_key_uses(profile)?;
-    let key_id = native_key_id(profile);
-    let native_dir = native_state_dir(profile);
+    let allowed_uses = native_key_uses(identity)?;
+    let key_id = native_key_id(identity);
+    let native_dir = native_state_dir(identity);
     let scratch_dir = native_dir.join("setup-work");
-    let handle_path = native_handle_path(profile);
+    let handle_path = native_handle_path(identity);
     let persistent_handle = allocate_native_persistent_handle(runner)?;
 
-    profile.storage.state_layout.ensure_dirs()?;
+    identity.storage.state_layout.ensure_dirs()?;
     fs::create_dir_all(&native_dir).map_err(|error| {
         Error::State(format!(
             "failed to create native setup directory '{}': {error}",
@@ -815,9 +834,9 @@ where
         ))
     })?;
 
-    let setup_request = NativeSetupRequest {
-        profile: profile.name.clone(),
-        key_label: Some(profile.name.clone()),
+    let setup_request = NativeIdentityCreateRequest {
+        identity: identity.name.clone(),
+        key_label: Some(identity.name.clone()),
         algorithm: NativeAlgorithm::P256,
         curve: NativeCurve::NistP256,
         allowed_uses,
@@ -855,12 +874,12 @@ where
         )));
     }
 
-    persist_native_metadata(profile, &key_id, &persistent_handle, &handle_path);
+    persist_native_metadata(identity, &key_id, &persistent_handle, &handle_path);
     Ok(())
 }
 
 fn export_native_public_key_with_runner<R>(
-    profile: &Profile,
+    identity: &Identity,
     requested_output: Option<&Path>,
     format: PublicKeyExportFormat,
     runner: &R,
@@ -868,23 +887,23 @@ fn export_native_public_key_with_runner<R>(
 where
     R: CommandRunner,
 {
-    if profile.algorithm != Algorithm::P256 {
+    if identity.algorithm != Algorithm::P256 {
         return Err(Error::Unsupported(format!(
-            "native public-key export is currently wired only for P-256 profiles, got {:?}",
-            profile.algorithm
+            "native public-key export is currently wired only for P-256 identities, got {:?}",
+            identity.algorithm
         )));
     }
 
-    profile.storage.state_layout.ensure_dirs()?;
+    identity.storage.state_layout.ensure_dirs()?;
 
-    let locator = resolve_native_key_locator(profile)?;
+    let locator = resolve_native_key_locator(identity)?;
     let tempdir = TempfileBuilder::new()
         .prefix("native-public-key-export-")
-        .tempdir_in(&profile.storage.state_layout.exports_dir)
+        .tempdir_in(&identity.storage.state_layout.exports_dir)
         .map_err(|error| {
             Error::State(format!(
                 "failed to create native export workspace in '{}': {error}",
-                profile.storage.state_layout.exports_dir.display()
+                identity.storage.state_layout.exports_dir.display()
             ))
         })?;
 
@@ -892,15 +911,15 @@ where
     let plan = plan_export_public_key(
         &NativePublicKeyExportRequest {
             key: NativeKeyRef {
-                profile: profile.name.clone(),
-                key_id: native_key_id(profile),
+                identity: identity.name.clone(),
+                key_id: native_key_id(identity),
             },
             encodings: vec![requested_encoding],
         },
         &NativePublicKeyExportOptions {
             locator,
             output_dir: tempdir.path().to_path_buf(),
-            file_stem: profile.name.clone(),
+            file_stem: identity.name.clone(),
         },
     )?;
 
@@ -925,14 +944,14 @@ where
             exported.path.display()
         ))
     })?;
-    let rendered_public_key = render_native_public_key_export(profile, format, &exported_bytes)?;
+    let rendered_public_key = render_native_public_key_export(identity, format, &exported_bytes)?;
 
-    let destination = resolve_public_key_output_path(profile, requested_output, format)?;
+    let destination = resolve_public_key_output_path(identity, requested_output, format)?;
     write_public_key_output(&destination, &rendered_public_key)?;
 
     Ok(ExportResult {
-        profile: profile.name.clone(),
-        mode: profile.mode.resolved,
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
         kind: ExportKind::PublicKey,
         artifact: ExportArtifact {
             format: format.into(),
@@ -946,9 +965,9 @@ const TPM_PERSISTENT_HANDLE_MIN: u32 = 0x8100_0000;
 const TPM_PERSISTENT_HANDLE_MAX: u32 = 0x81ff_ffff;
 const TPM_PERSISTENT_HANDLE_START: u32 = 0x8101_0000;
 
-pub(crate) fn resolve_native_key_locator(profile: &Profile) -> Result<NativeKeyLocator> {
+pub(crate) fn resolve_native_key_locator(identity: &Identity) -> Result<NativeKeyLocator> {
     if let Some(path) = metadata_path(
-        profile,
+        identity,
         &[
             "native.serialized_handle_path",
             "native.serialized-handle-path",
@@ -958,22 +977,22 @@ pub(crate) fn resolve_native_key_locator(profile: &Profile) -> Result<NativeKeyL
     }
 
     if let Some(handle) = metadata_value(
-        profile,
+        identity,
         &["native.persistent_handle", "native.persistent-handle"],
     ) {
         return Ok(NativeKeyLocator::PersistentHandle { handle });
     }
 
-    for path in native_handle_path_candidates(profile) {
+    for path in native_handle_path_candidates(identity) {
         if path.is_file() {
             return Ok(NativeKeyLocator::SerializedHandle { path });
         }
     }
 
     Err(Error::State(format!(
-        "profile '{}' resolved to native mode but no serialized handle state was found; checked {}",
-        profile.name,
-        native_handle_path_candidates(profile)
+        "identity '{}' resolved to native mode but no serialized handle state was found; checked {}",
+        identity.name,
+        native_handle_path_candidates(identity)
             .into_iter()
             .map(|path| format!("'{}'", path.display()))
             .collect::<Vec<_>>()
@@ -981,16 +1000,16 @@ pub(crate) fn resolve_native_key_locator(profile: &Profile) -> Result<NativeKeyL
     )))
 }
 
-fn native_key_uses(profile: &Profile) -> Result<Vec<NativeKeyUse>> {
-    let uses: Vec<_> = profile
+fn native_key_uses(identity: &Identity) -> Result<Vec<NativeKeyUse>> {
+    let uses: Vec<_> = identity
         .uses
         .iter()
         .map(|use_case| match use_case {
             UseCase::Sign => Ok(NativeKeyUse::Sign),
             UseCase::Verify => Ok(NativeKeyUse::Verify),
             unsupported => Err(Error::Unsupported(format!(
-                "native setup is currently wired only for sign/verify uses, but profile '{}' requested {:?}",
-                profile.name, unsupported
+                "native setup is currently wired only for sign/verify uses, but identity '{}' requested {:?}",
+                identity.name, unsupported
             ))),
         })
         .collect::<Result<_>>()?;
@@ -1081,26 +1100,26 @@ fn parse_persistent_handle_token(token: &str) -> Result<Option<String>> {
 }
 
 fn persist_native_metadata(
-    profile: &mut Profile,
+    identity: &mut Identity,
     key_id: &str,
     persistent_handle: &str,
     handle_path: &Path,
 ) {
-    profile
+    identity
         .metadata
         .insert("native.backend".to_string(), "subprocess".to_string());
-    profile
+    identity
         .metadata
         .insert("native.key_id".to_string(), key_id.to_string());
-    profile.metadata.insert(
+    identity.metadata.insert(
         "native.locator_kind".to_string(),
         "serialized-handle".to_string(),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         "native.serialized_handle_path".to_string(),
-        path_for_metadata(&profile.storage.state_layout.root_dir, handle_path),
+        path_for_metadata(&identity.storage.state_layout.root_dir, handle_path),
     );
-    profile.metadata.insert(
+    identity.metadata.insert(
         "native.persistent_handle".to_string(),
         persistent_handle.to_string(),
     );
@@ -1113,54 +1132,54 @@ fn path_for_metadata(root_dir: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn native_state_dir(profile: &Profile) -> PathBuf {
-    profile
+fn native_state_dir(identity: &Identity) -> PathBuf {
+    identity
         .storage
         .state_layout
         .objects_dir
-        .join(&profile.name)
+        .join(&identity.name)
         .join("native")
 }
 
-fn native_handle_path(profile: &Profile) -> PathBuf {
-    native_state_dir(profile).join(format!("{}.handle", native_key_id(profile)))
+fn native_handle_path(identity: &Identity) -> PathBuf {
+    native_state_dir(identity).join(format!("{}.handle", native_key_id(identity)))
 }
 
-pub(crate) fn metadata_path(profile: &Profile, keys: &[&str]) -> Option<PathBuf> {
-    let value = metadata_value(profile, keys)?;
+pub(crate) fn metadata_path(identity: &Identity, keys: &[&str]) -> Option<PathBuf> {
+    let value = metadata_value(identity, keys)?;
     let path = PathBuf::from(value);
     if path.is_absolute() {
         Some(path)
     } else {
-        Some(profile.storage.state_layout.root_dir.join(path))
+        Some(identity.storage.state_layout.root_dir.join(path))
     }
 }
 
-pub(crate) fn metadata_value(profile: &Profile, keys: &[&str]) -> Option<String> {
+pub(crate) fn metadata_value(identity: &Identity, keys: &[&str]) -> Option<String> {
     keys.iter()
-        .find_map(|key| profile.metadata.get(*key).cloned())
+        .find_map(|key| identity.metadata.get(*key).cloned())
 }
 
-pub(crate) fn native_handle_path_candidates(profile: &Profile) -> Vec<PathBuf> {
-    let objects_dir = &profile.storage.state_layout.objects_dir;
+pub(crate) fn native_handle_path_candidates(identity: &Identity) -> Vec<PathBuf> {
+    let objects_dir = &identity.storage.state_layout.objects_dir;
     vec![
-        native_handle_path(profile),
-        objects_dir.join(format!("{}.handle", profile.name)),
+        native_handle_path(identity),
+        objects_dir.join(format!("{}.handle", identity.name)),
         objects_dir
-            .join(&profile.name)
-            .join(format!("{}.handle", profile.name)),
-        objects_dir.join(&profile.name).join("key.handle"),
-        objects_dir.join(&profile.name).join("persistent.handle"),
+            .join(&identity.name)
+            .join(format!("{}.handle", identity.name)),
+        objects_dir.join(&identity.name).join("key.handle"),
+        objects_dir.join(&identity.name).join("persistent.handle"),
     ]
 }
 
-pub(crate) fn native_key_id(profile: &Profile) -> String {
-    metadata_value(profile, &["native.key_id", "native.key-id"])
-        .unwrap_or_else(|| format!("{}-signing-key", profile.name))
+pub(crate) fn native_key_id(identity: &Identity) -> String {
+    metadata_value(identity, &["native.key_id", "native.key-id"])
+        .unwrap_or_else(|| format!("{}-signing-key", identity.name))
 }
 
 fn resolve_public_key_output_path(
-    profile: &Profile,
+    identity: &Identity,
     requested_output: Option<&Path>,
     format: PublicKeyExportFormat,
 ) -> Result<PathBuf> {
@@ -1170,9 +1189,9 @@ fn resolve_public_key_output_path(
             path.display()
         ))),
         Some(path) => Ok(path.to_path_buf()),
-        None => Ok(profile.storage.state_layout.exports_dir.join(format!(
+        None => Ok(identity.storage.state_layout.exports_dir.join(format!(
             "{}.{}",
-            profile.name,
+            identity.name,
             public_key_export_default_suffix(format)
         ))),
     }
@@ -1189,7 +1208,7 @@ fn native_public_key_encoding(format: PublicKeyExportFormat) -> NativePublicKeyE
 }
 
 fn render_native_public_key_export(
-    profile: &Profile,
+    identity: &Identity,
     format: PublicKeyExportFormat,
     exported_bytes: &[u8],
 ) -> Result<Vec<u8>> {
@@ -1199,13 +1218,13 @@ fn render_native_public_key_export(
         }
         PublicKeyExportFormat::SpkiHex => Ok(hex_encode(exported_bytes).into_bytes()),
         PublicKeyExportFormat::Openssh => {
-            render_openssh_public_key(profile, exported_bytes).map(String::into_bytes)
+            render_openssh_public_key(identity, exported_bytes).map(String::into_bytes)
         }
     }
 }
 
 fn render_seed_public_key_export(
-    profile: &Profile,
+    identity: &Identity,
     format: PublicKeyExportFormat,
     spki_der: &[u8],
 ) -> Result<Vec<u8>> {
@@ -1213,11 +1232,13 @@ fn render_seed_public_key_export(
         PublicKeyExportFormat::SpkiDer => Ok(spki_der.to_vec()),
         PublicKeyExportFormat::SpkiPem => Ok(spki_der_to_pem(spki_der).into_bytes()),
         PublicKeyExportFormat::SpkiHex => Ok(hex_encode(spki_der).into_bytes()),
-        PublicKeyExportFormat::Openssh => match profile.algorithm {
-            Algorithm::P256 => render_openssh_public_key(profile, spki_der).map(String::into_bytes),
+        PublicKeyExportFormat::Openssh => match identity.algorithm {
+            Algorithm::P256 => {
+                render_openssh_public_key(identity, spki_der).map(String::into_bytes)
+            }
             Algorithm::Ed25519 | Algorithm::Secp256k1 => Err(Error::Unsupported(format!(
-                "OpenSSH public-key export is not wired for seed {:?} profiles yet",
-                profile.algorithm
+                "OpenSSH public-key export is not wired for seed {:?} identities yet",
+                identity.algorithm
             ))),
         },
     }
@@ -1235,8 +1256,7 @@ fn spki_der_to_pem(spki_der: &[u8]) -> String {
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
 
     for chunk in bytes.chunks(3) {
@@ -1262,22 +1282,22 @@ fn base64_encode(bytes: &[u8]) -> String {
     output
 }
 
-fn render_openssh_public_key(profile: &Profile, spki_der: &[u8]) -> Result<String> {
+fn render_openssh_public_key(identity: &Identity, spki_der: &[u8]) -> Result<String> {
     let sec1 = crate::ops::native::subprocess::extract_p256_sec1_from_spki_der(spki_der)?;
     let key_data = SshKeyData::Ecdsa(SshEcdsaPublicKey::from_sec1_bytes(&sec1).map_err(
         |error| {
             Error::State(format!(
-                "failed to convert exported SPKI DER into an OpenSSH ECDSA public key for profile '{}': {error}",
-                profile.name
+                "failed to convert exported SPKI DER into an OpenSSH ECDSA public key for identity '{}': {error}",
+                identity.name
             ))
         },
     )?);
-    let public_key = SshPublicKey::new(key_data, profile.name.clone());
+    let public_key = SshPublicKey::new(key_data, identity.name.clone());
 
     public_key.to_openssh().map_err(|error| {
         Error::State(format!(
-            "failed to render OpenSSH public key for profile '{}': {error}",
-            profile.name
+            "failed to render OpenSSH public key for identity '{}': {error}",
+            identity.name
         ))
     })
 }
@@ -1479,25 +1499,25 @@ fn resolve_mode(
     }
 }
 
-fn validate_profile_name(profile: &str) -> Result<()> {
-    if profile.trim().is_empty() {
+fn validate_profile_name(identity: &str) -> Result<()> {
+    if identity.trim().is_empty() {
         return Err(Error::Validation(
-            "profile name must not be empty".to_string(),
+            "identity name must not be empty".to_string(),
         ));
     }
 
-    if !profile
+    if !identity
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
         return Err(Error::Validation(
-            "profile name may contain only ASCII letters, numbers, '.', '-', and '_'".to_string(),
+            "identity name may contain only ASCII letters, numbers, '.', '-', and '_'".to_string(),
         ));
     }
 
-    if profile.contains("..") {
+    if identity.contains("..") {
         return Err(Error::Validation(
-            "profile name must not contain '..'".to_string(),
+            "identity name must not contain '..'".to_string(),
         ));
     }
 
@@ -1542,18 +1562,19 @@ mod tests {
     fn setup_persists_materialized_native_profile_when_not_dry_run() {
         let root_dir = unique_temp_path("setup-persist");
         let runner = FakeNativeSetupRunner::new();
-        let request = SetupRequest {
-            profile: "prod-signer".to_string(),
+        let request = IdentityCreateRequest {
+            identity: "prod-signer".to_string(),
             algorithm: Algorithm::P256,
             uses: vec![UseCase::Verify, UseCase::Sign],
             requested_mode: ModePreference::Native,
+            defaults: crate::model::DerivationOverrides::default(),
             state_dir: Some(root_dir.clone()),
             dry_run: false,
         };
 
-        let result = resolve_profile_with_runner(&HeuristicProbe, &request, &runner)
+        let result = resolve_identity_with_runner(&HeuristicProbe, &request, &runner)
             .expect("setup should succeed");
-        let profile_path = root_dir.join("profiles").join("prod-signer.json");
+        let identity_path = root_dir.join("identities").join("prod-signer.json");
         let handle_path = root_dir
             .join("objects")
             .join("prod-signer")
@@ -1561,30 +1582,35 @@ mod tests {
             .join("prod-signer-signing-key.handle");
 
         assert!(result.persisted);
-        assert_eq!(result.profile.storage.profile_path, profile_path);
-        assert!(profile_path.is_file());
+        assert_eq!(result.identity.storage.identity_path, identity_path);
+        assert!(identity_path.is_file());
         assert!(handle_path.is_file());
         assert_eq!(
-            result.profile.metadata.get("native.key_id"),
+            result.identity.metadata.get("native.key_id"),
             Some(&"prod-signer-signing-key".to_string())
         );
         assert_eq!(
-            result.profile.metadata.get("native.serialized_handle_path"),
+            result
+                .identity
+                .metadata
+                .get("native.serialized_handle_path"),
             Some(&"objects/prod-signer/native/prod-signer-signing-key.handle".to_string())
         );
         assert_eq!(
-            result.profile.metadata.get("native.persistent_handle"),
+            result.identity.metadata.get("native.persistent_handle"),
             Some(&"0x81010002".to_string())
         );
-        assert!(!root_dir
-            .join("objects")
-            .join("prod-signer")
-            .join("native")
-            .join("setup-work")
-            .exists());
+        assert!(
+            !root_dir
+                .join("objects")
+                .join("prod-signer")
+                .join("native")
+                .join("setup-work")
+                .exists()
+        );
 
-        let loaded = load_profile("prod-signer", Some(root_dir.clone())).expect("profile loads");
-        assert_eq!(loaded, result.profile);
+        let loaded = load_identity("prod-signer", Some(root_dir.clone())).expect("identity loads");
+        assert_eq!(loaded, result.identity);
         assert_eq!(runner.calls().len(), 5);
 
         fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
@@ -1594,16 +1620,17 @@ mod tests {
     fn setup_dry_run_does_not_touch_state() {
         let root_dir = unique_temp_path("setup-dry-run");
         let runner = FakeNativeSetupRunner::new();
-        let request = SetupRequest {
-            profile: "prod-signer".to_string(),
+        let request = IdentityCreateRequest {
+            identity: "prod-signer".to_string(),
             algorithm: Algorithm::P256,
             uses: vec![UseCase::Sign],
             requested_mode: ModePreference::Native,
+            defaults: crate::model::DerivationOverrides::default(),
             state_dir: Some(root_dir.clone()),
             dry_run: true,
         };
 
-        let result = resolve_profile_with_runner(&HeuristicProbe, &request, &runner)
+        let result = resolve_identity_with_runner(&HeuristicProbe, &request, &runner)
             .expect("setup should succeed");
 
         assert!(!result.persisted);
@@ -1618,18 +1645,19 @@ mod tests {
     #[test]
     fn setup_prf_provisions_root_material_and_persists_relative_metadata() {
         let root_dir = unique_temp_path("setup-prf-provision");
-        let request = SetupRequest {
-            profile: "prf-default".to_string(),
+        let request = IdentityCreateRequest {
+            identity: "prf-default".to_string(),
             algorithm: Algorithm::Ed25519,
             uses: vec![UseCase::Derive],
             requested_mode: ModePreference::Prf,
+            defaults: crate::model::DerivationOverrides::default(),
             state_dir: Some(root_dir.clone()),
             dry_run: false,
         };
         let probe = StaticCapabilityProbe::prf();
         let runner = FakePrfSetupRunner::default();
 
-        let result = resolve_profile_with_runner(&probe, &request, &runner)
+        let result = resolve_identity_with_runner(&probe, &request, &runner)
             .expect("PRF setup should succeed");
         let object_dir = root_dir.join("objects").join("prf-default");
 
@@ -1640,7 +1668,7 @@ mod tests {
         assert!(object_dir.join("prf-root.ctx").is_file());
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(PRF_PARENT_CONTEXT_PATH_METADATA_KEY)
                 .map(String::as_str),
@@ -1648,7 +1676,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(PRF_PUBLIC_PATH_METADATA_KEY)
                 .map(String::as_str),
@@ -1656,7 +1684,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(PRF_PRIVATE_PATH_METADATA_KEY)
                 .map(String::as_str),
@@ -1664,15 +1692,15 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(PRF_CONTEXT_PATH_METADATA_KEY)
                 .map(String::as_str),
             Some("objects/prf-default/prf-root.ctx")
         );
 
-        let loaded = load_profile("prf-default", Some(root_dir.clone())).expect("profile loads");
-        assert_eq!(loaded.metadata, result.profile.metadata);
+        let loaded = load_identity("prf-default", Some(root_dir.clone())).expect("identity loads");
+        assert_eq!(loaded.metadata, result.identity.metadata);
         assert_eq!(
             runner.recorded_programs(),
             vec!["tpm2_createprimary", "tpm2_create", "tpm2_load"]
@@ -1684,18 +1712,19 @@ mod tests {
     #[test]
     fn setup_seed_persists_relative_metadata_and_records_backend_request() {
         let root_dir = unique_temp_path("setup-seed-provision");
-        let request = SetupRequest {
-            profile: "seed-default".to_string(),
+        let request = IdentityCreateRequest {
+            identity: "seed-default".to_string(),
             algorithm: Algorithm::Ed25519,
-            uses: vec![UseCase::Derive, UseCase::SshAgent],
+            uses: vec![UseCase::Derive, UseCase::Ssh],
             requested_mode: ModePreference::Seed,
+            defaults: crate::model::DerivationOverrides::default(),
             state_dir: Some(root_dir.clone()),
             dry_run: false,
         };
         let probe = StaticCapabilityProbe::seed();
         let backend = RecordingSeedSetupBackend::new(root_dir.join("objects"));
 
-        let result = resolve_profile_with_seed_backend(&probe, &request, &backend)
+        let result = resolve_identity_with_seed_backend(&probe, &request, &backend)
             .expect("seed setup should succeed");
         let object_dir = root_dir.join("objects").join("seed-default");
 
@@ -1704,7 +1733,7 @@ mod tests {
         assert!(object_dir.join("sealed.priv").is_file());
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_OBJECT_LABEL_METADATA_KEY)
                 .map(String::as_str),
@@ -1712,7 +1741,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_PUBLIC_BLOB_PATH_METADATA_KEY)
                 .map(String::as_str),
@@ -1720,7 +1749,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_PRIVATE_BLOB_PATH_METADATA_KEY)
                 .map(String::as_str),
@@ -1728,7 +1757,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_STORAGE_KIND_METADATA_KEY)
                 .map(String::as_str),
@@ -1736,7 +1765,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_DERIVATION_KDF_METADATA_KEY)
                 .map(String::as_str),
@@ -1744,7 +1773,7 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_DERIVATION_DOMAIN_LABEL_METADATA_KEY)
                 .map(String::as_str),
@@ -1752,15 +1781,15 @@ mod tests {
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY)
                 .map(String::as_str),
             Some("true")
         );
 
-        let loaded = load_profile("seed-default", Some(root_dir.clone())).expect("profile loads");
-        assert_eq!(loaded.metadata, result.profile.metadata);
+        let loaded = load_identity("seed-default", Some(root_dir.clone())).expect("identity loads");
+        assert_eq!(loaded.metadata, result.identity.metadata);
         assert_eq!(
             backend.calls(),
             vec![SeedSealCall {
@@ -1778,19 +1807,20 @@ mod tests {
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let mut profile = Profile {
-            schema_version: crate::model::PROFILE_SCHEMA_VERSION,
+        let mut identity = Identity {
+            schema_version: crate::model::IDENTITY_SCHEMA_VERSION,
             name: "prod-signer".to_string(),
             algorithm: Algorithm::P256,
             uses: vec![UseCase::Sign, UseCase::Verify],
-            mode: ModeResolution {
+            mode: IdentityModeResolution {
                 requested: ModePreference::Native,
                 resolved: Mode::Native,
                 reasons: vec!["native requested".to_string()],
             },
-            storage: crate::model::ProfileStorage {
+            defaults: crate::model::IdentityDerivationDefaults::default(),
+            storage: crate::model::IdentityStorage {
                 state_layout: state_layout.clone(),
-                profile_path: state_layout.profile_path("prod-signer"),
+                identity_path: state_layout.identity_path("prod-signer"),
                 root_material_kind: crate::model::RootMaterialKind::NativeObject,
             },
             export_policy: crate::model::ExportPolicy::for_mode(Mode::Native),
@@ -1805,23 +1835,23 @@ mod tests {
         fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
         fs::write(&handle_path, b"serialized-handle").expect("handle file");
         persist_native_metadata(
-            &mut profile,
+            &mut identity,
             "prod-signer-signing-key",
             "0x81010002",
             &handle_path,
         );
-        profile.persist().expect("persist profile");
+        identity.persist().expect("persist identity");
 
         let output_path = root_dir.join("custom").join("prod-signer.der");
         let result = export_native_public_key_with_runner(
-            &profile,
+            &identity,
             Some(output_path.as_path()),
             PublicKeyExportFormat::SpkiDer,
             &FakeNativeExportRunner::success(example_spki_der()),
         )
         .expect("native export should succeed");
 
-        assert_eq!(result.profile, "prod-signer");
+        assert_eq!(result.identity, "prod-signer");
         assert_eq!(result.mode, Mode::Native);
         assert_eq!(result.kind, ExportKind::PublicKey);
         assert_eq!(result.artifact.format, ExportFormat::SpkiDer);
@@ -1840,11 +1870,11 @@ mod tests {
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let profile = Profile::new(
+        let identity = Identity::new(
             "seed-ed25519".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::SshAgent],
-            ModeResolution {
+            vec![UseCase::Ssh],
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
@@ -1855,7 +1885,7 @@ mod tests {
         let output_path = root_dir.join("exports").join("seed-ed25519.der");
 
         let result = export_seed_public_key_with_backend(
-            &profile,
+            &identity,
             Some(output_path.as_path()),
             PublicKeyExportFormat::SpkiDer,
             &FakeSeedExportBackend::new(seed.clone()),
@@ -1869,7 +1899,7 @@ mod tests {
             Algorithm::Ed25519,
         );
 
-        assert_eq!(result.profile, "seed-ed25519");
+        assert_eq!(result.identity, "seed-ed25519");
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.kind, ExportKind::PublicKey);
         assert_eq!(result.artifact.format, ExportFormat::SpkiDer);
@@ -1887,11 +1917,11 @@ mod tests {
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let profile = Profile::new(
+        let identity = Identity::new(
             "seed-secp256k1".to_string(),
             Algorithm::Secp256k1,
             vec![UseCase::Derive],
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
@@ -1902,7 +1932,7 @@ mod tests {
         let output_path = root_dir.join("exports").join("seed-secp256k1.der");
 
         let result = export_seed_public_key_with_backend(
-            &profile,
+            &identity,
             Some(output_path.as_path()),
             PublicKeyExportFormat::SpkiDer,
             &FakeSeedExportBackend::new(seed.clone()),
@@ -1912,7 +1942,7 @@ mod tests {
 
         let expected = expected_seed_public_key_der(
             &seed,
-            seed_public_key_derivation_spec(&profile).expect("secp256k1 export spec"),
+            seed_public_key_derivation_spec(&identity).expect("secp256k1 export spec"),
             Algorithm::Secp256k1,
         );
 
@@ -1931,11 +1961,11 @@ mod tests {
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let profile = Profile::new(
+        let identity = Identity::new(
             "seed-p256".to_string(),
             Algorithm::P256,
             vec![UseCase::Derive],
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
@@ -1946,7 +1976,7 @@ mod tests {
         let output_path = root_dir.join("exports").join("seed-p256.der");
 
         let result = export_seed_public_key_with_backend(
-            &profile,
+            &identity,
             Some(output_path.as_path()),
             PublicKeyExportFormat::SpkiDer,
             &FakeSeedExportBackend::new(seed.clone()),
@@ -1956,7 +1986,7 @@ mod tests {
 
         let expected = expected_seed_public_key_der(
             &seed,
-            seed_public_key_derivation_spec(&profile).expect("p256 export spec"),
+            seed_public_key_derivation_spec(&identity).expect("p256 export spec"),
             Algorithm::P256,
         );
 
@@ -1972,11 +2002,11 @@ mod tests {
     #[test]
     fn export_native_public_key_supports_spki_pem_output() {
         let root_dir = unique_temp_path("export-native-public-key-pem");
-        let (profile, _) = persisted_native_export_profile(&root_dir);
+        let (identity, _) = persisted_native_export_profile(&root_dir);
 
         let output_path = root_dir.join("custom").join("prod-signer.pem");
         let result = export_native_public_key_with_runner(
-            &profile,
+            &identity,
             Some(output_path.as_path()),
             PublicKeyExportFormat::SpkiPem,
             &FakeNativeExportRunner::success(example_spki_der()),
@@ -1994,11 +2024,11 @@ mod tests {
     #[test]
     fn export_native_public_key_supports_spki_hex_output() {
         let root_dir = unique_temp_path("export-native-public-key-hex");
-        let (profile, _) = persisted_native_export_profile(&root_dir);
+        let (identity, _) = persisted_native_export_profile(&root_dir);
 
         let output_path = root_dir.join("custom").join("prod-signer.hex");
         let result = export_native_public_key_with_runner(
-            &profile,
+            &identity,
             Some(output_path.as_path()),
             PublicKeyExportFormat::SpkiHex,
             &FakeNativeExportRunner::success(example_spki_der()),
@@ -2017,10 +2047,10 @@ mod tests {
     #[test]
     fn export_native_public_key_supports_openssh_output() {
         let root_dir = unique_temp_path("export-native-public-key-openssh");
-        let (profile, _) = persisted_native_export_profile(&root_dir);
+        let (identity, _) = persisted_native_export_profile(&root_dir);
 
         let result = export_native_public_key_with_runner(
-            &profile,
+            &identity,
             None,
             PublicKeyExportFormat::Openssh,
             &FakeNativeExportRunner::success(example_spki_der()),
@@ -2046,21 +2076,21 @@ mod tests {
     #[test]
     fn export_refuses_prf_public_key_requests_after_loading_profile() {
         let root_dir = unique_temp_path("export-prf-refusal");
-        let profile = Profile::new(
+        let identity = Identity::new(
             "prf-default".to_string(),
             Algorithm::Ed25519,
             vec![UseCase::Derive],
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Prf,
                 resolved: Mode::Prf,
                 reasons: vec!["prf requested".to_string()],
             },
             StateLayout::new(root_dir.clone()),
         );
-        profile.persist().expect("persist profile");
+        identity.persist().expect("persist identity");
 
         let error = export(&ExportRequest {
-            profile: "prf-default".to_string(),
+            identity: "prf-default".to_string(),
             kind: ExportKind::PublicKey,
             output: None,
             public_key_format: None,
@@ -2273,11 +2303,13 @@ mod tests {
                 .lock()
                 .expect("seed setup calls")
                 .push(SeedSealCall {
-                    object_label: request.profile.storage.object_label.clone(),
+                    object_label: request.identity.storage.object_label.clone(),
                     bytes,
                 });
 
-            let object_dir = self.objects_dir.join(&request.profile.storage.object_label);
+            let object_dir = self
+                .objects_dir
+                .join(&request.identity.storage.object_label);
             fs::create_dir_all(&object_dir).map_err(|error| {
                 Error::State(format!(
                     "failed to create fake seed object directory '{}': {error}",
@@ -2296,7 +2328,7 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<crate::ops::seed::SeedMaterial> {
             unreachable!("seed setup tests do not unseal material")
@@ -2318,11 +2350,11 @@ mod tests {
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let profile = Profile::new(
+        let identity = Identity::new(
             "seed-default".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Derive, UseCase::SshAgent],
-            ModeResolution {
+            vec![UseCase::Derive, UseCase::Ssh],
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
@@ -2332,9 +2364,9 @@ mod tests {
 
         let output_path = root_dir.join("backup").join("seed-default.recovery.json");
         let result = export_recovery_bundle_with_backend(
-            &profile,
+            &identity,
             &ExportRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 kind: ExportKind::RecoveryBundle,
                 output: Some(output_path.clone()),
                 public_key_format: None,
@@ -2349,7 +2381,7 @@ mod tests {
         )
         .expect("seed recovery export should succeed");
 
-        assert_eq!(result.profile, "seed-default");
+        assert_eq!(result.identity, "seed-default");
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.kind, ExportKind::RecoveryBundle);
         assert_eq!(result.artifact.format, ExportFormat::RecoveryBundleJson);
@@ -2366,11 +2398,11 @@ mod tests {
     #[test]
     fn export_recovery_bundle_requires_explicit_output_path() {
         let root_dir = unique_temp_path("export-seed-recovery-missing-output");
-        let profile = Profile::new(
+        let identity = Identity::new(
             "seed-default".to_string(),
             Algorithm::Ed25519,
             vec![UseCase::Derive],
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
@@ -2379,9 +2411,9 @@ mod tests {
         );
 
         let error = export_recovery_bundle_with_backend(
-            &profile,
+            &identity,
             &ExportRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 kind: ExportKind::RecoveryBundle,
                 output: None,
                 public_key_format: None,
@@ -2407,29 +2439,29 @@ mod tests {
         let state_layout = StateLayout::new(root_dir.clone());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let existing = Profile::new(
-            "restored-profile".to_string(),
+        let existing = Identity::new(
+            "restored-identity".to_string(),
             Algorithm::Ed25519,
             vec![UseCase::Derive],
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
             },
             state_layout.clone(),
         );
-        existing.persist().expect("persist existing profile");
+        existing.persist().expect("persist existing identity");
 
         let seed = vec![0x24; 32];
         let backend = FakeSeedImportBackend::default();
         let error = import_recovery_bundle_with_backend(
             &RecoveryImportRequest {
                 bundle_path: root_dir.join("backup").join("seed.recovery.json"),
-                profile: Some("restored-profile".to_string()),
+                identity: Some("restored-identity".to_string()),
                 state_dir: Some(root_dir.clone()),
                 overwrite_existing: false,
             },
-            sample_recovery_bundle("old-profile", &seed),
+            sample_recovery_bundle("old-identity", &seed),
             state_layout,
             &backend,
         )
@@ -2448,13 +2480,13 @@ mod tests {
         state_layout.ensure_dirs().expect("state dirs");
 
         let seed = vec![0x42; 32];
-        let bundle = sample_recovery_bundle("old-profile", &seed);
+        let bundle = sample_recovery_bundle("old-identity", &seed);
         let backend = FakeSeedImportBackend::default();
 
         let result = import_recovery_bundle_with_backend(
             &RecoveryImportRequest {
                 bundle_path: root_dir.join("backup").join("seed.recovery.json"),
-                profile: Some("restored-profile".to_string()),
+                identity: Some("restored-identity".to_string()),
                 state_dir: Some(root_dir.clone()),
                 overwrite_existing: true,
             },
@@ -2464,43 +2496,43 @@ mod tests {
         )
         .expect("recovery import should succeed");
 
-        assert_eq!(result.profile.name, "restored-profile");
-        assert_eq!(result.profile.mode.resolved, Mode::Seed);
-        assert_eq!(result.restored_from_profile, "old-profile");
+        assert_eq!(result.identity.name, "restored-identity");
+        assert_eq!(result.identity.mode.resolved, Mode::Seed);
+        assert_eq!(result.restored_from_identity, "old-identity");
         assert_eq!(result.seed_bytes, seed.len());
         assert_eq!(
-            result.profile.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY),
-            Some(&"restored-profile".to_string())
+            result.identity.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY),
+            Some(&"restored-identity".to_string())
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_PUBLIC_BLOB_PATH_METADATA_KEY),
-            Some(&"objects/restored-profile/sealed.pub".to_string())
+            Some(&"objects/restored-identity/sealed.pub".to_string())
         );
         assert_eq!(
             result
-                .profile
+                .identity
                 .metadata
                 .get(SEED_PRIVATE_BLOB_PATH_METADATA_KEY),
-            Some(&"objects/restored-profile/sealed.priv".to_string())
+            Some(&"objects/restored-identity/sealed.priv".to_string())
         );
 
-        let persisted = Profile::load_named("restored-profile", Some(root_dir.clone()))
-            .expect("persisted restored profile");
+        let persisted = Identity::load_named("restored-identity", Some(root_dir.clone()))
+            .expect("persisted restored identity");
         assert_eq!(persisted.mode.resolved, Mode::Seed);
         assert!(
             persisted
                 .mode
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("old-profile"))
+                .any(|reason| reason.contains("old-identity"))
         );
 
         let sealed = backend.last_request();
-        assert_eq!(sealed.profile_name, "restored-profile");
-        assert_eq!(sealed.object_label, "restored-profile");
+        assert_eq!(sealed.profile_name, "restored-identity");
+        assert_eq!(sealed.object_label, "restored-identity");
         assert!(sealed.overwrite_existing);
         assert_eq!(sealed.seed, seed);
 
@@ -2551,8 +2583,8 @@ mod tests {
                 .lock()
                 .expect("last request")
                 .replace(RecordedSeedImport {
-                    profile_name: request.profile.profile.clone(),
-                    object_label: request.profile.storage.object_label.clone(),
+                    profile_name: request.identity.identity.clone(),
+                    object_label: request.identity.storage.object_label.clone(),
                     overwrite_existing: request.overwrite_existing,
                     seed,
                 });
@@ -2561,7 +2593,7 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &crate::ops::seed::SeedProfile,
+            _profile: &crate::ops::seed::SeedIdentity,
             _auth_source: &crate::ops::seed::SeedOpenAuthSource,
         ) -> Result<crate::ops::seed::SeedMaterial> {
             unreachable!("recovery import should only seal imported seeds")
@@ -2586,30 +2618,31 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &crate::ops::seed::SeedProfile,
+            _profile: &crate::ops::seed::SeedIdentity,
             _auth_source: &crate::ops::seed::SeedOpenAuthSource,
         ) -> Result<crate::ops::seed::SeedMaterial> {
             Ok(secrecy::SecretBox::new(Box::new(self.seed.clone())))
         }
     }
 
-    fn persisted_native_export_profile(root_dir: &Path) -> (Profile, PathBuf) {
+    fn persisted_native_export_profile(root_dir: &Path) -> (Identity, PathBuf) {
         let state_layout = StateLayout::new(root_dir.to_path_buf());
         state_layout.ensure_dirs().expect("state dirs");
 
-        let mut profile = Profile {
-            schema_version: crate::model::PROFILE_SCHEMA_VERSION,
+        let mut identity = Identity {
+            schema_version: crate::model::IDENTITY_SCHEMA_VERSION,
             name: "prod-signer".to_string(),
             algorithm: Algorithm::P256,
             uses: vec![UseCase::Sign, UseCase::Verify],
-            mode: ModeResolution {
+            mode: IdentityModeResolution {
                 requested: ModePreference::Native,
                 resolved: Mode::Native,
                 reasons: vec!["native requested".to_string()],
             },
-            storage: crate::model::ProfileStorage {
+            defaults: crate::model::IdentityDerivationDefaults::default(),
+            storage: crate::model::IdentityStorage {
                 state_layout: state_layout.clone(),
-                profile_path: state_layout.profile_path("prod-signer"),
+                identity_path: state_layout.identity_path("prod-signer"),
                 root_material_kind: crate::model::RootMaterialKind::NativeObject,
             },
             export_policy: crate::model::ExportPolicy::for_mode(Mode::Native),
@@ -2624,14 +2657,14 @@ mod tests {
         fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
         fs::write(&handle_path, b"serialized-handle").expect("handle file");
         persist_native_metadata(
-            &mut profile,
+            &mut identity,
             "prod-signer-signing-key",
             "0x81010002",
             &handle_path,
         );
-        profile.persist().expect("persist profile");
+        identity.persist().expect("persist identity");
 
-        (profile, handle_path)
+        (identity, handle_path)
     }
 
     #[derive(Clone)]
@@ -2727,10 +2760,10 @@ mod tests {
             kind: crate::ops::seed::SEED_RECOVERY_BUNDLE_KIND.to_string(),
             exported_at_unix_seconds: 1,
             reason: "hardware migration".to_string(),
-            profile: crate::ops::seed::SeedRecoveryBundleProfile {
+            identity: crate::ops::seed::SeedRecoveryBundleIdentity {
                 name: profile_name.to_string(),
                 algorithm: Algorithm::Ed25519,
-                uses: vec![UseCase::Derive, UseCase::SshAgent],
+                uses: vec![UseCase::Derive, UseCase::Ssh],
                 derivation: crate::ops::seed::SeedDerivation::hkdf_sha256_v1(),
             },
             seed: crate::ops::seed::SeedRecoveryBundleSecret {

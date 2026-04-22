@@ -10,7 +10,7 @@ use crate::crypto::{
     DerivationSpecV1, OutputKind, OutputSpec,
 };
 use crate::error::{Error, Result};
-use crate::model::{DeriveRequest, DeriveResult, Mode, Profile};
+use crate::model::{DeriveRequest, DeriveResult, Identity, Mode};
 
 use super::prf::{
     PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
@@ -18,27 +18,28 @@ use super::prf::{
     TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, plan_tpm_prf_in,
 };
 use super::seed::{
-    HkdfSha256SeedDeriver, SEED_PRIVATE_BLOB_PATH_METADATA_KEY,
-    SEED_PUBLIC_BLOB_PATH_METADATA_KEY, SeedBackend, SeedOpenAuthSource, SeedOpenOutput,
-    SeedOpenRequest, SeedProfile, SeedSoftwareDeriver, SoftwareSeedDerivationRequest,
-    SubprocessSeedBackend, open_and_derive, seed_profile_from_profile,
+    HkdfSha256SeedDeriver, SEED_PRIVATE_BLOB_PATH_METADATA_KEY, SEED_PUBLIC_BLOB_PATH_METADATA_KEY,
+    SeedBackend, SeedIdentity, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
+    SeedSoftwareDeriver, SoftwareSeedDerivationRequest, SubprocessSeedBackend, open_and_derive,
+    seed_profile_from_profile,
 };
 
 pub fn execute_with_defaults<R>(
-    profile: &Profile,
+    identity: &Identity,
     request: &DeriveRequest,
     prf_runner: &R,
 ) -> Result<DeriveResult>
 where
     R: CommandRunner,
 {
-    let seed_backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     let seed_deriver = HkdfSha256SeedDeriver;
-    execute_with_runner(profile, request, prf_runner, &seed_backend, &seed_deriver)
+    execute_with_runner(identity, request, prf_runner, &seed_backend, &seed_deriver)
 }
 
 pub fn execute_with_runner<R, B, D>(
-    profile: &Profile,
+    identity: &Identity,
     request: &DeriveRequest,
     prf_runner: &R,
     seed_backend: &B,
@@ -50,30 +51,30 @@ where
     D: SeedSoftwareDeriver,
 {
     // Enforce use=derive at operation dispatch time.
-    if !profile.uses.contains(&crate::model::UseCase::Derive) {
+    if !identity.uses.contains(&crate::model::UseCase::Derive) {
         return Err(Error::PolicyRefusal(format!(
-            "profile '{}' is not configured with use=derive",
-            profile.name
+            "identity '{}' is not configured with use=derive",
+            identity.name
         )));
     }
 
     // Enforce mode/use compatibility at operation dispatch time.
-    crate::model::UseCase::validate_for_mode(&profile.uses, profile.mode.resolved)?;
+    crate::model::UseCase::validate_for_mode(&identity.uses, identity.mode.resolved)?;
 
     let spec = derive_spec(request)?;
 
-    match profile.mode.resolved {
+    match identity.mode.resolved {
         Mode::Native => Err(Error::Unsupported(format!(
-            "profile '{}' resolved to native mode; derive is currently wired only for PRF and seed profiles",
-            profile.name
+            "identity '{}' resolved to native mode; derive is currently wired only for PRF and seed identities",
+            identity.name
         ))),
-        Mode::Prf => execute_prf(profile, request.length, spec, prf_runner),
-        Mode::Seed => execute_seed(profile, request.length, spec, seed_backend, seed_deriver),
+        Mode::Prf => execute_prf(identity, request.length, spec, prf_runner),
+        Mode::Seed => execute_seed(identity, request.length, spec, seed_backend, seed_deriver),
     }
 }
 
 fn execute_prf<R>(
-    profile: &Profile,
+    identity: &Identity,
     length: u16,
     spec: DerivationSpec,
     runner: &R,
@@ -81,9 +82,9 @@ fn execute_prf<R>(
 where
     R: CommandRunner,
 {
-    let executor = resolve_prf_executor(profile)?;
-    let request = PrfRequest::new(profile.name.clone(), spec)?;
-    let workspace_root = temporary_workspace_root("prf", &profile.name)?;
+    let executor = resolve_prf_executor(identity)?;
+    let request = PrfRequest::new(identity.name.clone(), spec)?;
+    let workspace_root = temporary_workspace_root("prf", &identity.name)?;
     let plan = plan_tpm_prf_in(request, executor, &workspace_root)?;
     let execution = execute_tpm_prf_plan_with_runner(&plan, runner);
     let cleanup = fs::remove_dir_all(&workspace_root).map_err(|error| {
@@ -95,7 +96,7 @@ where
 
     match (execution, cleanup) {
         (Ok(result), Ok(())) => Ok(DeriveResult {
-            profile: profile.name.clone(),
+            identity: identity.name.clone(),
             mode: Mode::Prf,
             length,
             encoding: "hex".to_string(),
@@ -107,7 +108,7 @@ where
 }
 
 fn execute_seed<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     length: u16,
     spec: DerivationSpec,
     backend: &B,
@@ -117,11 +118,11 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let seed_profile = seed_profile_from_profile(profile)?;
-    ensure_seed_material_exists(profile, &seed_profile)?;
+    let seed_profile = seed_profile_from_profile(identity)?;
+    ensure_seed_material_exists(identity, &seed_profile)?;
 
     let request = SeedOpenRequest {
-        profile: seed_profile,
+        identity: seed_profile,
         auth_source: SeedOpenAuthSource::None,
         output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
             spec,
@@ -133,7 +134,7 @@ where
 
     let derived = open_and_derive(backend, deriver, &request)?;
     Ok(DeriveResult {
-        profile: profile.name.clone(),
+        identity: identity.name.clone(),
         mode: Mode::Seed,
         length,
         encoding: "hex".to_string(),
@@ -142,17 +143,16 @@ where
 }
 
 fn derive_spec(request: &DeriveRequest) -> Result<DerivationSpec> {
-    let mut context = CryptoDerivationContext::new(
-        request.context.namespace.clone(),
-        DerivationDomain::Application,
-        request.context.purpose.clone(),
-    );
+    let org = request.derivation.org.clone().ok_or_else(|| {
+        Error::Validation("derive currently requires --org or an identity default".to_string())
+    })?;
+    let purpose = request.derivation.purpose.clone().ok_or_else(|| {
+        Error::Validation("derive currently requires --purpose or an identity default".to_string())
+    })?;
 
-    if let Some(label) = &request.context.label {
-        context = context.with_label(label.clone());
-    }
+    let mut context = CryptoDerivationContext::new(org, DerivationDomain::Application, purpose);
 
-    for (key, value) in &request.context.context {
+    for (key, value) in &request.derivation.context {
         context = context.with_field(key.clone(), value.clone());
     }
 
@@ -162,21 +162,25 @@ fn derive_spec(request: &DeriveRequest) -> Result<DerivationSpec> {
     )?))
 }
 
-fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
-    let object_dir = profile.storage.state_layout.objects_dir.join(&profile.name);
+fn resolve_prf_executor(identity: &Identity) -> Result<TpmPrfExecutor> {
+    let object_dir = identity
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&identity.name);
 
-    let metadata_parent = profile
+    let metadata_parent = identity
         .metadata
         .get(PRF_PARENT_CONTEXT_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
-    let metadata_public = profile
+        .map(|path| resolve_state_path(identity, path));
+    let metadata_public = identity
         .metadata
         .get(PRF_PUBLIC_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
-    let metadata_private = profile
+        .map(|path| resolve_state_path(identity, path));
+    let metadata_private = identity
         .metadata
         .get(PRF_PRIVATE_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
+        .map(|path| resolve_state_path(identity, path));
 
     if let (Some(parent_context_path), Some(public_path), Some(private_path)) =
         (metadata_parent, metadata_public, metadata_private)
@@ -204,10 +208,10 @@ fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
         }
     }
 
-    if let Some(context_path) = profile
+    if let Some(context_path) = identity
         .metadata
         .get(PRF_CONTEXT_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path))
+        .map(|path| resolve_state_path(identity, path))
     {
         return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
             context_path,
@@ -224,30 +228,30 @@ fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
     }
 
     Err(Error::Unsupported(format!(
-        "profile '{}' resolved to PRF mode but no PRF root material was found; expected metadata '{}' or loadable blobs under '{}'",
-        profile.name,
+        "identity '{}' resolved to PRF mode but no PRF root material was found; expected metadata '{}' or loadable blobs under '{}'",
+        identity.name,
         PRF_CONTEXT_PATH_METADATA_KEY,
         object_dir.display()
     )))
 }
 
-fn resolve_state_path(profile: &Profile, value: &str) -> PathBuf {
+fn resolve_state_path(identity: &Identity, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
     if path.is_absolute() {
         path
     } else {
-        profile.storage.state_layout.root_dir.join(path)
+        identity.storage.state_layout.root_dir.join(path)
     }
 }
-fn ensure_seed_material_exists(profile: &Profile, seed_profile: &SeedProfile) -> Result<()> {
-    let object_dir = profile
+fn ensure_seed_material_exists(identity: &Identity, seed_profile: &SeedIdentity) -> Result<()> {
+    let object_dir = identity
         .storage
         .state_layout
         .objects_dir
         .join(&seed_profile.storage.object_label);
-    let public_blob = metadata_path(profile, SEED_PUBLIC_BLOB_PATH_METADATA_KEY)
+    let public_blob = metadata_path(identity, SEED_PUBLIC_BLOB_PATH_METADATA_KEY)
         .unwrap_or_else(|| object_dir.join("sealed.pub"));
-    let private_blob = metadata_path(profile, SEED_PRIVATE_BLOB_PATH_METADATA_KEY)
+    let private_blob = metadata_path(identity, SEED_PRIVATE_BLOB_PATH_METADATA_KEY)
         .unwrap_or_else(|| object_dir.join("sealed.priv"));
 
     if public_blob.is_file() && private_blob.is_file() {
@@ -255,24 +259,24 @@ fn ensure_seed_material_exists(profile: &Profile, seed_profile: &SeedProfile) ->
     }
 
     Err(Error::Unsupported(format!(
-        "profile '{}' resolved to seed mode but no sealed seed object was found; expected '{}' and '{}'",
-        profile.name,
+        "identity '{}' resolved to seed mode but no sealed seed object was found; expected '{}' and '{}'",
+        identity.name,
         public_blob.display(),
         private_blob.display()
     )))
 }
 
-fn metadata_path(profile: &Profile, key: &str) -> Option<PathBuf> {
-    let value = profile.metadata.get(key)?;
+fn metadata_path(identity: &Identity, key: &str) -> Option<PathBuf> {
+    let value = identity.metadata.get(key)?;
     let path = PathBuf::from(value);
     if path.is_absolute() {
         Some(path)
     } else {
-        Some(profile.storage.state_layout.root_dir.join(path))
+        Some(identity.storage.state_layout.root_dir.join(path))
     }
 }
 
-fn temporary_workspace_root(kind: &str, profile: &str) -> Result<PathBuf> {
+fn temporary_workspace_root(kind: &str, identity: &str) -> Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| {
@@ -281,7 +285,7 @@ fn temporary_workspace_root(kind: &str, profile: &str) -> Result<PathBuf> {
             ))
         })?;
 
-    let sanitized_profile = profile
+    let sanitized_profile = identity
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>();
@@ -314,7 +318,8 @@ mod tests {
     use super::*;
     use crate::backend::{CommandInvocation, CommandOutput};
     use crate::model::{
-        Algorithm, DerivationContext, ModePreference, ModeResolution, StateLayout, UseCase,
+        Algorithm, DerivationOverrides, IdentityDerivationDefaults, IdentityModeResolution,
+        ModePreference, StateLayout, UseCase,
     };
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -322,18 +327,19 @@ mod tests {
     #[test]
     fn executes_prf_derive_when_loaded_context_exists() {
         let root_dir = unique_temp_path("derive-prf");
-        let object_dir = root_dir.join("objects").join("prf-profile");
+        let object_dir = root_dir.join("objects").join("prf-identity");
         fs::create_dir_all(&object_dir).expect("create object dir");
         fs::write(object_dir.join("prf-root.ctx"), b"ctx").expect("write context");
 
-        let profile = test_profile(root_dir.clone(), "prf-profile", Mode::Prf);
-        let request = test_request("prf-profile", 16);
+        let identity = test_profile(root_dir.clone(), "prf-identity", Mode::Prf);
+        let request = test_request("prf-identity", 16);
         let runner = FakePrfRunner::new(b"raw-prf-material".to_vec());
         let seed_backend = FakeSeedBackend::default();
         let seed_deriver = FakeSeedDeriver::default();
 
-        let result = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
-            .expect("prf derive should succeed");
+        let result =
+            execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
+                .expect("prf derive should succeed");
 
         assert_eq!(result.mode, Mode::Prf);
         assert_eq!(result.length, 16);
@@ -345,38 +351,39 @@ mod tests {
     #[test]
     fn executes_prf_derive_from_relative_loadable_metadata() {
         let root_dir = unique_temp_path("derive-prf-relative-loadable");
-        let object_dir = root_dir.join("objects").join("prf-profile");
+        let object_dir = root_dir.join("objects").join("prf-identity");
         fs::create_dir_all(&object_dir).expect("create object dir");
         fs::write(object_dir.join("parent.ctx"), b"parent").expect("write parent context");
         fs::write(object_dir.join("prf-root.pub"), b"pub").expect("write public blob");
         fs::write(object_dir.join("prf-root.priv"), b"priv").expect("write private blob");
         fs::write(object_dir.join("prf-root.ctx"), b"loaded").expect("write loaded context");
 
-        let mut profile = test_profile(root_dir.clone(), "prf-profile", Mode::Prf);
-        profile.metadata.insert(
+        let mut identity = test_profile(root_dir.clone(), "prf-identity", Mode::Prf);
+        identity.metadata.insert(
             PRF_PARENT_CONTEXT_PATH_METADATA_KEY.to_string(),
-            "objects/prf-profile/parent.ctx".to_string(),
+            "objects/prf-identity/parent.ctx".to_string(),
         );
-        profile.metadata.insert(
+        identity.metadata.insert(
             PRF_PUBLIC_PATH_METADATA_KEY.to_string(),
-            "objects/prf-profile/prf-root.pub".to_string(),
+            "objects/prf-identity/prf-root.pub".to_string(),
         );
-        profile.metadata.insert(
+        identity.metadata.insert(
             PRF_PRIVATE_PATH_METADATA_KEY.to_string(),
-            "objects/prf-profile/prf-root.priv".to_string(),
+            "objects/prf-identity/prf-root.priv".to_string(),
         );
-        profile.metadata.insert(
+        identity.metadata.insert(
             PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
-            "objects/prf-profile/prf-root.ctx".to_string(),
+            "objects/prf-identity/prf-root.ctx".to_string(),
         );
 
-        let request = test_request("prf-profile", 16);
+        let request = test_request("prf-identity", 16);
         let runner = FakePrfRunner::new(b"raw-prf-material".to_vec());
         let seed_backend = FakeSeedBackend::default();
         let seed_deriver = FakeSeedDeriver::default();
 
-        let result = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
-            .expect("prf derive should succeed");
+        let result =
+            execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
+                .expect("prf derive should succeed");
 
         assert_eq!(result.mode, Mode::Prf);
         assert_eq!(runner.recorded_programs(), vec!["tpm2_load", "tpm2_hmac"]);
@@ -387,13 +394,13 @@ mod tests {
     #[test]
     fn reports_unsupported_when_prf_material_is_missing() {
         let root_dir = unique_temp_path("derive-prf-missing");
-        let profile = test_profile(root_dir.clone(), "prf-profile", Mode::Prf);
-        let request = test_request("prf-profile", 16);
+        let identity = test_profile(root_dir.clone(), "prf-identity", Mode::Prf);
+        let request = test_request("prf-identity", 16);
         let runner = FakePrfRunner::new(b"raw-prf-material".to_vec());
         let seed_backend = FakeSeedBackend::default();
         let seed_deriver = FakeSeedDeriver::default();
 
-        let error = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+        let error = execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
             .expect_err("missing PRF material should be unsupported");
 
         assert_eq!(error.code(), crate::error::ErrorCode::Unsupported);
@@ -403,19 +410,20 @@ mod tests {
     #[test]
     fn executes_seed_derive_when_sealed_object_exists() {
         let root_dir = unique_temp_path("derive-seed");
-        let object_dir = root_dir.join("objects").join("seed-profile");
+        let object_dir = root_dir.join("objects").join("seed-identity");
         fs::create_dir_all(&object_dir).expect("create object dir");
         fs::write(object_dir.join("sealed.pub"), b"pub").expect("write public blob");
         fs::write(object_dir.join("sealed.priv"), b"priv").expect("write private blob");
 
-        let profile = test_profile(root_dir.clone(), "seed-profile", Mode::Seed);
-        let request = test_request("seed-profile", 24);
+        let identity = test_profile(root_dir.clone(), "seed-identity", Mode::Seed);
+        let request = test_request("seed-identity", 24);
         let runner = FakePrfRunner::new(b"unused".to_vec());
         let seed_backend = FakeSeedBackend::new(vec![7_u8; 32]);
         let seed_deriver = FakeSeedDeriver::new(vec![9_u8; 24]);
 
-        let result = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
-            .expect("seed derive should succeed");
+        let result =
+            execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
+                .expect("seed derive should succeed");
 
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.length, 24);
@@ -424,20 +432,21 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("remove temp dir");
     }
 
-    fn test_profile(root_dir: PathBuf, name: &str, mode: Mode) -> Profile {
-        Profile {
-            schema_version: crate::model::PROFILE_SCHEMA_VERSION,
+    fn test_profile(root_dir: PathBuf, name: &str, mode: Mode) -> Identity {
+        Identity {
+            schema_version: crate::model::IDENTITY_SCHEMA_VERSION,
             name: name.to_string(),
             algorithm: Algorithm::Ed25519,
             uses: vec![UseCase::Derive],
-            mode: ModeResolution {
+            mode: IdentityModeResolution {
                 requested: ModePreference::Auto,
                 resolved: mode,
-                reasons: vec!["test profile".to_string()],
+                reasons: vec!["test identity".to_string()],
             },
-            storage: crate::model::ProfileStorage {
+            defaults: IdentityDerivationDefaults::default(),
+            storage: crate::model::IdentityStorage {
                 state_layout: StateLayout::new(root_dir),
-                profile_path: PathBuf::new(),
+                identity_path: PathBuf::new(),
                 root_material_kind: crate::model::RootMaterialKind::for_mode(mode),
             },
             export_policy: crate::model::ExportPolicy::for_mode(mode),
@@ -445,14 +454,12 @@ mod tests {
         }
     }
 
-    fn test_request(profile: &str, length: u16) -> DeriveRequest {
+    fn test_request(identity: &str, length: u16) -> DeriveRequest {
         DeriveRequest {
-            profile: profile.to_string(),
-            context: DerivationContext {
-                version: 1,
-                purpose: "session-secret".to_string(),
-                namespace: "io.github.example".to_string(),
-                label: Some("primary".to_string()),
+            identity: identity.to_string(),
+            derivation: DerivationOverrides {
+                org: Some("io.github.example".to_string()),
+                purpose: Some("session-secret".to_string()),
                 context: BTreeMap::from([("tenant".to_string(), "alpha".to_string())]),
             },
             length,
@@ -554,7 +561,7 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<super::super::seed::SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.seed.clone())))
@@ -592,16 +599,16 @@ mod tests {
         fs::write(object_dir.join("sealed.pub"), b"pub").expect("pub");
         fs::write(object_dir.join("sealed.priv"), b"priv").expect("priv");
 
-        // Profile with only SshAgent, not Derive
-        let mut profile = test_profile(root_dir.clone(), "no-derive", Mode::Seed);
-        profile.uses = vec![UseCase::SshAgent];
+        // Identity with only SshAgent, not Derive
+        let mut identity = test_profile(root_dir.clone(), "no-derive", Mode::Seed);
+        identity.uses = vec![UseCase::Ssh];
 
         let request = test_request("no-derive", 16);
         let runner = FakePrfRunner::new(b"unused".to_vec());
         let seed_backend = FakeSeedBackend::new(vec![7_u8; 32]);
         let seed_deriver = FakeSeedDeriver::new(vec![9_u8; 16]);
 
-        let error = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+        let error = execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
             .expect_err("derive should fail without use=derive");
 
         assert_eq!(error.code(), crate::error::ErrorCode::PolicyRefusal);
@@ -613,16 +620,16 @@ mod tests {
     #[test]
     fn derive_fails_for_native_mode_profile() {
         let root_dir = unique_temp_path("derive-native-enforcement");
-        // Profile with derive + native mode should fail mode/use enforcement
-        let mut profile = test_profile(root_dir.clone(), "native-derive", Mode::Native);
-        profile.uses = vec![UseCase::Derive];
+        // Identity with derive + native mode should fail mode/use enforcement
+        let mut identity = test_profile(root_dir.clone(), "native-derive", Mode::Native);
+        identity.uses = vec![UseCase::Derive];
 
         let request = test_request("native-derive", 16);
         let runner = FakePrfRunner::new(b"unused".to_vec());
         let seed_backend = FakeSeedBackend::default();
         let seed_deriver = FakeSeedDeriver::default();
 
-        let error = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+        let error = execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
             .expect_err("native mode should refuse derive");
 
         assert_eq!(error.code(), crate::error::ErrorCode::PolicyRefusal);
@@ -638,14 +645,15 @@ mod tests {
         fs::create_dir_all(&object_dir).expect("create object dir");
         fs::write(object_dir.join("prf-root.ctx"), b"ctx").expect("write context");
 
-        let profile = test_profile(root_dir.clone(), "prf-ok", Mode::Prf);
+        let identity = test_profile(root_dir.clone(), "prf-ok", Mode::Prf);
         let request = test_request("prf-ok", 16);
         let runner = FakePrfRunner::new(b"raw-prf-material".to_vec());
         let seed_backend = FakeSeedBackend::default();
         let seed_deriver = FakeSeedDeriver::default();
 
-        let result = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
-            .expect("prf + derive should succeed");
+        let result =
+            execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
+                .expect("prf + derive should succeed");
 
         assert_eq!(result.mode, Mode::Prf);
 
@@ -655,15 +663,15 @@ mod tests {
     #[test]
     fn derive_fails_for_prf_mode_with_sign_use() {
         let root_dir = unique_temp_path("derive-prf-sign");
-        let mut profile = test_profile(root_dir.clone(), "prf-sign", Mode::Prf);
-        profile.uses = vec![UseCase::Sign];
+        let mut identity = test_profile(root_dir.clone(), "prf-sign", Mode::Prf);
+        identity.uses = vec![UseCase::Sign];
 
         let request = test_request("prf-sign", 16);
         let runner = FakePrfRunner::new(b"unused".to_vec());
         let seed_backend = FakeSeedBackend::default();
         let seed_deriver = FakeSeedDeriver::default();
 
-        let error = execute_with_runner(&profile, &request, &runner, &seed_backend, &seed_deriver)
+        let error = execute_with_runner(&identity, &request, &runner, &seed_backend, &seed_deriver)
             .expect_err("prf + sign should fail derive");
 
         // First error: missing use=derive

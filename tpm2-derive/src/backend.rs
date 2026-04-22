@@ -49,8 +49,7 @@ impl CapabilityProbe for HeuristicProbe {
                     .all(|use_case| matches!(use_case, UseCase::Sign | UseCase::Verify)) =>
             {
                 recommendation_reasons.push(
-                    "p256 sign/verify is the best candidate for native TPM MVP support"
-                        .to_string(),
+                    "p256 sign/verify is the best candidate for native TPM MVP support".to_string(),
                 );
                 Some(Mode::Native)
             }
@@ -64,12 +63,10 @@ impl CapabilityProbe for HeuristicProbe {
             None => None,
         };
 
-        if uses.iter().any(|use_case| {
-            matches!(
-                use_case,
-                UseCase::SshAgent | UseCase::Derive
-            )
-        }) {
+        if uses
+            .iter()
+            .any(|use_case| matches!(use_case, UseCase::Ssh | UseCase::Derive))
+        {
             recommendation_reasons.push(
                 "requested operation benefits from deterministic derived output; prefer PRF and fall back to seed mode"
                     .to_string(),

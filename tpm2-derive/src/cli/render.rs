@@ -14,7 +14,11 @@ pub fn success_with_diagnostics<T: Serialize>(
     result: T,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<String> {
-    render(json, OutputEnvelope::ok(command, result, diagnostics), false)
+    render(
+        json,
+        OutputEnvelope::ok(command, result, diagnostics),
+        false,
+    )
 }
 
 pub fn failure(
@@ -23,10 +27,18 @@ pub fn failure(
     error: ErrorEnvelope,
     diagnostics: Vec<crate::model::Diagnostic>,
 ) -> Result<String> {
-    render(json, OutputEnvelope::<Value>::err(command, diagnostics, error), true)
+    render(
+        json,
+        OutputEnvelope::<Value>::err(command, diagnostics, error),
+        true,
+    )
 }
 
-fn render<T: Serialize>(json: bool, envelope: OutputEnvelope<T>, force_full: bool) -> Result<String> {
+fn render<T: Serialize>(
+    json: bool,
+    envelope: OutputEnvelope<T>,
+    force_full: bool,
+) -> Result<String> {
     if json || force_full {
         return Ok(serde_json::to_string_pretty(&envelope)?);
     }

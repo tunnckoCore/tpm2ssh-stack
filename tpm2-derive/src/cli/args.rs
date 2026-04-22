@@ -6,9 +6,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "tpm2-derive",
     version,
-    about = "TPM-backed key operations with native, PRF, and seed modes",
-    long_about = "TPM-backed key operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'setup' to provision persistent state, 'import' to reseal an exported seed bundle into fresh TPM-backed state, and the operational subcommands ('derive', 'sign', 'verify', 'export', 'ssh agent add') to use an existing profile.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh agent add' path currently supports seed Ed25519 and seed P-256 profiles, while higher-level wrappers such as 'tpm2ssh' can provide broader user-facing SSH/Git flows.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive setup --profile prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive sign --profile prod-signer --input message.bin\n  tpm2-derive derive --profile app-prf --purpose session --namespace com.example\n  tpm2-derive ssh agent add --profile seed-user\n  tpm2-derive export --profile prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --profile seed-user --kind recovery-bundle --output backup.json --reason 'hardware migration' --confirm --confirm-phrase 'I understand this export weakens TPM-only protection'\n  tpm2-derive import --bundle backup.json --profile restored-user --confirm\n\nSSH quick guide:\n  - Want a direct tpm2-derive ssh-agent flow today? Use a seed/ed25519 or seed/p256 profile.\n  - Want a TPM-native signer? Use p256 + native for sign/verify."
+    about = "TPM-backed identity operations with native, PRF, and seed modes",
+    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, 'import' to reseal an exported seed bundle into fresh TPM-backed state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path currently supports the seed-backed slice in this CLI, while higher-level wrappers such as 'tpm2ssh' can provide broader user-facing SSH/Git flows.",
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin\n  tpm2-derive derive --with app-prf --org com.example --purpose session\n  tpm2-derive ssh-add --with seed-user\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive import --bundle backup.json --identity restored-user --confirm"
 )]
 pub struct Cli {
     #[arg(
@@ -25,43 +25,27 @@ pub struct Cli {
 pub enum Command {
     /// Probe TPM/tooling capabilities and recommended mode selection.
     Inspect(InspectArgs),
-    /// Create or update a profile and materialize backend state unless --dry-run is used.
-    Setup(SetupArgs),
-    /// Derive deterministic bytes from a persisted PRF or seed profile.
+    /// Create or update an identity and materialize backend state unless --dry-run is used.
+    Identity(IdentityArgs),
+    /// Derive deterministic bytes from a persisted PRF or seed identity.
     Derive(DeriveArgs),
-    /// Sign input with a persisted profile; native P-256 is the main wired signing path today.
+    /// Sign input with a persisted identity.
     Sign(SignArgs),
-    /// Verify a signature against a persisted profile; native P-256 is the main wired verify path today.
+    /// Verify a signature against a persisted identity.
     Verify(VerifyArgs),
-    /// Encrypt data using a derived symmetric key from a persisted profile.
+    /// Encrypt data using a derived symmetric key from a persisted identity.
     Encrypt(EncryptArgs),
     /// Decrypt data previously encrypted with the encrypt command.
     Decrypt(DecryptArgs),
-    /// Derive a keypair (secret key + public key) from a persisted profile.
+    /// Derive a keypair (secret key + public key) from a persisted identity.
     Keygen(KeygenArgs),
-    /// Export public material or recovery artifacts from a persisted profile.
+    /// Export public material or recovery artifacts from a persisted identity.
     Export(ExportArgs),
     /// Import a break-glass recovery bundle and reseal it into TPM-backed state.
     Import(ImportArgs),
-    #[command(subcommand)]
-    /// SSH-oriented operations.
-    Ssh(SshCommand),
-}
-
-#[derive(Debug, Subcommand)]
-pub enum SshCommand {
-    #[command(
-        name = "agent",
-        subcommand,
-        about = "Interact with an ssh-agent using a persisted profile"
-    )]
-    Agent(SshAgentCommand),
-}
-
-#[derive(Debug, Subcommand)]
-pub enum SshAgentCommand {
-    /// Add a derived private key to ssh-agent; this direct CLI path currently supports seed ed25519 and seed p256 profiles.
-    Add(SshAgentAddArgs),
+    /// Add a derived private key to ssh-agent.
+    #[command(name = "ssh-add")]
+    SshAdd(SshAddArgs),
 }
 
 #[derive(Debug, Args)]
@@ -78,20 +62,23 @@ pub struct InspectArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Create or update a profile and provision TPM-backed state")]
-pub struct SetupArgs {
-    #[arg(long, help = "Profile name used to persist metadata and backend state")]
-    pub profile: String,
-    #[arg(long, value_enum, help = "Algorithm the profile is centered on")]
+#[command(about = "Create or update an identity and provision TPM-backed state")]
+pub struct IdentityArgs {
+    #[arg(help = "Identity name used to persist metadata and backend state")]
+    pub identity: String,
+    #[arg(long, value_enum, help = "Algorithm the identity is centered on")]
     pub algorithm: AlgorithmArg,
     #[arg(
         long = "use",
         value_enum,
-        help = "Allowed use(s) for the profile; repeat as needed"
+        required = true,
+        help = "Allowed use(s) for the identity; repeat as needed"
     )]
     pub uses: Vec<UseArg>,
     #[arg(long, value_enum, default_value_t = ModeArg::Auto, help = "Force a mode or let the tool auto-resolve one")]
     pub mode: ModeArg,
+    #[command(flatten)]
+    pub defaults: DerivationInputArgs,
     #[arg(
         long,
         help = "Override the state root directory instead of the default local state path"
@@ -99,27 +86,28 @@ pub struct SetupArgs {
     pub state_dir: Option<PathBuf>,
     #[arg(
         long,
-        help = "Validate and resolve the profile without provisioning TPM state"
+        help = "Validate and resolve the identity without provisioning TPM state"
     )]
     pub dry_run: bool,
 }
 
-#[derive(Debug, Args)]
-#[command(about = "Derive deterministic bytes from a persisted profile")]
-pub struct DeriveArgs {
-    #[arg(long, help = "Existing profile name to use for derivation")]
-    pub profile: String,
-    #[arg(long, help = "High-level purpose string used for domain separation")]
-    pub purpose: String,
-    #[arg(
-        long,
-        help = "Application or domain namespace used for domain separation"
-    )]
-    pub namespace: String,
-    #[arg(long, help = "Optional label to further distinguish this derivation")]
-    pub label: Option<String>,
+#[derive(Debug, Args, Clone, Default)]
+pub struct DerivationInputArgs {
+    #[arg(long, help = "Organization string used for derivation identity")]
+    pub org: Option<String>,
+    #[arg(long, help = "Purpose string used for derivation identity")]
+    pub purpose: Option<String>,
     #[arg(long = "context", value_parser = parse_key_value, help = "Additional key=value context fields; repeat as needed")]
     pub context: Vec<(String, String)>,
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Derive deterministic bytes from a persisted identity")]
+pub struct DeriveArgs {
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(
         long,
         default_value_t = 32,
@@ -131,25 +119,15 @@ pub struct DeriveArgs {
         help = "Override the state root directory instead of the default local state path"
     )]
     pub state_dir: Option<PathBuf>,
-    #[arg(long, help = "After deriving, also add the material to ssh-agent")]
-    pub ssh_agent_add: bool,
-    #[arg(
-        long,
-        help = "Optional ssh-agent comment for the added key (used with --ssh-agent-add)"
-    )]
-    pub ssh_agent_comment: Option<String>,
-    #[arg(
-        long,
-        help = "Explicit ssh-agent socket path; otherwise SSH_AUTH_SOCK is used (used with --ssh-agent-add)"
-    )]
-    pub ssh_agent_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Sign input with a persisted profile")]
+#[command(about = "Sign input with a persisted identity")]
 pub struct SignArgs {
-    #[arg(long, help = "Existing profile name to use for signing")]
-    pub profile: String,
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(
         long,
         default_value = "-",
@@ -164,10 +142,12 @@ pub struct SignArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Verify a signature against a persisted profile")]
+#[command(about = "Verify a signature against a persisted identity")]
 pub struct VerifyArgs {
-    #[arg(long, help = "Existing profile name to use for verification")]
-    pub profile: String,
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(
         long,
         default_value = "-",
@@ -184,10 +164,12 @@ pub struct VerifyArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Encrypt data using a derived symmetric key from a persisted profile")]
+#[command(about = "Encrypt data using a derived symmetric key from a persisted identity")]
 pub struct EncryptArgs {
-    #[arg(long, help = "Existing profile name to use for encryption")]
-    pub profile: String,
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(
         long,
         default_value = "-",
@@ -206,8 +188,10 @@ pub struct EncryptArgs {
 #[derive(Debug, Args)]
 #[command(about = "Decrypt data previously encrypted with the encrypt command")]
 pub struct DecryptArgs {
-    #[arg(long, help = "Existing profile name to use for decryption")]
-    pub profile: String,
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(
         long,
         default_value = "-",
@@ -224,14 +208,12 @@ pub struct DecryptArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Derive a keypair (secret key + public key) from a persisted profile")]
+#[command(about = "Derive a keypair (secret key + public key) from a persisted identity")]
 pub struct KeygenArgs {
-    #[arg(
-        long = "from-profile",
-        visible_alias = "profile",
-        help = "Profile name to derive the keypair from"
-    )]
-    pub from_profile: String,
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(
         long,
         value_enum,
@@ -260,9 +242,9 @@ pub enum KeygenKindArg {
     /// Try PRF first, then seed, otherwise error.
     #[default]
     Auto,
-    /// Derive from a PRF-mode profile.
+    /// Derive from a PRF-mode identity.
     Prf,
-    /// Derive from a seed-mode profile.
+    /// Derive from a seed-mode identity.
     Seed,
 }
 
@@ -278,8 +260,10 @@ pub enum KeygenFormatArg {
 #[derive(Debug, Args)]
 #[command(about = "Export public material or high-friction recovery artifacts")]
 pub struct ExportArgs {
-    #[arg(long, help = "Existing profile name to export from")]
-    pub profile: String,
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(long, value_enum, help = "Artifact kind to export")]
     pub kind: ExportKindArg,
     #[arg(
@@ -325,15 +309,15 @@ pub struct ImportArgs {
     pub bundle: PathBuf,
     #[arg(
         long,
-        help = "Optional destination profile name; defaults to the profile recorded in the bundle"
+        help = "Optional destination identity name; defaults to the identity recorded in the bundle"
     )]
-    pub profile: Option<String>,
+    pub identity: Option<String>,
     #[arg(
         long,
         help = "Override the state root directory instead of the default local state path"
     )]
     pub state_dir: Option<PathBuf>,
-    #[arg(long, help = "Replace existing profile/object state if present")]
+    #[arg(long, help = "Replace existing identity/object state if present")]
     pub overwrite_existing: bool,
     #[arg(
         long,
@@ -343,12 +327,12 @@ pub struct ImportArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(
-    about = "Add a derived private key to ssh-agent (currently the direct seed ed25519 / seed p256 slice in this CLI)"
-)]
-pub struct SshAgentAddArgs {
-    #[arg(long, help = "Existing profile name to derive from")]
-    pub profile: String,
+#[command(about = "Add a derived private key to ssh-agent")]
+pub struct SshAddArgs {
+    #[arg(long = "with", help = "Existing identity name to use")]
+    pub identity: String,
+    #[command(flatten)]
+    pub derivation: DerivationInputArgs,
     #[arg(long, help = "Optional ssh-agent comment for the added key")]
     pub comment: Option<String>,
     #[arg(
@@ -373,7 +357,7 @@ pub enum AlgorithmArg {
     Secp256k1,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 pub enum UseArg {
     /// Allow signing operations.
     Sign,
@@ -381,12 +365,16 @@ pub enum UseArg {
     Verify,
     /// Allow deterministic derivation operations.
     Derive,
-    /// Intended for ssh-agent loading.
-    SshAgent,
-    /// Placeholder for future encryption usage.
+    /// Intended for SSH usage.
+    Ssh,
+    /// Allow encryption operations.
     Encrypt,
-    /// Placeholder for future decryption usage.
+    /// Allow decryption operations.
     Decrypt,
+    /// Allow secret-bearing export operations.
+    ExportSecret,
+    /// Expand to the mode-aware full supported set.
+    All,
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -439,11 +427,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identity_command_parses_new_surface() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "identity",
+            "prod-signer",
+            "--algorithm",
+            "p256",
+            "--mode",
+            "native",
+            "--use",
+            "sign",
+            "--use",
+            "verify",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Identity(args) => {
+                assert_eq!(args.identity, "prod-signer");
+                assert_eq!(args.uses, vec![UseArg::Sign, UseArg::Verify]);
+            }
+            other => panic!("expected identity command, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operational_commands_parse_with_selector_and_derivation_inputs() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "derive",
+            "--with",
+            "app-prf",
+            "--org",
+            "com.example",
+            "--purpose",
+            "session",
+            "--context",
+            "tenant=alpha",
+            "--length",
+            "32",
+        ])
+        .expect("cli should parse");
+
+        match cli.command {
+            Command::Derive(args) => {
+                assert_eq!(args.identity, "app-prf");
+                assert_eq!(args.derivation.org.as_deref(), Some("com.example"));
+                assert_eq!(args.derivation.purpose.as_deref(), Some("session"));
+                assert_eq!(
+                    args.derivation.context,
+                    vec![("tenant".to_string(), "alpha".to_string())]
+                );
+            }
+            other => panic!("expected derive command, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_add_parses_flat_command() {
+        let cli = Cli::try_parse_from(["tpm2-derive", "ssh-add", "--with", "seed-user"])
+            .expect("cli should parse");
+
+        match cli.command {
+            Command::SshAdd(args) => assert_eq!(args.identity, "seed-user"),
+            other => panic!("expected ssh-add command, found {other:?}"),
+        }
+    }
+
+    #[test]
     fn export_parses_public_key_format_flag() {
         let cli = Cli::try_parse_from([
             "tpm2-derive",
             "export",
-            "--profile",
+            "--with",
             "prod-signer",
             "--kind",
             "public-key",
@@ -454,7 +511,7 @@ mod tests {
 
         match cli.command {
             Command::Export(args) => {
-                assert_eq!(args.profile, "prod-signer");
+                assert_eq!(args.identity, "prod-signer");
                 assert_eq!(
                     args.public_key_format,
                     Some(PublicKeyExportFormatArg::Openssh)
@@ -462,5 +519,46 @@ mod tests {
             }
             other => panic!("expected export command, found {other:?}"),
         }
+    }
+
+    #[test]
+    fn removed_old_surface_no_longer_parses() {
+        assert!(
+            Cli::try_parse_from([
+                "tpm2-derive",
+                "setup",
+                "--identity",
+                "prod-signer",
+                "--algorithm",
+                "p256",
+                "--use",
+                "sign",
+            ])
+            .is_err()
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "tpm2-derive",
+                "ssh",
+                "agent",
+                "add",
+                "--identity",
+                "seed-user",
+            ])
+            .is_err()
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "tpm2-derive",
+                "derive",
+                "--with",
+                "app-prf",
+                "--namespace",
+                "com.example",
+            ])
+            .is_err()
+        );
     }
 }

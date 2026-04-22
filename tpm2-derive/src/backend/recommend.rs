@@ -279,12 +279,8 @@ fn is_sign_verify_only(uses: &[UseCase]) -> bool {
 }
 
 fn needs_deterministic_output(uses: &[UseCase]) -> bool {
-    uses.iter().any(|use_case| {
-        matches!(
-            use_case,
-            UseCase::Derive | UseCase::SshAgent
-        )
-    })
+    uses.iter()
+        .any(|use_case| matches!(use_case, UseCase::Derive | UseCase::Ssh))
 }
 
 #[cfg(test)]
@@ -297,13 +293,13 @@ mod tests {
     fn detects_sign_verify_only() {
         assert!(is_sign_verify_only(&[UseCase::Sign, UseCase::Verify]));
         assert!(!is_sign_verify_only(&[]));
-        assert!(!is_sign_verify_only(&[UseCase::Sign, UseCase::SshAgent]));
+        assert!(!is_sign_verify_only(&[UseCase::Sign, UseCase::Ssh]));
     }
 
     #[test]
     fn detects_deterministic_workflows() {
         assert!(needs_deterministic_output(&[UseCase::Derive]));
-        assert!(needs_deterministic_output(&[UseCase::SshAgent]));
+        assert!(needs_deterministic_output(&[UseCase::Ssh]));
         assert!(!needs_deterministic_output(&[UseCase::Sign]));
     }
 
@@ -337,7 +333,7 @@ mod tests {
                 seed: true,
             },
             Some(Algorithm::Ed25519),
-            &[UseCase::SshAgent],
+            &[UseCase::Ssh],
             &mut reasons,
         );
 
