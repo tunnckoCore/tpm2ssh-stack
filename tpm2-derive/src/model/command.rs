@@ -110,39 +110,6 @@ pub struct DecryptResult {
     pub plaintext: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum KeygenKind {
-    Auto,
-    Prf,
-    Seed,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum KeygenFormat {
-    Hex,
-    Json,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct KeygenRequest {
-    pub identity: String,
-    pub kind: KeygenKind,
-    pub format: KeygenFormat,
-    pub output: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct KeygenResult {
-    pub identity: String,
-    pub mode: Mode,
-    pub algorithm: Algorithm,
-    pub secret_key_hex: String,
-    pub public_key_hex: String,
-    pub output_path: Option<PathBuf>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExportKind {

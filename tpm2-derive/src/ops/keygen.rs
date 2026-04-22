@@ -1,8 +1,7 @@
 //! Shared derived asymmetric-key helpers for PRF/seed-backed identities.
 //!
-//! The public `keygen` command must not bypass `export-secret` policy, so its
-//! entrypoints return a policy error. The reusable helpers in this module power
-//! sign/verify/export/ssh-add and keep them on the same derived key material.
+//! These helpers power sign/verify/export/ssh-add and keep them on the same
+//! derived key material.
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use p256::pkcs8::EncodePublicKey as _;
@@ -11,7 +10,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::backend::CommandRunner;
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, DerivationOverrides, Identity, KeygenResult, Mode, UseCase};
+use crate::model::{Algorithm, DerivationOverrides, Identity, Mode};
 
 use super::seed::{
     HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
@@ -24,27 +23,6 @@ use super::shared::{
 
 const KEYGEN_SCALAR_RETRY_DOMAIN: &[u8] = b"tpm2-derive\0keygen-scalar-retry\0v1";
 const KEYGEN_SCALAR_RETRY_LIMIT: u32 = 16;
-
-pub fn execute_with_defaults<R>(identity: &Identity, _prf_runner: &R) -> Result<KeygenResult>
-where
-    R: CommandRunner,
-{
-    reject_keygen_export(identity)
-}
-
-pub fn execute<R, B, D>(
-    identity: &Identity,
-    _prf_runner: &R,
-    _seed_backend: &B,
-    _seed_deriver: &D,
-) -> Result<KeygenResult>
-where
-    R: CommandRunner,
-    B: SeedBackend,
-    D: SeedSoftwareDeriver,
-{
-    reject_keygen_export(identity)
-}
 
 pub(crate) fn derive_identity_key_material_with_defaults<R>(
     identity: &Identity,
@@ -244,19 +222,6 @@ fn scalar_retry_bytes(seed: &[u8; 32], algorithm: Algorithm, counter: u32) -> [u
     hasher.update(counter.to_be_bytes());
     hasher.update(seed);
     hasher.finalize().into()
-}
-
-fn reject_keygen_export(identity: &Identity) -> Result<KeygenResult> {
-    let guidance = if identity.uses.contains(&UseCase::ExportSecret) {
-        "use `export --kind keypair` or `export --kind secret-key --confirm --reason ...` instead"
-    } else {
-        "add use=export-secret when creating the identity and use `export --kind keypair` or `export --kind secret-key --confirm --reason ...` instead"
-    };
-
-    Err(Error::PolicyRefusal(format!(
-        "keygen would export secret key material directly for identity '{}'; {guidance}",
-        identity.name
-    )))
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
