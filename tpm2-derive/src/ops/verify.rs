@@ -25,7 +25,9 @@ use crate::ops::seed::{
 #[cfg(test)]
 use secrecy::ExposeSecret;
 
-use super::shared::{classify_native_command_failure, load_input_bytes};
+use super::shared::{
+    classify_native_command_failure, ensure_derivation_overrides_allowed, load_input_bytes,
+};
 #[cfg(test)]
 use super::sign::{
     SEED_SIGNING_KEY_NAMESPACE, SEED_SIGNING_KEY_PATH, seed_signing_key_derivation_spec,
@@ -70,6 +72,8 @@ pub fn execute_with_runner<R>(
 where
     R: CommandRunner,
 {
+    ensure_derivation_overrides_allowed(identity, derivation)?;
+
     match identity.mode.resolved {
         Mode::Native => verify_native_with_runner(request, identity, runner),
         Mode::Seed | Mode::Prf => verify_derived_identity(request, identity, derivation, runner),
@@ -572,4 +576,52 @@ fn parse_ed25519_verify_signature(
         Ed25519Signature::from_bytes(&signature_bytes),
         VerifySignatureFormat::Raw,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use crate::model::{IdentityModeResolution, InputSource, ModePreference, StateLayout};
+
+    #[test]
+    fn native_verify_rejects_derivation_overrides() {
+        let state_root = tempdir().expect("state root");
+        let identity = Identity::new(
+            "native-verify".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            StateLayout::new(state_root.path().to_path_buf()),
+        );
+        let input_path = state_root.path().join("input.bin");
+        let sig_path = state_root.path().join("sig.bin");
+        fs::write(&input_path, b"hello native verify").expect("input file");
+        fs::write(&sig_path, [0u8; 64]).expect("signature file");
+
+        let error = execute_with_defaults(
+            &identity,
+            &VerifyRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path { path: sig_path },
+            },
+            &DerivationOverrides {
+                org: Some("com.example".to_string()),
+                purpose: None,
+                context: Default::default(),
+            },
+        )
+        .expect_err("native verify should reject derivation overrides");
+
+        assert!(matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides")));
+    }
 }

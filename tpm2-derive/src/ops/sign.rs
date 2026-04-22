@@ -31,7 +31,10 @@ use crate::ops::seed::{
 #[cfg(test)]
 use secrecy::ExposeSecret;
 
-use super::shared::{classify_native_command_failure, ensure_dir, load_input_bytes};
+use super::shared::{
+    classify_native_command_failure, ensure_derivation_overrides_allowed, ensure_dir,
+    load_input_bytes,
+};
 
 #[cfg(test)]
 pub(crate) const SEED_SIGNING_KEY_NAMESPACE: &str = "tpm2-derive.sign";
@@ -107,6 +110,8 @@ pub fn execute_with_runner<R>(
 where
     R: CommandRunner,
 {
+    ensure_derivation_overrides_allowed(identity, derivation)?;
+
     match identity.mode.resolved {
         Mode::Native => {
             let staged = stage_native_sign(request, identity)?;
@@ -611,4 +616,49 @@ fn finalize_native_signature_output(plan: &NativeSignPlan) -> Result<Vec<u8>> {
 
 fn load_sign_input(input: &crate::model::InputSource) -> Result<Vec<u8>> {
     load_input_bytes(input, "sign input")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use crate::model::{IdentityModeResolution, InputSource, ModePreference, StateLayout};
+
+    #[test]
+    fn native_sign_rejects_derivation_overrides() {
+        let state_root = tempdir().expect("state root");
+        let identity = Identity::new(
+            "native-sign".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            StateLayout::new(state_root.path().to_path_buf()),
+        );
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, b"hello native sign").expect("input file");
+
+        let error = execute_with_defaults(
+            &identity,
+            &SignRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+            },
+            &DerivationOverrides {
+                org: Some("com.example".to_string()),
+                purpose: None,
+                context: Default::default(),
+            },
+        )
+        .expect_err("native sign should reject derivation overrides");
+
+        assert!(matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides")));
+    }
 }

@@ -22,9 +22,10 @@ impl NativeAlgorithmCapability {
         let mut supported = Vec::new();
         if self.sign {
             supported.push(UseCase::Sign);
-        }
-        if self.verify {
-            supported.push(UseCase::Verify);
+            supported.push(UseCase::Ssh);
+            if self.verify {
+                supported.push(UseCase::Verify);
+            }
         }
         if self.encrypt {
             supported.push(UseCase::Encrypt);
@@ -39,10 +40,11 @@ impl NativeAlgorithmCapability {
         match use_case {
             UseCase::All => false,
             UseCase::Sign => self.sign,
-            UseCase::Verify => self.verify,
+            UseCase::Verify => self.sign && self.verify,
+            UseCase::Ssh => self.sign,
             UseCase::Encrypt => self.encrypt,
             UseCase::Decrypt => self.decrypt,
-            UseCase::Ssh | UseCase::Derive | UseCase::ExportSecret => false,
+            UseCase::Derive | UseCase::ExportSecret => false,
         }
     }
 }

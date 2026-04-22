@@ -28,23 +28,32 @@ pub(crate) struct EffectiveDerivationInputs {
     pub context: BTreeMap<String, String>,
 }
 
-pub(crate) fn resolve_effective_derivation_inputs(
+pub(crate) fn ensure_derivation_overrides_allowed(
     identity: &Identity,
     overrides: &DerivationOverrides,
-) -> Result<EffectiveDerivationInputs> {
-    if identity.mode.resolved == Mode::Native {
-        if overrides.is_empty() {
-            return Ok(EffectiveDerivationInputs {
-                org: DEFAULT_DERIVATION_ORG.to_string(),
-                purpose: identity.name.clone(),
-                context: BTreeMap::new(),
-            });
-        }
-
+) -> Result<()> {
+    if identity.mode.resolved == Mode::Native && !overrides.is_empty() {
         return Err(Error::Validation(
             "native identities reject derivation overrides; remove command-level --org, --purpose, and --context flags"
                 .to_string(),
         ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn resolve_effective_derivation_inputs(
+    identity: &Identity,
+    overrides: &DerivationOverrides,
+) -> Result<EffectiveDerivationInputs> {
+    ensure_derivation_overrides_allowed(identity, overrides)?;
+
+    if identity.mode.resolved == Mode::Native {
+        return Ok(EffectiveDerivationInputs {
+            org: DEFAULT_DERIVATION_ORG.to_string(),
+            purpose: identity.name.clone(),
+            context: BTreeMap::new(),
+        });
     }
 
     let mut context = identity.defaults.context.clone();

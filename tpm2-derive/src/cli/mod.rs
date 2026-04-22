@@ -106,24 +106,7 @@ fn derivation_overrides(args: args::DerivationInputArgs) -> DerivationOverrides 
 }
 
 fn identity_create_uses(uses: Vec<UseArg>) -> Vec<UseCase> {
-    let has_all = uses.iter().any(|use_arg| matches!(use_arg, UseArg::All));
-    let mut resolved: Vec<_> = uses
-        .into_iter()
-        .filter(|use_arg| !matches!(use_arg, UseArg::All))
-        .map(Into::into)
-        .collect();
-
-    if has_all {
-        resolved.extend([
-            UseCase::Sign,
-            UseCase::Verify,
-            UseCase::Encrypt,
-            UseCase::Decrypt,
-            UseCase::Derive,
-            UseCase::Ssh,
-        ]);
-    }
-
+    let mut resolved: Vec<_> = uses.into_iter().map(Into::into).collect();
     resolved.sort();
     resolved.dedup();
     resolved
@@ -888,6 +871,13 @@ mod tests {
             signature.to_der().as_bytes().to_vec(),
             public_key_der,
         )
+    }
+
+    #[test]
+    fn identity_create_uses_preserves_all_until_mode_resolution() {
+        let uses = identity_create_uses(vec![UseArg::All, UseArg::Sign]);
+        assert!(uses.contains(&UseCase::All));
+        assert!(uses.contains(&UseCase::Sign));
     }
 
     #[test]

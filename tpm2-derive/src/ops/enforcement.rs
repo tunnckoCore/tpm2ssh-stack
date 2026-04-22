@@ -161,9 +161,9 @@ mod tests {
     }
 
     #[test]
-    fn setup_currently_rejects_native_mode_with_ssh_use_until_capability_workstream_lands() {
+    fn setup_allows_native_mode_with_ssh_use_when_signing_capability_exists() {
         let root_dir = unique_temp_path("setup-native-ssh");
-        let error = ops::resolve_identity(
+        let result = ops::resolve_identity(
             &HeuristicProbe,
             &request(
                 "test-native-ssh",
@@ -173,9 +173,9 @@ mod tests {
                 root_dir.clone(),
             ),
         )
-        .expect_err("native + ssh still depends on capability workstream support");
+        .expect("native + ssh should be allowed as a future-facing signing-backed intent bit");
 
-        assert!(matches!(error, Error::CapabilityMismatch(_)));
+        assert_eq!(result.identity.mode.resolved, Mode::Native);
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -316,7 +316,7 @@ mod tests {
         )
         .expect("native --use all should expand to supported native uses");
 
-        assert_eq!(result.identity.uses, vec![UseCase::Sign, UseCase::Verify]);
+        assert_eq!(result.identity.uses, vec![UseCase::Sign, UseCase::Verify, UseCase::Ssh]);
         let _ = std::fs::remove_dir_all(root_dir);
     }
 

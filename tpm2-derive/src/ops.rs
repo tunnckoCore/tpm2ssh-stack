@@ -17,6 +17,9 @@ pub mod verify;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -501,6 +504,8 @@ fn export_public_key_with_runner<R>(
 where
     R: CommandRunner,
 {
+    shared::ensure_derivation_overrides_allowed(identity, &request.derivation)?;
+
     let format = request
         .public_key_format
         .unwrap_or(PublicKeyExportFormat::SpkiDer);
@@ -790,18 +795,51 @@ fn resolve_secret_export_output_path(
     requested_output: Option<&Path>,
     suffix: &str,
 ) -> Result<PathBuf> {
-    match requested_output {
-        Some(path) if path.is_dir() => Err(Error::Validation(format!(
-            "export output '{}' must be a file path, not a directory",
-            path.display()
-        ))),
-        Some(path) => Ok(path.to_path_buf()),
-        None => Ok(identity
+    let path = match requested_output {
+        Some(path) => path.to_path_buf(),
+        None => identity
             .storage
             .state_layout
             .exports_dir
-            .join(format!("{}.{}", identity.name, suffix))),
+            .join(format!("{}.{}", identity.name, suffix)),
+    };
+
+    validate_secret_bearing_output_path(&path)?;
+    Ok(path)
+}
+
+fn validate_secret_bearing_output_path(path: &Path) -> Result<()> {
+    if path == Path::new("-") {
+        return Err(Error::Validation(
+            "secret-bearing export may not write to stdout; choose an explicit regular file path"
+                .to_string(),
+        ));
     }
+
+    if path.is_dir() {
+        return Err(Error::Validation(format!(
+            "export output '{}' must be a file path, not a directory",
+            path.display()
+        )));
+    }
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(Error::Validation(format!(
+                "export output '{}' must not be a symlink",
+                path.display()
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(Error::Validation(format!(
+                "export output '{}' must be a regular file path",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn write_secret_output(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -817,17 +855,42 @@ fn write_secret_output(path: &Path, bytes: &[u8]) -> Result<()> {
         })?;
     }
 
-    fs::write(path, bytes).map_err(|error| {
+    validate_secret_bearing_output_path(path)?;
+
+    if path.exists() {
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            Error::State(format!(
+                "failed to set permissions on '{}': {error}",
+                path.display()
+            ))
+        })?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(path).map_err(|error| {
         Error::State(format!(
-            "failed to write secret-bearing export to '{}': {error}",
+            "failed to open secret-bearing export destination '{}': {error}",
             path.display()
         ))
     })?;
 
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            Error::State(format!(
+                "failed to set permissions on '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+    file.write_all(bytes).map_err(|error| {
         Error::State(format!(
-            "failed to set permissions on '{}': {error}",
+            "failed to write secret-bearing export to '{}': {error}",
             path.display()
         ))
     })?;
@@ -1183,22 +1246,26 @@ pub(crate) fn resolve_native_key_locator(identity: &Identity) -> Result<NativeKe
 }
 
 fn native_key_uses(identity: &Identity) -> Result<Vec<NativeKeyUse>> {
-    let uses: Vec<_> = identity
+    let mut uses: Vec<_> = identity
         .uses
         .iter()
         .map(|use_case| match use_case {
             UseCase::Sign => Ok(NativeKeyUse::Sign),
             UseCase::Verify => Ok(NativeKeyUse::Verify),
+            UseCase::Ssh => Ok(NativeKeyUse::Sign),
             unsupported => Err(Error::Unsupported(format!(
-                "native setup is currently wired only for sign/verify uses, but identity '{}' requested {:?}",
+                "native setup is currently wired only for sign/verify-backed uses, but identity '{}' requested {:?}",
                 identity.name, unsupported
             ))),
         })
         .collect::<Result<_>>()?;
 
+    uses.sort();
+    uses.dedup();
+
     if uses.is_empty() {
         return Err(Error::Validation(
-            "native setup requires at least one sign/verify use".to_string(),
+            "native setup requires at least one sign/verify-backed use".to_string(),
         ));
     }
 
@@ -1501,20 +1568,7 @@ fn resolve_recovery_bundle_output_path(requested_output: Option<&Path>) -> Resul
         )
     })?;
 
-    if path.is_dir() {
-        return Err(Error::Validation(format!(
-            "export output '{}' must be a file path, not a directory",
-            path.display()
-        )));
-    }
-
-    if path == Path::new("-") {
-        return Err(Error::Validation(
-            "recovery-bundle export may not write to stdout; choose an explicit file path"
-                .to_string(),
-        ));
-    }
-
+    validate_secret_bearing_output_path(path)?;
     Ok(path.to_path_buf())
 }
 
@@ -1550,37 +1604,11 @@ fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
 }
 
 fn write_recovery_bundle_output(path: &Path, bundle: &SeedRecoveryBundleV1) -> Result<usize> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|error| {
-            Error::State(format!(
-                "failed to create export directory '{}': {error}",
-                parent.display()
-            ))
-        })?;
-    }
-
     let payload = format!(
         "{}\n",
         serde_json::to_string_pretty(bundle).map_err(crate::error::Error::from)?
     );
-    fs::write(path, payload.as_bytes()).map_err(|error| {
-        Error::State(format!(
-            "failed to write recovery-bundle export to '{}': {error}",
-            path.display()
-        ))
-    })?;
-
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        Error::State(format!(
-            "failed to set permissions on '{}': {error}",
-            path.display()
-        ))
-    })?;
-
+    write_secret_output(path, payload.as_bytes())?;
     Ok(payload.len())
 }
 
@@ -1988,6 +2016,46 @@ mod tests {
         );
 
         fs::remove_dir_all(root_dir).expect("temporary seed setup state should be removed");
+    }
+
+    #[test]
+    fn export_native_public_key_rejects_derivation_overrides() {
+        let root_dir = unique_temp_path("export-native-derivation-rejected");
+        let identity = Identity::new(
+            "native-export".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            StateLayout::new(root_dir.clone()),
+        );
+
+        let error = export_public_key_with_runner(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::PublicKey,
+                output: Some(root_dir.join("native.der")),
+                public_key_format: Some(PublicKeyExportFormat::SpkiDer),
+                state_dir: Some(root_dir.clone()),
+                reason: None,
+                confirm: false,
+                confirm_phrase: None,
+                derivation: DerivationOverrides {
+                    org: Some("com.example".to_string()),
+                    purpose: None,
+                    context: BTreeMap::new(),
+                },
+            },
+            &ProcessCommandRunner,
+        )
+        .expect_err("native export should reject derivation overrides");
+
+        assert!(matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides")));
+        let _ = fs::remove_dir_all(root_dir);
     }
 
     #[test]

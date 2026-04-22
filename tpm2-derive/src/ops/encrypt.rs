@@ -9,7 +9,7 @@ use secrecy::ExposeSecret;
 
 use crate::backend::CommandRunner;
 use crate::error::{Error, Result};
-use crate::model::{DecryptResult, DerivationOverrides, EncryptResult, Identity, Mode};
+use crate::model::{DecryptResult, DerivationOverrides, EncryptResult, Identity, Mode, UseCase};
 
 use super::seed::{
     HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
@@ -17,7 +17,8 @@ use super::seed::{
     seed_profile_from_profile,
 };
 use super::shared::{
-    encrypt_command_spec, execute_prf_derivation_with_runner, resolve_effective_derivation_inputs,
+    encrypt_command_spec, ensure_derivation_overrides_allowed, execute_prf_derivation_with_runner,
+    resolve_effective_derivation_inputs,
 };
 
 const NONCE_LEN: usize = 12;
@@ -57,6 +58,14 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
+    ensure_derivation_overrides_allowed(identity, derivation)?;
+    if !identity.uses.contains(&UseCase::Encrypt) {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' is not configured with use=encrypt",
+            identity.name
+        )));
+    }
+
     let key_material =
         derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
     let ciphertext = aead_encrypt(&key_material, plaintext)?;
@@ -109,6 +118,14 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
+    ensure_derivation_overrides_allowed(identity, derivation)?;
+    if !identity.uses.contains(&UseCase::Decrypt) {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' is not configured with use=decrypt",
+            identity.name
+        )));
+    }
+
     let key_material =
         derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
     let plaintext = aead_decrypt(&key_material, ciphertext)?;
@@ -427,6 +444,44 @@ mod tests {
         assert_eq!(decrypted.mode, Mode::Prf);
         assert_eq!(hex_decode(decrypted.plaintext.as_deref().expect("plaintext")), plaintext);
         assert_eq!(runner.invocations().len(), 2);
+    }
+
+    #[test]
+    fn encrypt_requires_encrypt_use() {
+        let state_root = tempdir().expect("state root");
+        let mut identity = seed_identity(state_root.path());
+        identity.uses = vec![UseCase::Decrypt];
+
+        let error = encrypt(
+            &identity,
+            b"nope",
+            &DerivationOverrides::default(),
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x01; 32]),
+            &HkdfSha256SeedDeriver,
+        )
+        .expect_err("encrypt should enforce use=encrypt");
+
+        assert!(matches!(error, Error::PolicyRefusal(message) if message.contains("use=encrypt")));
+    }
+
+    #[test]
+    fn decrypt_requires_decrypt_use() {
+        let state_root = tempdir().expect("state root");
+        let mut identity = seed_identity(state_root.path());
+        identity.uses = vec![UseCase::Encrypt];
+
+        let error = decrypt(
+            &identity,
+            b"nope",
+            &DerivationOverrides::default(),
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x01; 32]),
+            &HkdfSha256SeedDeriver,
+        )
+        .expect_err("decrypt should enforce use=decrypt");
+
+        assert!(matches!(error, Error::PolicyRefusal(message) if message.contains("use=decrypt")));
     }
 
     #[test]
