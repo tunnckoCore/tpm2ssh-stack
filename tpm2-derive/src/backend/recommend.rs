@@ -213,6 +213,10 @@ fn selection_reason(mode: Mode, algorithm: Option<Algorithm>, uses: &[UseCase]) 
     }
 }
 
+fn algorithm_supports_ssh_identity(algorithm: Algorithm) -> bool {
+    matches!(algorithm, Algorithm::Ed25519 | Algorithm::P256)
+}
+
 fn supports_mode(
     native: &NativeCapabilitySummary,
     prf_available: bool,
@@ -244,18 +248,23 @@ fn supports_mode(
                 return false;
             };
             !concrete_uses.is_empty()
+                && (!concrete_uses.contains(&UseCase::Verify) || concrete_uses.contains(&UseCase::Sign))
                 && concrete_uses
                     .iter()
                     .all(|use_case| native.supports_use(algorithm, *use_case))
         }
         Mode::Prf => {
             prf_available
+                && (!concrete_uses.contains(&UseCase::Ssh)
+                    || algorithm.is_some_and(algorithm_supports_ssh_identity))
                 && concrete_uses
                     .iter()
                     .all(|use_case| UseCase::allowed_for_mode(Mode::Prf).contains(use_case))
         }
         Mode::Seed => {
             seed_available
+                && (!concrete_uses.contains(&UseCase::Ssh)
+                    || algorithm.is_some_and(algorithm_supports_ssh_identity))
                 && concrete_uses
                     .iter()
                     .all(|use_case| UseCase::allowed_for_mode(Mode::Seed).contains(use_case))
@@ -293,6 +302,12 @@ fn unsupported_mode_reason(
                 );
             }
 
+            if concrete_uses.contains(&UseCase::Verify) && !concrete_uses.contains(&UseCase::Sign) {
+                return format!(
+                    "Native mode cannot satisfy requested uses {requested} for {algorithm:?}; verify-only native identities are not wired in the current prototype slice"
+                );
+            }
+
             let missing = concrete_uses
                 .iter()
                 .copied()
@@ -314,6 +329,11 @@ fn unsupported_mode_reason(
             }
 
             let concrete_uses = expand_mode_requested_uses(mode, algorithm, native, uses);
+            if concrete_uses.contains(&UseCase::Ssh)
+                && !algorithm.is_some_and(algorithm_supports_ssh_identity)
+            {
+                return "PRF mode does not currently support use=ssh for this algorithm".to_string();
+            }
             let missing = concrete_uses
                 .iter()
                 .copied()
@@ -335,6 +355,11 @@ fn unsupported_mode_reason(
             }
 
             let concrete_uses = expand_mode_requested_uses(mode, algorithm, native, uses);
+            if concrete_uses.contains(&UseCase::Ssh)
+                && !algorithm.is_some_and(algorithm_supports_ssh_identity)
+            {
+                return "Seed mode does not currently support use=ssh for this algorithm".to_string();
+            }
             let missing = concrete_uses
                 .iter()
                 .copied()

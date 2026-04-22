@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -449,20 +451,10 @@ where
     plan.request.validate()?;
     ensure_matching_execution_version(plan.executor.version, plan.request.protocol_version())?;
 
-    fs::create_dir_all(&plan.workspace.root_dir).map_err(|error| {
-        Error::State(format!(
-            "failed to create TPM PRF workspace '{}': {error}",
-            plan.workspace.root_dir.display()
-        ))
-    })?;
+    create_secure_prf_workspace(&plan.workspace.root_dir)?;
 
     let request_bytes = plan.request.tpm_input()?;
-    fs::write(&plan.workspace.request_input_path, &request_bytes).map_err(|error| {
-        Error::State(format!(
-            "failed to write TPM PRF request input '{}': {error}",
-            plan.workspace.request_input_path.display()
-        ))
-    })?;
+    write_secure_workspace_file(&plan.workspace.request_input_path, &request_bytes)?;
 
     for step in &plan.steps {
         let output = runner.run(&step.invocation);
@@ -608,6 +600,60 @@ fn ensure_matching_execution_version(
     }
 
     Ok(())
+}
+
+fn create_secure_prf_workspace(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path).map_err(|error| {
+        Error::State(format!(
+            "failed to create TPM PRF workspace '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        Error::State(format!(
+            "failed to harden TPM PRF workspace permissions for '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn write_secure_workspace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(path).map_err(|error| {
+        Error::State(format!(
+            "failed to open TPM PRF workspace file '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            Error::State(format!(
+                "failed to harden TPM PRF workspace file permissions for '{}': {error}",
+                path.display()
+            ))
+        })?;
+
+    use std::io::Write as _;
+    file.write_all(bytes).map_err(|error| {
+        Error::State(format!(
+            "failed to write TPM PRF request input '{}': {error}",
+            path.display()
+        ))
+    })
 }
 
 fn temp_workspace_root(identity: &str) -> Result<PathBuf> {

@@ -283,6 +283,25 @@ mod tests {
     }
 
     #[test]
+    fn setup_rejects_native_mode_with_verify_only_until_that_slice_is_wired() {
+        let root_dir = unique_temp_path("setup-native-verify-only");
+        let error = ops::resolve_identity(
+            &HeuristicProbe,
+            &request(
+                "test-native-verify-only",
+                Algorithm::P256,
+                vec![UseCase::Verify],
+                ModePreference::Native,
+                root_dir.clone(),
+            ),
+        )
+        .expect_err("native verify-only should be rejected truthfully");
+
+        assert!(matches!(error, Error::CapabilityMismatch(message) if message.contains("verify-only native identities are not wired")));
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
     fn auto_chooses_seed_when_prf_cannot_satisfy_signing_request() {
         let root_dir = unique_temp_path("setup-auto-sign-seed");
         let result = ops::resolve_identity(
@@ -317,6 +336,43 @@ mod tests {
         .expect("native --use all should expand to supported native uses");
 
         assert_eq!(result.identity.uses, vec![UseCase::Sign, UseCase::Verify, UseCase::Ssh]);
+    }
+
+    #[test]
+    fn use_all_for_prf_does_not_expand_export_secret() {
+        let root_dir = unique_temp_path("setup-prf-all-no-export-secret");
+        let result = ops::resolve_identity(
+            &AlwaysAvailableProbe,
+            &request(
+                "test-prf-all",
+                Algorithm::Ed25519,
+                vec![UseCase::All],
+                ModePreference::Prf,
+                root_dir.clone(),
+            ),
+        )
+        .expect("prf --use all should expand without export-secret");
+
+        assert!(!result.identity.uses.contains(&UseCase::ExportSecret));
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn setup_rejects_secp256k1_ssh_identities_until_ssh_backend_supports_them() {
+        let root_dir = unique_temp_path("setup-secp256k1-ssh");
+        let error = ops::resolve_identity(
+            &AlwaysAvailableProbe,
+            &request(
+                "test-secp256k1-ssh",
+                Algorithm::Secp256k1,
+                vec![UseCase::Ssh],
+                ModePreference::Prf,
+                root_dir.clone(),
+            ),
+        )
+        .expect_err("secp256k1 ssh identities should be rejected truthfully");
+
+        assert!(matches!(error, Error::CapabilityMismatch(message) if message.contains("use=ssh")));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 

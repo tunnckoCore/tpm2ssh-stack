@@ -90,8 +90,34 @@ pub fn mode_supported_uses(
         Mode::Native => algorithm
             .map(|algorithm| native.supported_uses(algorithm))
             .unwrap_or_default(),
-        Mode::Prf => UseCase::allowed_for_mode(Mode::Prf).to_vec(),
-        Mode::Seed => UseCase::allowed_for_mode(Mode::Seed).to_vec(),
+        Mode::Prf => UseCase::allowed_for_mode(Mode::Prf)
+            .iter()
+            .copied()
+            .filter(|use_case| {
+                !matches!(use_case, UseCase::ExportSecret)
+                    && !matches!(use_case, UseCase::Ssh)
+                        .then_some(())
+                        .is_some_and(|_| {
+                            !algorithm.is_some_and(|algorithm| {
+                                matches!(algorithm, Algorithm::Ed25519 | Algorithm::P256)
+                            })
+                        })
+            })
+            .collect(),
+        Mode::Seed => UseCase::allowed_for_mode(Mode::Seed)
+            .iter()
+            .copied()
+            .filter(|use_case| {
+                !matches!(use_case, UseCase::ExportSecret)
+                    && !matches!(use_case, UseCase::Ssh)
+                        .then_some(())
+                        .is_some_and(|_| {
+                            !algorithm.is_some_and(|algorithm| {
+                                matches!(algorithm, Algorithm::Ed25519 | Algorithm::P256)
+                            })
+                        })
+            })
+            .collect(),
     };
     uses.sort();
     uses.dedup();
