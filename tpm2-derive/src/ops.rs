@@ -10,6 +10,7 @@ pub mod keygen;
 pub mod native;
 pub mod prf;
 pub mod seed;
+mod shared;
 pub mod ssh;
 
 use std::collections::BTreeSet;
@@ -34,8 +35,8 @@ use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessComma
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, CapabilityReport, ExportArtifact, ExportFormat, ExportKind, ExportRequest,
-    ExportResult, Identity, IdentityCreateRequest, IdentityCreateResult,
+    Algorithm, CapabilityReport, DerivationOverrides, ExportArtifact, ExportFormat, ExportKind,
+    ExportRequest, ExportResult, Identity, IdentityCreateRequest, IdentityCreateResult,
     IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode, ModePreference,
     PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult, StateLayout, UseCase,
     expand_mode_requested_uses,
@@ -189,6 +190,13 @@ fn build_identity_record(
 
     // Enforce mode/use compatibility at setup time after mode-aware expansion.
     UseCase::validate_for_mode(&uses, resolved_mode)?;
+
+    if resolved_mode == Mode::Native && !request.defaults.is_empty() {
+        return Err(Error::Validation(
+            "native identities reject derivation defaults; remove identity-level --org, --purpose, and --context flags"
+                .to_string(),
+        ));
+    }
 
     let mut reasons = if let Some(explicit) = request.requested_mode.explicit() {
         vec![format!("mode explicitly requested as {explicit:?}")]
@@ -464,7 +472,7 @@ fn persistable_state_path(state_layout: &StateLayout, path: &Path) -> Result<Str
 pub fn export(request: &ExportRequest) -> Result<ExportResult> {
     validate_profile_name(&request.identity)?;
 
-    if request.kind != ExportKind::PublicKey && request.public_key_format.is_some() {
+    if !matches!(request.kind, ExportKind::PublicKey) && request.public_key_format.is_some() {
         return Err(Error::Validation(
             "--format is supported only with --kind public-key".to_string(),
         ));
@@ -472,61 +480,159 @@ pub fn export(request: &ExportRequest) -> Result<ExportResult> {
 
     let identity = load_identity(&request.identity, request.state_dir.clone())?;
     match request.kind {
-        ExportKind::PublicKey => export_public_key(
-            &identity,
-            request.output.as_deref(),
-            request.public_key_format,
-        ),
+        ExportKind::PublicKey => export_public_key(&identity, request),
+        ExportKind::SecretKey => export_secret_key(&identity, request),
+        ExportKind::Keypair => export_keypair(&identity, request),
         ExportKind::RecoveryBundle => export_recovery_bundle(&identity, request),
     }
 }
 
-fn export_public_key(
-    identity: &Identity,
-    requested_output: Option<&Path>,
-    requested_format: Option<PublicKeyExportFormat>,
-) -> Result<ExportResult> {
-    let format = requested_format.unwrap_or(PublicKeyExportFormat::SpkiDer);
+fn export_public_key(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
+    let format = request
+        .public_key_format
+        .unwrap_or(PublicKeyExportFormat::SpkiDer);
+
     match identity.mode.resolved {
-        Mode::Prf => Err(Error::PolicyRefusal(format!(
-            "identity '{}' resolved to PRF mode; PRF roots do not expose a standalone public key",
-            identity.name
-        ))),
-        Mode::Native => {
-            if !identity.export_policy.public_key_export {
-                return Err(Error::PolicyRefusal(format!(
-                    "identity '{}' resolved to {:?} mode, which does not allow public-key export",
-                    identity.name, identity.mode.resolved
-                )));
-            }
-
-            export_native_public_key_with_runner(
+        Mode::Native => export_native_public_key_with_runner(
+            identity,
+            request.output.as_deref(),
+            format,
+            &ProcessCommandRunner,
+        ),
+        Mode::Prf | Mode::Seed => {
+            let runner = ProcessCommandRunner;
+            let material = crate::ops::keygen::derive_identity_key_material_with_defaults(
                 identity,
-                requested_output,
-                format,
-                &ProcessCommandRunner,
-            )
-        }
-        Mode::Seed => {
-            if !identity.export_policy.public_key_export {
-                return Err(Error::PolicyRefusal(format!(
-                    "identity '{}' resolved to {:?} mode, which does not allow public-key export",
-                    identity.name, identity.mode.resolved
-                )));
-            }
+                &request.derivation,
+                &runner,
+            )?;
+            let public_key_der =
+                crate::ops::keygen::public_key_spki_der_from_material(identity, &material)?;
+            let rendered_public_key =
+                render_derived_public_key_export(identity, format, &public_key_der, &material)?;
+            let destination =
+                resolve_public_key_output_path(identity, request.output.as_deref(), format)?;
+            write_public_key_output(&destination, &rendered_public_key)?;
 
-            let backend =
-                SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
-            let deriver = HkdfSha256SeedDeriver;
-            export_seed_public_key_with_backend(
-                identity,
-                requested_output,
-                format,
-                &backend,
-                &deriver,
-            )
+            Ok(ExportResult {
+                identity: identity.name.clone(),
+                mode: identity.mode.resolved,
+                kind: ExportKind::PublicKey,
+                artifact: ExportArtifact {
+                    format: format.into(),
+                    path: destination,
+                    bytes_written: rendered_public_key.len(),
+                },
+            })
         }
     }
+}
+
+fn export_secret_key(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
+    enforce_secret_export_policy(identity, request, ExportKind::SecretKey)?;
+
+    let runner = ProcessCommandRunner;
+    let material = crate::ops::keygen::derive_identity_key_material_with_defaults(
+        identity,
+        &request.derivation,
+        &runner,
+    )?;
+    let secret_key_hex = crate::ops::keygen::hex_encode(
+        &crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?,
+    );
+    let destination =
+        resolve_secret_export_output_path(identity, request.output.as_deref(), "secret-key.hex")?;
+    write_secret_output(&destination, secret_key_hex.as_bytes())?;
+
+    Ok(ExportResult {
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        kind: ExportKind::SecretKey,
+        artifact: ExportArtifact {
+            format: ExportFormat::SecretKeyHex,
+            path: destination,
+            bytes_written: secret_key_hex.len(),
+        },
+    })
+}
+
+fn export_keypair(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
+    enforce_secret_export_policy(identity, request, ExportKind::Keypair)?;
+
+    let runner = ProcessCommandRunner;
+    let material = crate::ops::keygen::derive_identity_key_material_with_defaults(
+        identity,
+        &request.derivation,
+        &runner,
+    )?;
+    let secret_key_hex = crate::ops::keygen::hex_encode(
+        &crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?,
+    );
+    let public_key_hex = crate::ops::keygen::hex_encode(
+        &crate::ops::keygen::public_key_spki_der_from_material(identity, &material)?,
+    );
+    let payload = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "identity": identity.name.clone(),
+            "mode": identity.mode.resolved,
+            "algorithm": identity.algorithm,
+            "secret_key_hex": secret_key_hex,
+            "public_key_spki_der_hex": public_key_hex,
+        }))
+        .map_err(crate::error::Error::from)?
+    );
+    let destination =
+        resolve_secret_export_output_path(identity, request.output.as_deref(), "keypair.json")?;
+    write_secret_output(&destination, payload.as_bytes())?;
+
+    Ok(ExportResult {
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        kind: ExportKind::Keypair,
+        artifact: ExportArtifact {
+            format: ExportFormat::KeypairJson,
+            path: destination,
+            bytes_written: payload.len(),
+        },
+    })
+}
+
+fn enforce_secret_export_policy(
+    identity: &Identity,
+    request: &ExportRequest,
+    kind: ExportKind,
+) -> Result<()> {
+    if identity.mode.resolved == Mode::Native {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' resolved to native mode; {:?} export is unavailable for native TPM-backed keys",
+            identity.name, kind
+        )));
+    }
+
+    if !identity.uses.contains(&UseCase::ExportSecret) {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' is not configured with use=export-secret, which is required for {:?} export",
+            identity.name, kind
+        )));
+    }
+
+    if !request.confirm {
+        return Err(Error::Validation(format!(
+            "{:?} export requires --confirm because secret key material leaves TPM-only protection",
+            kind
+        )));
+    }
+
+    let reason = request.reason.as_deref().unwrap_or_default().trim();
+    if reason.is_empty() {
+        return Err(Error::Validation(format!(
+            "{:?} export requires --reason to record why secret key material is being exported",
+            kind
+        )));
+    }
+
+    Ok(())
 }
 
 fn export_recovery_bundle(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
@@ -585,6 +691,73 @@ where
     })
 }
 
+fn render_derived_public_key_export(
+    identity: &Identity,
+    format: PublicKeyExportFormat,
+    spki_der: &[u8],
+    material: &[u8],
+) -> Result<Vec<u8>> {
+    match format {
+        PublicKeyExportFormat::SpkiDer => Ok(spki_der.to_vec()),
+        PublicKeyExportFormat::SpkiPem => Ok(spki_der_to_pem(spki_der).into_bytes()),
+        PublicKeyExportFormat::SpkiHex => Ok(hex_encode(spki_der).into_bytes()),
+        PublicKeyExportFormat::Openssh => {
+            crate::ops::ssh::openssh_public_key_from_material(identity, material)
+                .map(String::into_bytes)
+        }
+    }
+}
+
+fn resolve_secret_export_output_path(
+    identity: &Identity,
+    requested_output: Option<&Path>,
+    suffix: &str,
+) -> Result<PathBuf> {
+    match requested_output {
+        Some(path) if path.is_dir() => Err(Error::Validation(format!(
+            "export output '{}' must be a file path, not a directory",
+            path.display()
+        ))),
+        Some(path) => Ok(path.to_path_buf()),
+        None => Ok(identity
+            .storage
+            .state_layout
+            .exports_dir
+            .join(format!("{}.{}", identity.name, suffix))),
+    }
+}
+
+fn write_secret_output(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            Error::State(format!(
+                "failed to create export directory '{}': {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    fs::write(path, bytes).map_err(|error| {
+        Error::State(format!(
+            "failed to write secret-bearing export to '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+        Error::State(format!(
+            "failed to set permissions on '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
 fn export_seed_public_key_with_backend<B, D>(
     identity: &Identity,
     requested_output: Option<&Path>,
@@ -596,24 +769,31 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let seed_profile = seed_profile_from_profile(identity)?;
+    let seed_identity = seed_profile_from_profile(identity)?;
+    let spec = seed_public_key_derivation_spec(identity)?;
     let derived = open_and_derive(
         backend,
         deriver,
         &SeedOpenRequest {
-            identity: seed_profile,
+            identity: seed_identity,
             auth_source: SeedOpenAuthSource::None,
             output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
-                spec: seed_public_key_derivation_spec(identity)?,
-                output_bytes: 32,
+                output_bytes: usize::from(spec.output().length),
+                spec,
             }),
             require_fresh_unseal: true,
             confirm_software_derivation: true,
         },
     )?;
 
-    let public_key_der = seed_public_key_spki_der(identity, derived.expose_secret())?;
-    let rendered_public_key = render_seed_public_key_export(identity, format, &public_key_der)?;
+    let public_key_der =
+        crate::ops::keygen::public_key_spki_der_from_material(identity, derived.expose_secret())?;
+    let rendered_public_key = render_derived_public_key_export(
+        identity,
+        format,
+        &public_key_der,
+        derived.expose_secret(),
+    )?;
     let destination = resolve_public_key_output_path(identity, requested_output, format)?;
     write_public_key_output(&destination, &rendered_public_key)?;
 
@@ -630,105 +810,9 @@ where
 }
 
 fn seed_public_key_derivation_spec(identity: &Identity) -> Result<DerivationSpec> {
-    match identity.algorithm {
-        Algorithm::Ed25519
-            if identity
-                .uses
-                .iter()
-                .any(|use_case| matches!(use_case, UseCase::Ssh)) =>
-        {
-            crate::ops::ssh::ssh_ed25519_derivation_spec()
-        }
-        Algorithm::Ed25519 => seed_software_child_key_spec("ed25519", OutputKind::Ed25519Seed),
-        Algorithm::Secp256k1 => {
-            seed_software_child_key_spec("secp256k1", OutputKind::Secp256k1Scalar)
-        }
-        Algorithm::P256 => seed_software_child_key_spec("p256", OutputKind::P256Scalar),
-    }
-}
-
-fn seed_software_child_key_spec(
-    algorithm: &str,
-    output_kind: OutputKind,
-) -> Result<DerivationSpec> {
-    Ok(DerivationSpec::V1(DerivationSpecV1::software_child_key(
-        SEED_PUBLIC_KEY_NAMESPACE,
-        algorithm,
-        SEED_PUBLIC_KEY_PATH,
-        output_kind,
-    )?))
-}
-
-fn seed_public_key_spki_der(identity: &Identity, derived_secret: &[u8]) -> Result<Vec<u8>> {
-    match identity.algorithm {
-        Algorithm::Ed25519 => seed_ed25519_public_key_spki_der(identity, derived_secret),
-        Algorithm::Secp256k1 => seed_secp256k1_public_key_spki_der(identity, derived_secret),
-        Algorithm::P256 => seed_p256_public_key_spki_der(identity, derived_secret),
-    }
-}
-
-fn seed_ed25519_public_key_spki_der(identity: &Identity, derived_secret: &[u8]) -> Result<Vec<u8>> {
-    let seed_bytes = seed_secret_bytes(identity, derived_secret)?;
-    let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
-    signing_key
-        .verifying_key()
-        .to_public_key_der()
-        .map(|document| document.as_bytes().to_vec())
-        .map_err(|error| {
-            Error::Internal(format!(
-                "failed to encode ed25519 seed public key for identity '{}': {error}",
-                identity.name
-            ))
-        })
-}
-
-fn seed_secp256k1_public_key_spki_der(
-    identity: &Identity,
-    derived_secret: &[u8],
-) -> Result<Vec<u8>> {
-    let scalar_bytes = seed_valid_ec_scalar_bytes(identity, derived_secret, |candidate| {
-        k256::SecretKey::from_slice(candidate).is_ok()
-    })?;
-    let secret_key = k256::SecretKey::from_slice(&scalar_bytes).map_err(|error| {
-        Error::Internal(format!(
-            "failed to materialize secp256k1 seed secret key for identity '{}': {error}",
-            identity.name
-        ))
-    })?;
-
-    secret_key
-        .public_key()
-        .to_public_key_der()
-        .map(|document| document.as_bytes().to_vec())
-        .map_err(|error| {
-            Error::Internal(format!(
-                "failed to encode secp256k1 seed public key for identity '{}': {error}",
-                identity.name
-            ))
-        })
-}
-
-fn seed_p256_public_key_spki_der(identity: &Identity, derived_secret: &[u8]) -> Result<Vec<u8>> {
-    let scalar_bytes = seed_valid_ec_scalar_bytes(identity, derived_secret, |candidate| {
-        p256::SecretKey::from_slice(candidate).is_ok()
-    })?;
-    let secret_key = p256::SecretKey::from_slice(&scalar_bytes).map_err(|error| {
-        Error::Internal(format!(
-            "failed to materialize p256 seed secret key for identity '{}': {error}",
-            identity.name
-        ))
-    })?;
-
-    secret_key
-        .public_key()
-        .to_public_key_der()
-        .map(|document| document.as_bytes().to_vec())
-        .map_err(|error| {
-            Error::Internal(format!(
-                "failed to encode p256 seed public key for identity '{}': {error}",
-                identity.name
-            ))
-        })
+    let effective =
+        shared::resolve_effective_derivation_inputs(identity, &DerivationOverrides::default())?;
+    shared::identity_key_spec(identity.algorithm, &effective)
 }
 
 fn seed_secret_bytes(identity: &Identity, derived_secret: &[u8]) -> Result<[u8; 32]> {
@@ -1923,7 +2007,7 @@ mod tests {
 
         let expected = expected_seed_public_key_der(
             &seed,
-            crate::ops::ssh::ssh_ed25519_derivation_spec().expect("ssh ed25519 spec"),
+            seed_public_key_derivation_spec(&identity).expect("seed ed25519 spec"),
             Algorithm::Ed25519,
         );
 
@@ -2102,8 +2186,8 @@ mod tests {
     }
 
     #[test]
-    fn export_refuses_prf_public_key_requests_after_loading_profile() {
-        let root_dir = unique_temp_path("export-prf-refusal");
+    fn export_no_longer_rejects_prf_public_key_requests_on_policy_only() {
+        let root_dir = unique_temp_path("export-prf-public-key");
         let identity = Identity::new(
             "prf-default".to_string(),
             Algorithm::Ed25519,
@@ -2126,10 +2210,14 @@ mod tests {
             reason: None,
             confirm: false,
             confirm_phrase: None,
+            derivation: DerivationOverrides::default(),
         })
-        .expect_err("prf export should refuse");
+        .expect_err("prf export still needs provisioned PRF root material in tests");
 
-        assert!(matches!(error, Error::PolicyRefusal(message) if message.contains("PRF mode")));
+        assert!(
+            !matches!(error, Error::PolicyRefusal(message) if message.contains("PRF mode")),
+            "PRF public-key export should no longer be rejected just because the identity is PRF-backed"
+        );
 
         fs::remove_dir_all(root_dir).expect("temporary prf export state should be removed");
     }
@@ -2402,6 +2490,7 @@ mod tests {
                 confirm_phrase: Some(
                     crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
                 ),
+                derivation: DerivationOverrides::default(),
             },
             &FakeSeedExportBackend::new(vec![0x7a; 32]),
         )
@@ -2449,6 +2538,7 @@ mod tests {
                 confirm_phrase: Some(
                     crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
                 ),
+                derivation: DerivationOverrides::default(),
             },
             &FakeSeedExportBackend::new(vec![0x7a; 32]),
         )
