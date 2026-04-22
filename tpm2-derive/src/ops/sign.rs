@@ -12,7 +12,8 @@ use crate::backend::{CommandInvocation, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, DerivationOverrides, Diagnostic, Identity, Mode, SignRequest, UseCase,
+    Algorithm, BinaryOutputFormat, DerivationOverrides, Diagnostic, Identity, Mode, SignRequest,
+    UseCase,
 };
 use crate::ops::keygen::{derive_identity_key_material_with_defaults, hex_encode};
 use crate::ops::native::subprocess::{
@@ -32,8 +33,8 @@ use crate::ops::seed::{
 use secrecy::ExposeSecret;
 
 use super::shared::{
-    classify_native_command_failure, ensure_derivation_overrides_allowed, ensure_dir,
-    load_input_bytes,
+    classify_native_command_failure, encode_output_bytes, ensure_derivation_overrides_allowed,
+    ensure_dir, load_input_bytes, write_output_file,
 };
 
 #[cfg(test)]
@@ -50,8 +51,11 @@ pub struct NativeSignOperationResult {
     pub digest_algorithm: DigestAlgorithm,
     pub input_bytes: usize,
     pub digest_path: PathBuf,
-    pub output_path: PathBuf,
-    pub signature_bytes_written: Option<usize>,
+    pub output_format: BinaryOutputFormat,
+    pub output_path: Option<PathBuf>,
+    pub signature_bytes: Option<usize>,
+    pub signature: Option<String>,
+    pub signature_format: SeedSignatureFormat,
     pub plan: NativeSignPlan,
 }
 
@@ -63,8 +67,10 @@ pub struct DerivedSignOperationResult {
     pub digest_algorithm: DigestAlgorithm,
     pub digest_hex: String,
     pub input_bytes: usize,
+    pub output_format: BinaryOutputFormat,
+    pub output_path: Option<PathBuf>,
     pub signature_bytes: usize,
-    pub signature_hex: String,
+    pub signature: Option<String>,
     pub signature_format: SeedSignatureFormat,
 }
 
@@ -86,7 +92,7 @@ pub struct StagedNativeSign {
     pub digest_algorithm: DigestAlgorithm,
     pub input_bytes: usize,
     pub digest_path: PathBuf,
-    pub output_path: PathBuf,
+    pub artifact_path: PathBuf,
     pub plan: NativeSignPlan,
     pub ready_for_execution: bool,
     pub diagnostics: Vec<Diagnostic>,
@@ -116,19 +122,24 @@ where
         Mode::Native => {
             let staged = stage_native_sign(request, identity)?;
             let mut diagnostics = staged.diagnostics.clone();
-            let signature_bytes_written = if staged.ready_for_execution {
-                let bytes_written = execute_native_sign_plan_with_runner(&staged.plan, runner)?;
+            let (signature_bytes, output_path, signature) = if staged.ready_for_execution {
+                let signature_bytes = execute_native_sign_plan_with_runner(&staged.plan, runner)?;
+                let (output_path, signature) = persist_formatted_signature(
+                    identity,
+                    request,
+                    &signature_bytes,
+                    Some(staged.artifact_path.as_path()),
+                )?;
                 diagnostics.push(Diagnostic::info(
                     "native-sign-executed",
                     format!(
-                        "executed native sign and wrote {} bytes to '{}'",
-                        bytes_written,
-                        staged.output_path.display()
+                        "executed native sign and produced {} signature bytes",
+                        signature_bytes.len()
                     ),
                 ));
-                Some(bytes_written)
+                (Some(signature_bytes.len()), output_path, signature)
             } else {
-                None
+                (None, None, None)
             };
 
             Ok((
@@ -136,7 +147,7 @@ where
                     identity: identity.clone(),
                     request: request.clone(),
                     mode: Mode::Native,
-                    state: if signature_bytes_written.is_some() {
+                    state: if signature_bytes.is_some() {
                         "executed".to_string()
                     } else {
                         "planned".to_string()
@@ -144,8 +155,11 @@ where
                     digest_algorithm: staged.digest_algorithm,
                     input_bytes: staged.input_bytes,
                     digest_path: staged.digest_path,
-                    output_path: staged.output_path,
-                    signature_bytes_written,
+                    output_format: request.format,
+                    output_path,
+                    signature_bytes,
+                    signature,
+                    signature_format: SeedSignatureFormat::Der,
                     plan: staged.plan,
                 }),
                 diagnostics,
@@ -197,6 +211,9 @@ where
         Algorithm::Secp256k1 => sign_seed_secp256k1(&input_bytes, &derived, identity)?,
     };
 
+    let (output_path, signature) =
+        persist_formatted_signature(identity, request, &signature_bytes, None)?;
+
     Ok((
         DerivedSignOperationResult {
             identity: identity.clone(),
@@ -205,8 +222,10 @@ where
             digest_algorithm: DigestAlgorithm::Sha256,
             digest_hex: hex_encode(&digest),
             input_bytes: input_bytes.len(),
+            output_format: request.format,
+            output_path,
             signature_bytes: signature_bytes.len(),
-            signature_hex: hex_encode(&signature_bytes),
+            signature,
             signature_format,
         },
         diagnostics,
@@ -253,6 +272,9 @@ where
         }
     };
 
+    let (output_path, signature) =
+        persist_formatted_signature(identity, request, &signature_bytes, None)?;
+
     Ok((
         DerivedSignOperationResult {
             identity: identity.clone(),
@@ -261,8 +283,10 @@ where
             digest_algorithm: DigestAlgorithm::Sha256,
             digest_hex: hex_encode(&digest),
             input_bytes: input_bytes.len(),
+            output_format: request.format,
+            output_path,
             signature_bytes: signature_bytes.len(),
-            signature_hex: hex_encode(&signature_bytes),
+            signature,
             signature_format,
         },
         diagnostics,
@@ -417,15 +441,7 @@ pub(crate) fn stage_native_sign(
         .objects_dir
         .join(&identity.name)
         .join("native-sign");
-    let output_dir = identity
-        .storage
-        .state_layout
-        .exports_dir
-        .join(&identity.name)
-        .join("signatures");
-
     ensure_dir(&runtime_dir, "native sign runtime")?;
-    ensure_dir(&output_dir, "native sign output")?;
 
     let input_bytes = load_sign_input(&request.input)?;
     if input_bytes.is_empty() {
@@ -437,7 +453,7 @@ pub(crate) fn stage_native_sign(
     let digest = Sha256::digest(&input_bytes).to_vec();
     let digest_path = runtime_dir.join("sha256.digest.bin");
     let plain_signature_path = runtime_dir.join("signature.p1363.bin");
-    let output_path = output_dir.join("signature.der");
+    let artifact_path = runtime_dir.join("signature.der");
     fs::write(&digest_path, &digest).map_err(|error| {
         Error::State(format!(
             "failed to write staged sign digest '{}': {error}",
@@ -462,7 +478,7 @@ pub(crate) fn stage_native_sign(
             auth: NativeAuthSource::Empty,
             artifacts: NativeSignArtifacts {
                 digest_path: digest_path.clone(),
-                signature_path: output_path.clone(),
+                signature_path: artifact_path.clone(),
                 plain_signature_path: Some(plain_signature_path),
             },
         },
@@ -475,7 +491,7 @@ pub(crate) fn stage_native_sign(
         digest_algorithm: DigestAlgorithm::Sha256,
         input_bytes: input_bytes.len(),
         digest_path,
-        output_path,
+        artifact_path,
         plan,
         ready_for_execution,
         diagnostics,
@@ -558,7 +574,7 @@ fn resolve_native_sign_locator(identity: &Identity) -> (NativeKeyLocator, bool, 
 pub(crate) fn execute_native_sign_plan_with_runner<R>(
     plan: &NativeSignPlan,
     runner: &R,
-) -> Result<usize>
+) -> Result<Vec<u8>>
 where
     R: CommandRunner,
 {
@@ -573,8 +589,7 @@ where
         ));
     }
 
-    let signature = finalize_native_signature_output(plan)?;
-    Ok(signature.len())
+    finalize_native_signature_output(plan)
 }
 
 fn finalize_native_signature_output(plan: &NativeSignPlan) -> Result<Vec<u8>> {
@@ -614,6 +629,32 @@ fn finalize_native_signature_output(plan: &NativeSignPlan) -> Result<Vec<u8>> {
     }
 }
 
+fn persist_formatted_signature(
+    identity: &Identity,
+    request: &SignRequest,
+    signature_bytes: &[u8],
+    cleanup_path: Option<&std::path::Path>,
+) -> Result<(Option<PathBuf>, Option<String>)> {
+    let encoded = encode_output_bytes(request.format, signature_bytes);
+    let result = match request.output.as_deref() {
+        Some(path) => write_output_file(path, &encoded).map(|()| (Some(path.to_path_buf()), None)),
+        None => String::from_utf8(encoded)
+            .map(|text| (None, Some(text)))
+            .map_err(|error| {
+                Error::State(format!(
+                    "formatted sign output for identity '{}' could not be rendered as text: {error}",
+                    identity.name
+                ))
+            }),
+    };
+
+    if let Some(path) = cleanup_path {
+        let _ = fs::remove_file(path);
+    }
+
+    result
+}
+
 fn load_sign_input(input: &crate::model::InputSource) -> Result<Vec<u8>> {
     load_input_bytes(input, "sign input")
 }
@@ -650,6 +691,8 @@ mod tests {
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
+                format: BinaryOutputFormat::Hex,
+                output: None,
             },
             &DerivationOverrides {
                 org: Some("com.example".to_string()),
@@ -659,6 +702,8 @@ mod tests {
         )
         .expect_err("native sign should reject derivation overrides");
 
-        assert!(matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides")));
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides"))
+        );
     }
 }

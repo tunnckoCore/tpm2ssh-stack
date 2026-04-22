@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     version,
     about = "TPM-backed identity operations with native, PRF, and seed modes",
     long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, 'import' to reseal an exported seed bundle into fresh TPM-backed state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind keypair --confirm --reason \"hardware migration\" --output app-prf.json\n  tpm2-derive import --bundle backup.json --identity restored-user --confirm"
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind secret-key --format base64 --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format base64 --confirm --reason \"hardware migration\" --output app-prf.json\n  tpm2-derive import --bundle backup.json --identity restored-user --confirm"
 )]
 pub struct Cli {
     #[arg(
@@ -113,6 +113,18 @@ pub struct DeriveArgs {
     )]
     pub length: u16,
     #[arg(
+        long = "format",
+        value_enum,
+        default_value_t = BinaryOutputFormatArg::Hex,
+        help = "Output format for derived bytes"
+    )]
+    pub format: BinaryOutputFormatArg,
+    #[arg(
+        long,
+        help = "Write derived output to a file instead of returning it inline"
+    )]
+    pub output: Option<PathBuf>,
+    #[arg(
         long,
         help = "Override the state root directory instead of the default local state path"
     )]
@@ -132,6 +144,18 @@ pub struct SignArgs {
         help = "Input file to sign, or '-' for stdin"
     )]
     pub input: String,
+    #[arg(
+        long = "format",
+        value_enum,
+        default_value_t = BinaryOutputFormatArg::Hex,
+        help = "Output format for the emitted signature"
+    )]
+    pub format: BinaryOutputFormatArg,
+    #[arg(
+        long,
+        help = "Write the signature to a file instead of returning it inline"
+    )]
+    pub output: Option<PathBuf>,
     #[arg(
         long,
         help = "Override the state root directory instead of the default local state path"
@@ -154,6 +178,13 @@ pub struct VerifyArgs {
     pub input: String,
     #[arg(long, help = "Signature file to verify")]
     pub signature: String,
+    #[arg(
+        long = "format",
+        value_enum,
+        default_value_t = BinaryInputFormatArg::Auto,
+        help = "Input format for the signature data"
+    )]
+    pub format: BinaryInputFormatArg,
     #[arg(
         long,
         help = "Override the state root directory instead of the default local state path"
@@ -206,7 +237,9 @@ pub struct DecryptArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Export public material or gated secret-bearing artifacts from a persisted identity")]
+#[command(
+    about = "Export public material or gated secret-bearing artifacts from a persisted identity"
+)]
 pub struct ExportArgs {
     #[arg(long = "with", help = "Existing identity name to use")]
     pub identity: String,
@@ -217,9 +250,9 @@ pub struct ExportArgs {
     #[arg(
         long = "format",
         value_enum,
-        help = "Public-key encoding to emit; defaults to spki-der"
+        help = "Artifact format; valid values depend on --kind (public-key: spki-der|spki-pem|spki-hex|openssh, secret-key: hex|base64, keypair: hex|base64 inside JSON, recovery-bundle: json)"
     )]
-    pub public_key_format: Option<PublicKeyExportFormatArg>,
+    pub format: Option<ExportFormatArg>,
     #[arg(
         long,
         help = "Destination file path; recovery-bundle export requires this"
@@ -342,16 +375,36 @@ pub enum ModeArg {
 pub enum ExportKindArg {
     /// Export public key material.
     PublicKey,
-    /// Export a derived secret key in hex form.
+    /// Export a derived secret key.
     SecretKey,
-    /// Export both derived secret and public key material together as JSON.
+    /// Export both derived secret and public key material together as JSON; --format applies to both embedded key values.
     Keypair,
     /// Export a break-glass seed recovery bundle.
     RecoveryBundle,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum PublicKeyExportFormatArg {
+pub enum BinaryOutputFormatArg {
+    /// Write lowercase hexadecimal text.
+    Hex,
+    /// Write base64 text.
+    Base64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum BinaryInputFormatArg {
+    /// Auto-detect hex/base64 text and otherwise treat the signature as raw bytes.
+    Auto,
+    /// Treat the signature input as raw bytes.
+    Raw,
+    /// Treat the signature input as lowercase or uppercase hexadecimal text.
+    Hex,
+    /// Treat the signature input as base64 text.
+    Base64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum ExportFormatArg {
     /// Write binary SubjectPublicKeyInfo DER.
     SpkiDer,
     /// Write PEM-armored SubjectPublicKeyInfo.
@@ -360,6 +413,12 @@ pub enum PublicKeyExportFormatArg {
     SpkiHex,
     /// Write an OpenSSH public key line.
     Openssh,
+    /// Write lowercase hexadecimal text.
+    Hex,
+    /// Write base64 text.
+    Base64,
+    /// Write JSON.
+    Json,
 }
 
 pub fn parse_key_value(value: &str) -> Result<(String, String), String> {
@@ -421,6 +480,10 @@ mod tests {
             "tenant=alpha",
             "--length",
             "32",
+            "--format",
+            "base64",
+            "--output",
+            "derived.txt",
         ])
         .expect("cli should parse");
 
@@ -433,6 +496,8 @@ mod tests {
                     args.derivation.context,
                     vec![("tenant".to_string(), "alpha".to_string())]
                 );
+                assert_eq!(args.format, BinaryOutputFormatArg::Base64);
+                assert_eq!(args.output, Some(PathBuf::from("derived.txt")));
             }
             other => panic!("expected derive command, found {other:?}"),
         }
@@ -450,7 +515,51 @@ mod tests {
     }
 
     #[test]
-    fn export_parses_public_key_format_flag() {
+    fn sign_and_verify_parse_format_flags() {
+        let sign = Cli::try_parse_from([
+            "tpm2-derive",
+            "sign",
+            "--with",
+            "prod-signer",
+            "--format",
+            "base64",
+            "--output",
+            "sig.txt",
+        ])
+        .expect("sign cli should parse");
+
+        match sign.command {
+            Command::Sign(args) => {
+                assert_eq!(args.identity, "prod-signer");
+                assert_eq!(args.format, BinaryOutputFormatArg::Base64);
+                assert_eq!(args.output, Some(PathBuf::from("sig.txt")));
+            }
+            other => panic!("expected sign command, found {other:?}"),
+        }
+
+        let verify = Cli::try_parse_from([
+            "tpm2-derive",
+            "verify",
+            "--with",
+            "prod-signer",
+            "--signature",
+            "sig.txt",
+            "--format",
+            "base64",
+        ])
+        .expect("verify cli should parse");
+
+        match verify.command {
+            Command::Verify(args) => {
+                assert_eq!(args.identity, "prod-signer");
+                assert_eq!(args.format, BinaryInputFormatArg::Base64);
+            }
+            other => panic!("expected verify command, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_parses_format_flag() {
         let cli = Cli::try_parse_from([
             "tpm2-derive",
             "export",
@@ -466,10 +575,7 @@ mod tests {
         match cli.command {
             Command::Export(args) => {
                 assert_eq!(args.identity, "prod-signer");
-                assert_eq!(
-                    args.public_key_format,
-                    Some(PublicKeyExportFormatArg::Openssh)
-                );
+                assert_eq!(args.format, Some(ExportFormatArg::Openssh));
             }
             other => panic!("expected export command, found {other:?}"),
         }

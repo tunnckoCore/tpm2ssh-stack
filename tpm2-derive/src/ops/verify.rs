@@ -12,7 +12,8 @@ use tempfile::Builder as TempfileBuilder;
 use crate::backend::{CommandInvocation, CommandRunner, ProcessCommandRunner};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, DerivationOverrides, Diagnostic, Identity, InputSource, Mode, UseCase, VerifyRequest,
+    Algorithm, BinaryInputFormat, DerivationOverrides, Diagnostic, Identity, InputSource, Mode,
+    UseCase, VerifyRequest,
 };
 use crate::ops::keygen::{derive_identity_key_material_with_defaults, hex_encode};
 use crate::ops::native::{NativeKeyRef, NativePublicKeyEncoding, NativePublicKeyExportRequest};
@@ -26,7 +27,8 @@ use crate::ops::seed::{
 use secrecy::ExposeSecret;
 
 use super::shared::{
-    classify_native_command_failure, ensure_derivation_overrides_allowed, load_input_bytes,
+    classify_native_command_failure, decode_input_bytes, ensure_derivation_overrides_allowed,
+    load_input_bytes,
 };
 #[cfg(test)]
 use super::sign::{
@@ -50,6 +52,7 @@ pub struct VerifyOperationResult {
     pub digest_algorithm: crate::ops::native::DigestAlgorithm,
     pub digest_hex: String,
     pub input_bytes: usize,
+    pub signature_input_format: BinaryInputFormat,
     pub signature_bytes: usize,
     pub signature_format: VerifySignatureFormat,
 }
@@ -106,7 +109,9 @@ where
     }
 
     let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
+    let raw_signature_input = load_input_bytes(&request.signature, "verify signature")?;
+    let (signature_bytes, signature_input_format) =
+        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
     if signature_bytes.is_empty() {
         return Err(Error::Validation(
             "verify signature must not be empty".to_string(),
@@ -133,6 +138,7 @@ where
             &signature_bytes,
             &digest,
             &derived,
+            signature_input_format,
             diagnostics,
         ),
         Algorithm::P256 => verify_seed_p256(
@@ -142,6 +148,7 @@ where
             &signature_bytes,
             &digest,
             &derived,
+            signature_input_format,
             diagnostics,
         ),
         Algorithm::Secp256k1 => verify_seed_secp256k1(
@@ -151,6 +158,7 @@ where
             &signature_bytes,
             &digest,
             &derived,
+            signature_input_format,
             diagnostics,
         ),
     }
@@ -188,7 +196,9 @@ where
     }
 
     let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
+    let raw_signature_input = load_input_bytes(&request.signature, "verify signature")?;
+    let (signature_bytes, signature_input_format) =
+        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
     if signature_bytes.is_empty() {
         return Err(Error::Validation(
             "verify signature must not be empty".to_string(),
@@ -210,6 +220,7 @@ where
             digest_algorithm: crate::ops::native::DigestAlgorithm::Sha256,
             digest_hex: hex_encode(&digest),
             input_bytes: input_bytes.len(),
+            signature_input_format,
             signature_bytes: signature_bytes.len(),
             signature_format,
         },
@@ -251,7 +262,9 @@ where
     }
 
     let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
+    let raw_signature_input = load_input_bytes(&request.signature, "verify signature")?;
+    let (signature_bytes, signature_input_format) =
+        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
     if signature_bytes.is_empty() {
         return Err(Error::Validation(
             "verify signature must not be empty".to_string(),
@@ -273,6 +286,7 @@ where
             &signature_bytes,
             &digest,
             derived.expose_secret(),
+            signature_input_format,
             diagnostics,
         ),
         Algorithm::P256 => verify_seed_p256(
@@ -282,6 +296,7 @@ where
             &signature_bytes,
             &digest,
             derived.expose_secret(),
+            signature_input_format,
             diagnostics,
         ),
         Algorithm::Secp256k1 => verify_seed_secp256k1(
@@ -291,6 +306,7 @@ where
             &signature_bytes,
             &digest,
             derived.expose_secret(),
+            signature_input_format,
             diagnostics,
         ),
     }
@@ -303,6 +319,7 @@ fn verify_seed_ed25519(
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
+    signature_input_format: BinaryInputFormat,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let seed_bytes: [u8; 32] = derived_seed.try_into().map_err(|_| {
@@ -326,6 +343,7 @@ fn verify_seed_ed25519(
             digest_algorithm: crate::ops::native::DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
             input_bytes: input_bytes.len(),
+            signature_input_format,
             signature_bytes: signature_bytes.len(),
             signature_format,
         },
@@ -340,6 +358,7 @@ fn verify_seed_p256(
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
+    signature_input_format: BinaryInputFormat,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let scalar_bytes =
@@ -363,6 +382,7 @@ fn verify_seed_p256(
             digest_algorithm: crate::ops::native::DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
             input_bytes: input_bytes.len(),
+            signature_input_format,
             signature_bytes: signature_bytes.len(),
             signature_format,
         },
@@ -377,6 +397,7 @@ fn verify_seed_secp256k1(
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
+    signature_input_format: BinaryInputFormat,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let scalar_bytes =
@@ -401,6 +422,7 @@ fn verify_seed_secp256k1(
             digest_algorithm: crate::ops::native::DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
             input_bytes: input_bytes.len(),
+            signature_input_format,
             signature_bytes: signature_bytes.len(),
             signature_format,
         },
@@ -613,6 +635,7 @@ mod tests {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path { path: sig_path },
+                format: BinaryInputFormat::Auto,
             },
             &DerivationOverrides {
                 org: Some("com.example".to_string()),
@@ -622,6 +645,8 @@ mod tests {
         )
         .expect_err("native verify should reject derivation overrides");
 
-        assert!(matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides")));
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides"))
+        );
     }
 }

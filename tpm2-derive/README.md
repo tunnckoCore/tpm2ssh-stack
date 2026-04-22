@@ -114,14 +114,26 @@ tpm2-derive identity app-prf \
 Use that identity for sign/derive/export/ssh-add:
 
 ```bash
-tpm2-derive sign --with prod-signer --input message.bin
+tpm2-derive sign \
+  --with prod-signer \
+  --input message.bin \
+  --format base64 \
+  --output message.sig
+
+tpm2-derive verify \
+  --with prod-signer \
+  --input message.bin \
+  --signature message.sig \
+  --format base64
 
 tpm2-derive derive \
   --with app-prf \
   --org com.example \
   --purpose session \
   --context tenant=alpha \
-  --length 32
+  --length 32 \
+  --format base64 \
+  --output session.key
 
 tpm2-derive export \
   --with app-prf \
@@ -150,13 +162,15 @@ Secret-bearing export stays explicit and high-friction:
 tpm2-derive export \
   --with backup-seed \
   --kind secret-key \
+  --format base64 \
   --confirm \
   --reason backup \
-  --output backup-seed.secret.hex
+  --output backup-seed.secret.base64
 
 tpm2-derive export \
   --with backup-seed \
   --kind keypair \
+  --format base64 \
   --confirm \
   --reason "hardware migration" \
   --output backup-seed.keypair.json

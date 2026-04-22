@@ -10,7 +10,10 @@ use crate::crypto::{
     DerivationSpecV1, OutputKind, OutputSpec,
 };
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, DerivationOverrides, Identity, InputSource, Mode};
+use crate::model::{
+    Algorithm, BinaryInputFormat, BinaryOutputFormat, DerivationOverrides, Identity, InputSource,
+    Mode,
+};
 
 use super::prf::{
     PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
@@ -243,24 +246,23 @@ fn resolve_state_path(identity: &Identity, value: &str) -> PathBuf {
     }
 }
 
-fn temporary_workspace_root(kind: &str, identity: &str) -> Result<PathBuf> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+fn temporary_workspace_root(kind: &str, _identity: &str) -> Result<PathBuf> {
+    let tempdir = tempfile::Builder::new()
+        .prefix(&format!("tpm2-derive-{kind}-"))
+        .tempdir()
         .map_err(|error| {
             Error::State(format!(
-                "system clock error while creating {kind} workspace: {error}"
+                "failed to allocate secure temporary {kind} workspace: {error}"
             ))
         })?;
-    let sanitized_identity = identity
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect::<String>();
-
-    Ok(std::env::temp_dir().join(format!(
-        "tpm2-derive-{kind}-{}-{sanitized_identity}-{}",
-        std::process::id(),
-        now.as_nanos()
-    )))
+    let path = tempdir.keep();
+    fs::remove_dir(&path).map_err(|error| {
+        Error::State(format!(
+            "failed to prepare fresh temporary {kind} workspace '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(path)
 }
 
 pub(crate) fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
@@ -279,6 +281,130 @@ pub(crate) fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u
             ))
         }),
     }
+}
+
+pub(crate) fn encode_output_bytes(format: BinaryOutputFormat, bytes: &[u8]) -> Vec<u8> {
+    match format {
+        BinaryOutputFormat::Hex => hex_encode(bytes).into_bytes(),
+        BinaryOutputFormat::Base64 => base64_encode(bytes).into_bytes(),
+    }
+}
+
+pub(crate) fn decode_input_bytes(
+    format: BinaryInputFormat,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(Vec<u8>, BinaryInputFormat)> {
+    match format {
+        BinaryInputFormat::Raw => Ok((bytes.to_vec(), BinaryInputFormat::Raw)),
+        BinaryInputFormat::Hex => Ok((decode_hex_text(bytes, label)?, BinaryInputFormat::Hex)),
+        BinaryInputFormat::Base64 => {
+            Ok((decode_base64_text(bytes, label)?, BinaryInputFormat::Base64))
+        }
+        BinaryInputFormat::Auto => {
+            if let Ok(decoded) = decode_hex_text(bytes, label) {
+                return Ok((decoded, BinaryInputFormat::Hex));
+            }
+            if let Ok(decoded) = decode_base64_text(bytes, label) {
+                return Ok((decoded, BinaryInputFormat::Base64));
+            }
+            Ok((bytes.to_vec(), BinaryInputFormat::Raw))
+        }
+    }
+}
+
+pub(crate) fn output_format_extension(format: BinaryOutputFormat) -> &'static str {
+    match format {
+        BinaryOutputFormat::Hex => "hex",
+        BinaryOutputFormat::Base64 => "base64",
+    }
+}
+
+pub(crate) fn write_output_file(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        Error::State(format!(
+            "failed to create output directory '{}': {error}",
+            parent.display()
+        ))
+    })?;
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(Error::Validation(format!(
+                "output '{}' must not be a symlink",
+                path.display()
+            )));
+        }
+        if !file_type.is_file() {
+            return Err(Error::Validation(format!(
+                "output '{}' must be a regular file path",
+                path.display()
+            )));
+        }
+    }
+
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("output"),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    let mut file = options.open(&temp_path).map_err(|error| {
+        Error::State(format!(
+            "failed to create temp output file '{}': {error}",
+            temp_path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                let _ = fs::remove_file(&temp_path);
+                Error::State(format!(
+                    "failed to harden temp output permissions '{}': {error}",
+                    temp_path.display()
+                ))
+            })?;
+    }
+
+    use std::io::Write as _;
+    if let Err(error) = file.write_all(data) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(Error::State(format!(
+            "failed to write output to '{}': {error}",
+            temp_path.display()
+        )));
+    }
+    drop(file);
+
+    fs::rename(&temp_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        Error::State(format!(
+            "failed to move output into place '{}' -> '{}': {error}",
+            temp_path.display(),
+            path.display()
+        ))
+    })
 }
 
 pub(crate) fn ensure_dir(path: &Path, label: &str) -> Result<()> {
@@ -351,6 +477,132 @@ fn preview(value: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn decode_hex_text(bytes: &[u8], label: &str) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Validation(format!("{label} must be valid UTF-8 hex text")))?
+        .trim();
+    if text.is_empty() || text.len() % 2 != 0 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(Error::Validation(format!(
+            "{label} must be non-empty hexadecimal text"
+        )));
+    }
+
+    let mut decoded = Vec::with_capacity(text.len() / 2);
+    for index in (0..text.len()).step_by(2) {
+        let chunk = &text[index..index + 2];
+        let byte = u8::from_str_radix(chunk, 16).map_err(|error| {
+            Error::Validation(format!("failed to decode hexadecimal {label}: {error}"))
+        })?;
+        decoded.push(byte);
+    }
+    Ok(decoded)
+}
+
+fn decode_base64_text(bytes: &[u8], label: &str) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Validation(format!("{label} must be valid UTF-8 base64 text")))?
+        .trim();
+    if text.is_empty() {
+        return Err(Error::Validation(format!("{label} must not be empty")));
+    }
+
+    base64_decode(text)
+        .map_err(|error| Error::Validation(format!("failed to decode base64 {label}: {error}")))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+        output.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        output.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+
+    output
+}
+
+fn base64_decode(value: &str) -> Result<Vec<u8>> {
+    fn sextet(ch: char) -> Option<u8> {
+        match ch {
+            'A'..='Z' => Some((ch as u8) - b'A'),
+            'a'..='z' => Some((ch as u8) - b'a' + 26),
+            '0'..='9' => Some((ch as u8) - b'0' + 52),
+            '+' => Some(62),
+            '/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let compact = value
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    if compact.len() % 4 != 0 {
+        return Err(Error::Validation(
+            "base64 text length must be a multiple of 4".to_string(),
+        ));
+    }
+
+    let mut output = Vec::with_capacity((compact.len() / 4) * 3);
+    for chunk in compact.as_bytes().chunks(4) {
+        let chars = chunk.iter().map(|byte| *byte as char).collect::<Vec<_>>();
+        let mut values = [0u8; 4];
+        let mut padding = 0usize;
+        for (index, ch) in chars.iter().enumerate() {
+            if *ch == '=' {
+                values[index] = 0;
+                padding += 1;
+            } else if let Some(value) = sextet(*ch) {
+                values[index] = value;
+            } else {
+                return Err(Error::Validation(format!(
+                    "invalid base64 character '{}'; expected A-Z, a-z, 0-9, '+' or '/'",
+                    ch
+                )));
+            }
+        }
+
+        let triple = ((values[0] as u32) << 18)
+            | ((values[1] as u32) << 12)
+            | ((values[2] as u32) << 6)
+            | (values[3] as u32);
+        output.push(((triple >> 16) & 0xff) as u8);
+        if padding < 2 {
+            output.push(((triple >> 8) & 0xff) as u8);
+        }
+        if padding < 1 {
+            output.push((triple & 0xff) as u8);
+        }
+    }
+
+    Ok(output)
 }
 
 fn validate_non_empty(field: &str, value: &str) -> Result<()> {

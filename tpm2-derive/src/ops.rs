@@ -40,11 +40,11 @@ use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessComma
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, CapabilityReport, DerivationOverrides, ExportArtifact, ExportFormat, ExportKind,
-    ExportRequest, ExportResult, Identity, IdentityCreateRequest, IdentityCreateResult,
-    IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode, ModePreference,
-    PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult, StateLayout, UseCase,
-    expand_mode_requested_uses,
+    Algorithm, CapabilityReport, DerivationOverrides, ExportArtifact, ExportFormat,
+    ExportFormatRequest, ExportKind, ExportRequest, ExportResult, Identity, IdentityCreateRequest,
+    IdentityCreateResult, IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode,
+    ModePreference, PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult,
+    StateLayout, UseCase, expand_mode_requested_uses,
 };
 use crate::ops::native::subprocess::{
     NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
@@ -477,12 +477,6 @@ fn persistable_state_path(state_layout: &StateLayout, path: &Path) -> Result<Str
 pub fn export(request: &ExportRequest) -> Result<ExportResult> {
     validate_profile_name(&request.identity)?;
 
-    if !matches!(request.kind, ExportKind::PublicKey) && request.public_key_format.is_some() {
-        return Err(Error::Validation(
-            "--format is supported only with --kind public-key".to_string(),
-        ));
-    }
-
     let identity = load_identity(&request.identity, request.state_dir.clone())?;
     match request.kind {
         ExportKind::PublicKey => export_public_key(&identity, request),
@@ -506,14 +500,15 @@ where
 {
     shared::ensure_derivation_overrides_allowed(identity, &request.derivation)?;
 
-    let format = request
-        .public_key_format
-        .unwrap_or(PublicKeyExportFormat::SpkiDer);
+    let format = resolve_public_key_export_format(request.format)?;
 
     match identity.mode.resolved {
-        Mode::Native => {
-            export_native_public_key_with_runner(identity, request.output.as_deref(), format, runner)
-        }
+        Mode::Native => export_native_public_key_with_runner(
+            identity,
+            request.output.as_deref(),
+            format,
+            runner,
+        ),
         Mode::Prf | Mode::Seed => {
             let material = crate::ops::keygen::derive_identity_key_material_with_defaults(
                 identity,
@@ -554,7 +549,8 @@ fn export_secret_key_with_runner<R>(
 where
     R: CommandRunner,
 {
-    let seed_backend = SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     export_secret_key_with_dependencies(
         identity,
         request,
@@ -585,21 +581,33 @@ where
         seed_backend,
         seed_deriver,
     )?;
-    let secret_key_hex = crate::ops::keygen::hex_encode(
-        &crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?,
-    );
-    let destination =
-        resolve_secret_export_output_path(identity, request.output.as_deref(), "secret-key.hex")?;
-    write_secret_output(&destination, secret_key_hex.as_bytes())?;
+    let format = resolve_secret_key_export_format(request.format)?;
+    let secret_key_bytes = crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?;
+    let rendered_secret_key = render_secret_key_export(format, &secret_key_bytes);
+    let destination = resolve_secret_export_output_path(
+        identity,
+        request.output.as_deref(),
+        secret_key_export_default_suffix(format),
+    )?;
+    write_secret_output(&destination, &rendered_secret_key)?;
 
     Ok(ExportResult {
         identity: identity.name.clone(),
         mode: identity.mode.resolved,
         kind: ExportKind::SecretKey,
         artifact: ExportArtifact {
-            format: ExportFormat::SecretKeyHex,
+            format: match format {
+                ExportFormatRequest::Hex => ExportFormat::Hex,
+                ExportFormatRequest::Base64 => ExportFormat::Base64,
+                other => {
+                    return Err(Error::Internal(format!(
+                        "unexpected secret-key export format {:?}",
+                        other
+                    )));
+                }
+            },
             path: destination,
-            bytes_written: secret_key_hex.len(),
+            bytes_written: rendered_secret_key.len(),
         },
     })
 }
@@ -616,7 +624,8 @@ fn export_keypair_with_runner<R>(
 where
     R: CommandRunner,
 {
-    let seed_backend = SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     export_keypair_with_dependencies(
         identity,
         request,
@@ -647,20 +656,46 @@ where
         seed_backend,
         seed_deriver,
     )?;
-    let secret_key_hex = crate::ops::keygen::hex_encode(
-        &crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?,
-    );
-    let public_key_hex = crate::ops::keygen::hex_encode(
-        &crate::ops::keygen::public_key_spki_der_from_material(identity, &material)?,
-    );
+    let format = resolve_keypair_export_format(request.format)?;
+    let secret_key_bytes = crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?;
+    let public_key_der =
+        crate::ops::keygen::public_key_spki_der_from_material(identity, &material)?;
+    let (encoding_name, secret_value, public_value, artifact_format) = match format {
+        ExportFormatRequest::Hex => (
+            "hex",
+            crate::ops::keygen::hex_encode(&secret_key_bytes),
+            crate::ops::keygen::hex_encode(&public_key_der),
+            ExportFormat::KeypairJsonHex,
+        ),
+        ExportFormatRequest::Base64 => (
+            "base64",
+            shared::base64_encode(&secret_key_bytes),
+            shared::base64_encode(&public_key_der),
+            ExportFormat::KeypairJsonBase64,
+        ),
+        other => {
+            return Err(Error::Internal(format!(
+                "unexpected keypair export format {:?}",
+                other
+            )));
+        }
+    };
     let payload = format!(
         "{}\n",
         serde_json::to_string_pretty(&serde_json::json!({
             "identity": identity.name.clone(),
             "mode": identity.mode.resolved,
             "algorithm": identity.algorithm,
-            "secret_key_hex": secret_key_hex,
-            "public_key_spki_der_hex": public_key_hex,
+            "format": encoding_name,
+            "secret_key": {
+                "format": encoding_name,
+                "value": secret_value,
+            },
+            "public_key": {
+                "format": encoding_name,
+                "kind": "spki-der",
+                "value": public_value,
+            },
         }))
         .map_err(crate::error::Error::from)?
     );
@@ -673,7 +708,7 @@ where
         mode: identity.mode.resolved,
         kind: ExportKind::Keypair,
         artifact: ExportArtifact {
-            format: ExportFormat::KeypairJson,
+            format: artifact_format,
             path: destination,
             bytes_written: payload.len(),
         },
@@ -744,6 +779,7 @@ where
         )));
     }
 
+    resolve_recovery_bundle_export_format(request.format)?;
     let destination = resolve_recovery_bundle_output_path(request.output.as_deref())?;
     let seed_profile = seed_profile_from_profile(identity)?;
     let bundle = export_seed_recovery_bundle(
@@ -1441,6 +1477,72 @@ pub(crate) fn native_key_id(identity: &Identity) -> String {
         .unwrap_or_else(|| format!("{}-signing-key", identity.name))
 }
 
+fn resolve_public_key_export_format(
+    format: Option<ExportFormatRequest>,
+) -> Result<PublicKeyExportFormat> {
+    match format.unwrap_or(ExportFormatRequest::SpkiDer) {
+        ExportFormatRequest::SpkiDer => Ok(PublicKeyExportFormat::SpkiDer),
+        ExportFormatRequest::SpkiPem => Ok(PublicKeyExportFormat::SpkiPem),
+        ExportFormatRequest::SpkiHex => Ok(PublicKeyExportFormat::SpkiHex),
+        ExportFormatRequest::Openssh => Ok(PublicKeyExportFormat::Openssh),
+        ExportFormatRequest::Hex | ExportFormatRequest::Base64 | ExportFormatRequest::Json => {
+            Err(Error::Validation(
+                "public-key export formats are: spki-der, spki-pem, spki-hex, openssh".to_string(),
+            ))
+        }
+    }
+}
+
+fn resolve_secret_key_export_format(
+    format: Option<ExportFormatRequest>,
+) -> Result<ExportFormatRequest> {
+    let format = format.unwrap_or(ExportFormatRequest::Hex);
+    match format {
+        ExportFormatRequest::Hex | ExportFormatRequest::Base64 => Ok(format),
+        ExportFormatRequest::SpkiDer
+        | ExportFormatRequest::SpkiPem
+        | ExportFormatRequest::SpkiHex
+        | ExportFormatRequest::Openssh
+        | ExportFormatRequest::Json => Err(Error::Validation(
+            "secret-key export formats are: hex, base64".to_string(),
+        )),
+    }
+}
+
+fn resolve_keypair_export_format(
+    format: Option<ExportFormatRequest>,
+) -> Result<ExportFormatRequest> {
+    let format = format.unwrap_or(ExportFormatRequest::Hex);
+    match format {
+        ExportFormatRequest::Hex | ExportFormatRequest::Base64 => Ok(format),
+        ExportFormatRequest::SpkiDer
+        | ExportFormatRequest::SpkiPem
+        | ExportFormatRequest::SpkiHex
+        | ExportFormatRequest::Openssh
+        | ExportFormatRequest::Json => Err(Error::Validation(
+            "keypair export formats are: hex, base64; output remains JSON and the format applies to both key values"
+                .to_string(),
+        )),
+    }
+}
+
+fn resolve_recovery_bundle_export_format(format: Option<ExportFormatRequest>) -> Result<()> {
+    match format.unwrap_or(ExportFormatRequest::Json) {
+        ExportFormatRequest::Json => Ok(()),
+        _ => Err(Error::Validation(
+            "recovery-bundle export format is: json".to_string(),
+        )),
+    }
+}
+
+fn render_secret_key_export(format: ExportFormatRequest, secret_key_bytes: &[u8]) -> Vec<u8> {
+    match format {
+        ExportFormatRequest::Hex => crate::ops::keygen::hex_encode(secret_key_bytes).into_bytes(),
+        ExportFormatRequest::Base64 => shared::base64_encode(secret_key_bytes).into_bytes(),
+        _ => unreachable!("validated secret-key export format"),
+    }
+}
+
 fn resolve_public_key_output_path(
     identity: &Identity,
     requested_output: Option<&Path>,
@@ -1571,6 +1673,14 @@ fn public_key_export_default_suffix(format: PublicKeyExportFormat) -> &'static s
         PublicKeyExportFormat::SpkiPem => "public-key.spki.pem",
         PublicKeyExportFormat::SpkiHex => "public-key.spki.hex",
         PublicKeyExportFormat::Openssh => "public-key.openssh.pub",
+    }
+}
+
+fn secret_key_export_default_suffix(format: ExportFormatRequest) -> &'static str {
+    match format {
+        ExportFormatRequest::Hex => "secret-key.hex",
+        ExportFormatRequest::Base64 => "secret-key.base64",
+        _ => unreachable!("validated secret-key export suffix format"),
     }
 }
 
@@ -2053,7 +2163,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::PublicKey,
                 output: Some(root_dir.join("native.der")),
-                public_key_format: Some(PublicKeyExportFormat::SpkiDer),
+                format: Some(ExportFormatRequest::SpkiDer),
                 state_dir: Some(root_dir.clone()),
                 reason: None,
                 confirm: false,
@@ -2068,7 +2178,9 @@ mod tests {
         )
         .expect_err("native export should reject derivation overrides");
 
-        assert!(matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides")));
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides"))
+        );
         let _ = fs::remove_dir_all(root_dir);
     }
 
@@ -2364,7 +2476,7 @@ mod tests {
             identity: "prf-default".to_string(),
             kind: ExportKind::PublicKey,
             output: None,
-            public_key_format: None,
+            format: None,
             state_dir: Some(root_dir.clone()),
             reason: None,
             confirm: false,
@@ -2384,7 +2496,8 @@ mod tests {
     #[test]
     fn export_prf_public_key_renders_derived_child_key() {
         let root_dir = unique_temp_path("export-prf-derived-public-key");
-        let identity = persisted_prf_export_identity(&root_dir, Algorithm::P256, vec![UseCase::Sign]);
+        let identity =
+            persisted_prf_export_identity(&root_dir, Algorithm::P256, vec![UseCase::Sign]);
         let output_path = root_dir.join("exports").join("prf-box.spki.der");
 
         let result = export_public_key_with_runner(
@@ -2393,7 +2506,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::PublicKey,
                 output: Some(output_path.clone()),
-                public_key_format: Some(PublicKeyExportFormat::SpkiDer),
+                format: Some(ExportFormatRequest::SpkiDer),
                 state_dir: Some(root_dir.clone()),
                 reason: None,
                 confirm: false,
@@ -2407,7 +2520,11 @@ mod tests {
         assert_eq!(result.mode, Mode::Prf);
         assert_eq!(result.kind, ExportKind::PublicKey);
         assert_eq!(result.artifact.path, output_path);
-        assert!(!fs::read(&result.artifact.path).expect("exported public key").is_empty());
+        assert!(
+            !fs::read(&result.artifact.path)
+                .expect("exported public key")
+                .is_empty()
+        );
 
         fs::remove_dir_all(root_dir).expect("cleanup");
     }
@@ -2415,7 +2532,8 @@ mod tests {
     #[test]
     fn export_secret_key_and_keypair_require_export_secret_confirm_and_reason() {
         let root_dir = unique_temp_path("export-prf-secret-policy");
-        let base_identity = persisted_prf_export_identity(&root_dir, Algorithm::Ed25519, vec![UseCase::Sign]);
+        let base_identity =
+            persisted_prf_export_identity(&root_dir, Algorithm::Ed25519, vec![UseCase::Sign]);
         let with_export_secret = persisted_prf_export_identity(
             &root_dir,
             Algorithm::Ed25519,
@@ -2429,7 +2547,7 @@ mod tests {
                 identity: base_identity.name.clone(),
                 kind: ExportKind::SecretKey,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
@@ -2439,7 +2557,9 @@ mod tests {
             &runner,
         )
         .expect_err("missing export-secret should fail");
-        assert!(matches!(missing_use, Error::PolicyRefusal(message) if message.contains("use=export-secret")));
+        assert!(
+            matches!(missing_use, Error::PolicyRefusal(message) if message.contains("use=export-secret"))
+        );
 
         let missing_confirm = export_secret_key_with_runner(
             &with_export_secret,
@@ -2447,7 +2567,7 @@ mod tests {
                 identity: with_export_secret.name.clone(),
                 kind: ExportKind::SecretKey,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: false,
@@ -2457,7 +2577,9 @@ mod tests {
             &runner,
         )
         .expect_err("missing confirm should fail");
-        assert!(matches!(missing_confirm, Error::Validation(message) if message.contains("--confirm")));
+        assert!(
+            matches!(missing_confirm, Error::Validation(message) if message.contains("--confirm"))
+        );
 
         let missing_reason = export_keypair_with_runner(
             &with_export_secret,
@@ -2465,7 +2587,7 @@ mod tests {
                 identity: with_export_secret.name.clone(),
                 kind: ExportKind::Keypair,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: None,
                 confirm: true,
@@ -2475,7 +2597,9 @@ mod tests {
             &runner,
         )
         .expect_err("missing reason should fail");
-        assert!(matches!(missing_reason, Error::Validation(message) if message.contains("--reason")));
+        assert!(
+            matches!(missing_reason, Error::Validation(message) if message.contains("--reason"))
+        );
 
         fs::remove_dir_all(root_dir).expect("cleanup");
     }
@@ -2496,7 +2620,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::SecretKey,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
@@ -2507,10 +2631,12 @@ mod tests {
         )
         .expect("secret-key export");
         assert_eq!(secret_result.kind, ExportKind::SecretKey);
-        assert!(!fs::read_to_string(&secret_result.artifact.path)
-            .expect("secret-key output")
-            .trim()
-            .is_empty());
+        assert!(
+            !fs::read_to_string(&secret_result.artifact.path)
+                .expect("secret-key output")
+                .trim()
+                .is_empty()
+        );
 
         let keypair_result = export_keypair_with_runner(
             &identity,
@@ -2518,7 +2644,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::Keypair,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm: true,
@@ -2534,12 +2660,21 @@ mod tests {
         )
         .expect("parse keypair json");
         assert_eq!(payload["identity"], identity.name);
-        assert!(payload["secret_key_hex"].as_str().expect("secret hex").len() >= 64);
-        assert!(payload["public_key_spki_der_hex"]
-            .as_str()
-            .expect("public hex")
-            .len()
-            > 0);
+        assert_eq!(payload["format"], "hex");
+        assert!(
+            payload["secret_key"]["value"]
+                .as_str()
+                .expect("secret hex")
+                .len()
+                >= 64
+        );
+        assert!(
+            payload["public_key"]["value"]
+                .as_str()
+                .expect("public hex")
+                .len()
+                > 0
+        );
 
         fs::remove_dir_all(root_dir).expect("cleanup");
     }
@@ -2547,7 +2682,8 @@ mod tests {
     #[test]
     fn export_seed_secret_key_and_keypair_require_export_secret() {
         let root_dir = unique_temp_path("export-seed-secret-policy");
-        let identity = persisted_seed_export_identity(&root_dir, Algorithm::Ed25519, vec![UseCase::Sign]);
+        let identity =
+            persisted_seed_export_identity(&root_dir, Algorithm::Ed25519, vec![UseCase::Sign]);
         let backend = FakeSeedExportBackend::new(vec![0x33; 32]);
         let error = export_secret_key_with_dependencies(
             &identity,
@@ -2555,7 +2691,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::SecretKey,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
@@ -2568,7 +2704,9 @@ mod tests {
         )
         .expect_err("seed secret export without use bit should fail");
 
-        assert!(matches!(error, Error::PolicyRefusal(message) if message.contains("use=export-secret")));
+        assert!(
+            matches!(error, Error::PolicyRefusal(message) if message.contains("use=export-secret"))
+        );
         fs::remove_dir_all(root_dir).expect("cleanup");
     }
 
@@ -2588,7 +2726,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::SecretKey,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
@@ -2601,10 +2739,12 @@ mod tests {
         )
         .expect("seed secret-key export");
         assert_eq!(secret_result.kind, ExportKind::SecretKey);
-        assert!(!fs::read_to_string(&secret_result.artifact.path)
-            .expect("seed secret output")
-            .trim()
-            .is_empty());
+        assert!(
+            !fs::read_to_string(&secret_result.artifact.path)
+                .expect("seed secret output")
+                .trim()
+                .is_empty()
+        );
 
         let keypair_result = export_keypair_with_dependencies(
             &identity,
@@ -2612,7 +2752,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::Keypair,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm: true,
@@ -2644,7 +2784,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::SecretKey,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
@@ -2947,7 +3087,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::RecoveryBundle,
                 output: Some(output_path.clone()),
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm: true,
@@ -2995,7 +3135,7 @@ mod tests {
                 identity: identity.name.clone(),
                 kind: ExportKind::RecoveryBundle,
                 output: None,
-                public_key_format: None,
+                format: None,
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm: true,
@@ -3247,7 +3387,11 @@ mod tests {
         (identity, handle_path)
     }
 
-    fn persisted_prf_export_identity(root_dir: &Path, algorithm: Algorithm, uses: Vec<UseCase>) -> Identity {
+    fn persisted_prf_export_identity(
+        root_dir: &Path,
+        algorithm: Algorithm,
+        uses: Vec<UseCase>,
+    ) -> Identity {
         let state_layout = StateLayout::new(root_dir.to_path_buf());
         state_layout.ensure_dirs().expect("state dirs");
 
@@ -3270,7 +3414,11 @@ mod tests {
         identity
     }
 
-    fn persisted_seed_export_identity(root_dir: &Path, algorithm: Algorithm, uses: Vec<UseCase>) -> Identity {
+    fn persisted_seed_export_identity(
+        root_dir: &Path,
+        algorithm: Algorithm,
+        uses: Vec<UseCase>,
+    ) -> Identity {
         let state_layout = StateLayout::new(root_dir.to_path_buf());
         state_layout.ensure_dirs().expect("state dirs");
 

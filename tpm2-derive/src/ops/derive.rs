@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use secrecy::ExposeSecret;
 
@@ -13,7 +13,8 @@ use super::seed::{
     seed_profile_from_profile,
 };
 use super::shared::{
-    derive_command_spec, execute_prf_derivation_with_runner, resolve_effective_derivation_inputs,
+    derive_command_spec, encode_output_bytes, execute_prf_derivation_with_runner,
+    resolve_effective_derivation_inputs, write_output_file,
 };
 
 pub fn execute_with_defaults<R>(
@@ -59,14 +60,14 @@ where
             "identity '{}' resolved to native mode; derive is currently wired only for PRF and seed identities",
             identity.name
         ))),
-        Mode::Prf => execute_prf(identity, request.length, spec, prf_runner),
-        Mode::Seed => execute_seed(identity, request.length, spec, seed_backend, seed_deriver),
+        Mode::Prf => execute_prf(identity, request, spec, prf_runner),
+        Mode::Seed => execute_seed(identity, request, spec, seed_backend, seed_deriver),
     }
 }
 
 fn execute_prf<R>(
     identity: &Identity,
-    length: u16,
+    request: &DeriveRequest,
     spec: crate::crypto::DerivationSpec,
     runner: &R,
 ) -> Result<DeriveResult>
@@ -74,18 +75,19 @@ where
     R: CommandRunner,
 {
     let material = execute_prf_derivation_with_runner(identity, spec, runner, "derive")?;
-    Ok(DeriveResult {
-        identity: identity.name.clone(),
-        mode: Mode::Prf,
-        length,
-        encoding: "hex".to_string(),
-        material: hex_encode(&material),
-    })
+    build_result(
+        identity,
+        Mode::Prf,
+        request.length,
+        request.format,
+        request.output.as_deref(),
+        &material,
+    )
 }
 
 fn execute_seed<B, D>(
     identity: &Identity,
-    length: u16,
+    request: &DeriveRequest,
     spec: crate::crypto::DerivationSpec,
     backend: &B,
     deriver: &D,
@@ -97,25 +99,66 @@ where
     let seed_identity = seed_profile_from_profile(identity)?;
     ensure_seed_material_exists(identity)?;
 
-    let request = SeedOpenRequest {
+    let seed_request = SeedOpenRequest {
         identity: seed_identity,
         auth_source: SeedOpenAuthSource::None,
         output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
             spec,
-            output_bytes: usize::from(length),
+            output_bytes: usize::from(request.length),
         }),
         require_fresh_unseal: true,
         confirm_software_derivation: true,
     };
 
-    let derived = open_and_derive(backend, deriver, &request)?;
-    Ok(DeriveResult {
-        identity: identity.name.clone(),
-        mode: Mode::Seed,
-        length,
-        encoding: "hex".to_string(),
-        material: hex_encode(derived.expose_secret()),
-    })
+    let derived = open_and_derive(backend, deriver, &seed_request)?;
+    build_result(
+        identity,
+        Mode::Seed,
+        request.length,
+        request.format,
+        request.output.as_deref(),
+        derived.expose_secret(),
+    )
+}
+
+fn build_result(
+    identity: &Identity,
+    mode: Mode,
+    length: u16,
+    format: crate::model::BinaryOutputFormat,
+    output: Option<&Path>,
+    material: &[u8],
+) -> Result<DeriveResult> {
+    let encoded = encode_output_bytes(format, material);
+
+    match output {
+        Some(path) => {
+            write_output_file(path, &encoded)?;
+            Ok(DeriveResult {
+                identity: identity.name.clone(),
+                mode,
+                length,
+                format,
+                output_path: Some(path.to_path_buf()),
+                bytes_written: encoded.len(),
+                material: None,
+            })
+        }
+        None => Ok(DeriveResult {
+            identity: identity.name.clone(),
+            mode,
+            length,
+            format,
+            output_path: None,
+            bytes_written: encoded.len(),
+            material: Some(String::from_utf8(encoded).map_err(|error| {
+                Error::State(format!(
+                    "derived output for identity '{}' could not be rendered as text: {error}",
+                    identity.name
+                ))
+            })?),
+        }),
+    }
 }
 
 fn ensure_seed_material_exists(identity: &Identity) -> Result<()> {
@@ -167,8 +210,8 @@ mod tests {
 
     use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
     use crate::model::{
-        Algorithm, DerivationOverrides, Identity, IdentityModeResolution, Mode, ModePreference,
-        StateLayout, UseCase,
+        Algorithm, BinaryOutputFormat, DerivationOverrides, Identity, IdentityModeResolution, Mode,
+        ModePreference, StateLayout, UseCase,
     };
     use crate::ops::prf::{PRF_CONTEXT_PATH_METADATA_KEY, PrfRequest, RawPrfOutput, finalize};
 
@@ -236,6 +279,8 @@ mod tests {
             identity: identity.name.clone(),
             derivation: DerivationOverrides::default(),
             length: 32,
+            format: BinaryOutputFormat::Hex,
+            output: None,
         };
 
         let result = execute_with_runner(
@@ -254,8 +299,11 @@ mod tests {
         let spec = derive_command_spec(&effective, request.length).expect("derive spec");
         let expected = finalize(
             PrfRequest::new(identity.name.clone(), spec).expect("prf request"),
-            RawPrfOutput::new(crate::ops::prf::PrfProtocolVersion::V1, b"tpm-prf-material".to_vec())
-                .expect("raw prf output"),
+            RawPrfOutput::new(
+                crate::ops::prf::PrfProtocolVersion::V1,
+                b"tpm-prf-material".to_vec(),
+            )
+            .expect("raw prf output"),
         )
         .expect("finalize")
         .output
@@ -263,6 +311,6 @@ mod tests {
         .to_vec();
 
         assert_eq!(result.mode, Mode::Prf);
-        assert_eq!(result.material, hex_encode(&expected));
+        assert_eq!(result.material, Some(hex_encode(&expected)));
     }
 }
