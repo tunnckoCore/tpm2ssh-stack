@@ -36,6 +36,12 @@ pub struct DerivationOverrides {
     pub context: BTreeMap<String, String>,
 }
 
+impl DerivationOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.org.is_none() && self.purpose.is_none() && self.context.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DeriveRequest {
     pub identity: String,
@@ -141,6 +147,8 @@ pub struct KeygenResult {
 #[serde(rename_all = "kebab-case")]
 pub enum ExportKind {
     PublicKey,
+    SecretKey,
+    Keypair,
     RecoveryBundle,
 }
 
@@ -154,6 +162,7 @@ pub struct ExportRequest {
     pub reason: Option<String>,
     pub confirm: bool,
     pub confirm_phrase: Option<String>,
+    pub derivation: DerivationOverrides,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -172,6 +181,8 @@ pub enum ExportFormat {
     SpkiPem,
     SpkiHex,
     Openssh,
+    SecretKeyHex,
+    KeypairJson,
     RecoveryBundleJson,
 }
 
@@ -222,6 +233,7 @@ pub struct SshAddRequest {
     pub comment: Option<String>,
     pub socket: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
+    pub derivation: DerivationOverrides,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

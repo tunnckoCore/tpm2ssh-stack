@@ -38,6 +38,7 @@ use crate::model::{
     VerifyRequest,
 };
 use crate::ops;
+use crate::ops::keygen::derive_identity_key_material_with_defaults;
 use crate::ops::native::subprocess::{
     NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
     NativeSignOptions, NativeSignPlan, plan_sign,
@@ -94,6 +95,8 @@ impl From<ExportKindArg> for ExportKind {
     fn from(value: ExportKindArg) -> Self {
         match value {
             ExportKindArg::PublicKey => Self::PublicKey,
+            ExportKindArg::SecretKey => Self::SecretKey,
+            ExportKindArg::Keypair => Self::Keypair,
             ExportKindArg::RecoveryBundle => Self::RecoveryBundle,
         }
     }
@@ -261,6 +264,7 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
         reason: args.reason,
         confirm: args.confirm,
         confirm_phrase: args.confirm_phrase,
+        derivation: derivation_overrides(args.derivation),
     };
 
     match ops::export(&request) {
@@ -324,6 +328,7 @@ fn run_ssh_add(json: bool, args: SshAddArgs) -> Result<String> {
         comment: args.comment.clone(),
         socket: args.socket.clone(),
         state_dir: args.state_dir.clone(),
+        derivation: derivation_overrides(args.derivation.clone()),
     };
 
     let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
@@ -373,8 +378,9 @@ fn run_encrypt(json: bool, args: EncryptArgs) -> Result<String> {
     };
 
     let input_bytes = load_input_bytes(&parse_input_source(&args.input), "encrypt input")?;
+    let derivation = derivation_overrides(args.derivation.clone());
     let runner = ProcessCommandRunner;
-    match ops::encrypt::encrypt_with_defaults(&identity, &input_bytes, &runner) {
+    match ops::encrypt::encrypt_with_defaults(&identity, &input_bytes, &derivation, &runner) {
         Ok(mut result) => {
             if let Some(ref output) = args.output {
                 let ct = result
@@ -420,8 +426,9 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
     let raw_input = load_input_bytes(&parse_input_source(&args.input), "decrypt input")?;
     // Try to interpret as hex first (the format we emit), otherwise use raw bytes.
     let ciphertext = try_hex_decode(&raw_input).unwrap_or(raw_input);
+    let derivation = derivation_overrides(args.derivation.clone());
     let runner = ProcessCommandRunner;
-    match ops::encrypt::decrypt_with_defaults(&identity, &ciphertext, &runner) {
+    match ops::encrypt::decrypt_with_defaults(&identity, &ciphertext, &derivation, &runner) {
         Ok(mut result) => {
             if let Some(ref output) = args.output {
                 let pt = result
@@ -539,6 +546,7 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
         identity: args.identity.clone(),
         input: parse_input_source(&args.input),
     };
+    let derivation = derivation_overrides(args.derivation.clone());
     let command = CommandPath::from_segments(["sign"]);
 
     let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
@@ -641,32 +649,21 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
                 diagnostics,
             ),
         },
-        Mode::Prf => unsupported_mode_operation(
-            json,
-            command,
-            identity.mode.resolved,
-            diagnostics,
-            "sign is not wired for PRF-mode identities yet",
-        ),
-        Mode::Seed => {
-            let backend =
-                SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
-            match sign_seed_with_backend(&request, &identity, &backend, &HkdfSha256SeedDeriver) {
-                Ok((result, sign_diagnostics)) => {
-                    diagnostics.extend(sign_diagnostics);
-                    success_with_diagnostics(json, command, result, diagnostics)
-                }
-                Err(error) => failure(
-                    json,
-                    command,
-                    ErrorEnvelope {
-                        code: error.code().as_str().to_string(),
-                        message: error.to_string(),
-                    },
-                    diagnostics,
-                ),
+        Mode::Seed | Mode::Prf => match sign_derived_identity(&request, &identity, &derivation) {
+            Ok((result, sign_diagnostics)) => {
+                diagnostics.extend(sign_diagnostics);
+                success_with_diagnostics(json, command, result, diagnostics)
             }
-        }
+            Err(error) => failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: error.code().as_str().to_string(),
+                    message: error.to_string(),
+                },
+                diagnostics,
+            ),
+        },
     }
 }
 
@@ -683,6 +680,7 @@ where
         input: parse_input_source(&args.input),
         signature: parse_input_source(&args.signature),
     };
+    let derivation = derivation_overrides(args.derivation.clone());
     let command = CommandPath::from_segments(["verify"]);
 
     let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
@@ -720,20 +718,7 @@ where
 
     let verification = match identity.mode.resolved {
         Mode::Native => verify_native_with_runner(&request, &identity, runner),
-        Mode::Seed => {
-            let backend =
-                SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
-            verify_seed_with_backend(&request, &identity, &backend, &HkdfSha256SeedDeriver)
-        }
-        Mode::Prf => {
-            return unsupported_mode_operation(
-                json,
-                command,
-                identity.mode.resolved,
-                diagnostics,
-                "verify is not wired for PRF-mode identities yet; PRF roots can derive child key material, but the CLI verify flow does not yet derive and use a identity-bound public key",
-            );
-        }
+        Mode::Seed | Mode::Prf => verify_derived_identity(&request, &identity, &derivation),
     };
 
     match verification {
@@ -748,6 +733,133 @@ where
                 code: error.code().as_str().to_string(),
                 message: error.to_string(),
             },
+            diagnostics,
+        ),
+    }
+}
+
+fn sign_derived_identity(
+    request: &SignRequest,
+    identity: &Identity,
+    derivation: &DerivationOverrides,
+) -> Result<(SeedSignOperationResult, Vec<crate::model::Diagnostic>)> {
+    if !identity.uses.contains(&UseCase::Sign) {
+        return Err(Error::Unsupported(format!(
+            "identity '{}' is not configured with sign use",
+            identity.name
+        )));
+    }
+
+    let input_bytes = load_sign_input(&request.input)?;
+    if input_bytes.is_empty() {
+        return Err(Error::Validation(
+            "sign input must not be empty".to_string(),
+        ));
+    }
+
+    let runner = ProcessCommandRunner;
+    let derived = derive_identity_key_material_with_defaults(identity, derivation, &runner)?;
+    let digest = Sha256::digest(&input_bytes).to_vec();
+    let diagnostics = vec![crate::model::Diagnostic::info(
+        "derived-signer-material",
+        format!(
+            "derived {} bytes of {:?} signing key material from {:?} backing using the effective derivation inputs",
+            derived.len(),
+            identity.algorithm,
+            identity.mode.resolved,
+        ),
+    )];
+
+    let (signature_bytes, signature_format) = match identity.algorithm {
+        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, &derived)?,
+        Algorithm::P256 => sign_seed_p256(&input_bytes, &derived, identity)?,
+        Algorithm::Secp256k1 => sign_seed_secp256k1(&input_bytes, &derived, identity)?,
+    };
+
+    Ok((
+        SeedSignOperationResult {
+            identity: identity.clone(),
+            request: request.clone(),
+            mode: identity.mode.resolved,
+            digest_algorithm: DigestAlgorithm::Sha256,
+            digest_hex: hex_encode(&digest),
+            input_bytes: input_bytes.len(),
+            signature_bytes: signature_bytes.len(),
+            signature_hex: hex_encode(&signature_bytes),
+            signature_format,
+        },
+        diagnostics,
+    ))
+}
+
+fn verify_derived_identity(
+    request: &VerifyRequest,
+    identity: &Identity,
+    derivation: &DerivationOverrides,
+) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
+    if !identity.uses.contains(&UseCase::Verify) {
+        return Err(Error::Unsupported(format!(
+            "identity '{}' is not configured with verify use",
+            identity.name
+        )));
+    }
+
+    if matches!(request.input, InputSource::Stdin)
+        && matches!(request.signature, InputSource::Stdin)
+    {
+        return Err(Error::Validation(
+            "verify cannot read both --input and --signature from stdin at the same time"
+                .to_string(),
+        ));
+    }
+
+    let input_bytes = load_input_bytes(&request.input, "verify input")?;
+    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
+    if signature_bytes.is_empty() {
+        return Err(Error::Validation(
+            "verify signature must not be empty".to_string(),
+        ));
+    }
+
+    let runner = ProcessCommandRunner;
+    let derived = derive_identity_key_material_with_defaults(identity, derivation, &runner)?;
+    let digest = Sha256::digest(&input_bytes).to_vec();
+    let diagnostics = vec![crate::model::Diagnostic::info(
+        "derived-verifier-material",
+        format!(
+            "derived {} bytes of {:?} verifier material from {:?} backing using the effective derivation inputs",
+            derived.len(),
+            identity.algorithm,
+            identity.mode.resolved,
+        ),
+    )];
+
+    match identity.algorithm {
+        Algorithm::Ed25519 => verify_seed_ed25519(
+            request,
+            identity,
+            &input_bytes,
+            &signature_bytes,
+            &digest,
+            &derived,
+            diagnostics,
+        ),
+        Algorithm::P256 => verify_seed_p256(
+            request,
+            identity,
+            &input_bytes,
+            &signature_bytes,
+            &digest,
+            &derived,
+            diagnostics,
+        ),
+        Algorithm::Secp256k1 => verify_seed_secp256k1(
+            request,
+            identity,
+            &input_bytes,
+            &signature_bytes,
+            &digest,
+            &derived,
             diagnostics,
         ),
     }
@@ -1074,7 +1186,7 @@ fn verify_seed_ed25519(
         VerifyOperationResult {
             identity: identity.clone(),
             request: request.clone(),
-            mode: Mode::Seed,
+            mode: identity.mode.resolved,
             verified,
             digest_algorithm: DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
@@ -1111,7 +1223,7 @@ fn verify_seed_p256(
         VerifyOperationResult {
             identity: identity.clone(),
             request: request.clone(),
-            mode: Mode::Seed,
+            mode: identity.mode.resolved,
             verified,
             digest_algorithm: DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
@@ -1149,7 +1261,7 @@ fn verify_seed_secp256k1(
         VerifyOperationResult {
             identity: identity.clone(),
             request: request.clone(),
-            mode: Mode::Seed,
+            mode: identity.mode.resolved,
             verified,
             digest_algorithm: DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
@@ -1225,6 +1337,8 @@ fn seed_verify_diagnostics(
 fn export_command_path(kind: ExportKind) -> CommandPath {
     match kind {
         ExportKind::PublicKey => CommandPath::from_segments(["export", "public-key"]),
+        ExportKind::SecretKey => CommandPath::from_segments(["export", "secret-key"]),
+        ExportKind::Keypair => CommandPath::from_segments(["export", "keypair"]),
         ExportKind::RecoveryBundle => CommandPath::from_segments(["export", "recovery-bundle"]),
     }
 }
@@ -1881,6 +1995,7 @@ fn build_placeholder_request(operation: &str, identity: String) -> serde_json::V
             reason: None,
             confirm: false,
             confirm_phrase: None,
+            derivation: DerivationOverrides::default(),
         })
         .unwrap_or_default(),
         "ssh-add" => serde_json::to_value(SshAddRequest {
@@ -1888,6 +2003,7 @@ fn build_placeholder_request(operation: &str, identity: String) -> serde_json::V
             comment: None,
             socket: None,
             state_dir: None,
+            derivation: DerivationOverrides::default(),
         })
         .unwrap_or_default(),
         _ => serde_json::to_value(PendingOperation {

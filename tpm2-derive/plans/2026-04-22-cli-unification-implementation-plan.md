@@ -252,19 +252,19 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Checklist
 
-- [ ] Introduce one shared helper to compute effective derivation inputs
-- [ ] Implement ADR merge rules exactly:
-  - [ ] `org` command override wins
-  - [ ] `purpose` command override wins
-  - [ ] `context` merges by key
-  - [ ] new key appends
-  - [ ] same key replaces default value
-  - [ ] repeated same command key → last wins
-  - [ ] native rejects all derivation overrides
-- [ ] Route all identity-bound PRF/seed commands through the same effective-input helper
-- [ ] Audit PRF call sites for double-expansion behavior
-- [ ] Expose one PRF helper that returns final derived bytes once
-- [ ] Remove second HKDF expansion from current PRF consumers
+- [x] Introduce one shared helper to compute effective derivation inputs
+- [x] Implement ADR merge rules exactly:
+  - [x] `org` command override wins
+  - [x] `purpose` command override wins
+  - [x] `context` merges by key
+  - [x] new key appends
+  - [x] same key replaces default value
+  - [x] repeated same command key → last wins
+  - [x] native rejects all derivation overrides
+- [x] Route all identity-bound PRF/seed commands through the same effective-input helper
+- [x] Audit PRF call sites for double-expansion behavior
+- [x] Expose one PRF helper that returns final derived bytes once
+- [x] Remove second HKDF expansion from current PRF consumers
 
 ### Deliverables
 
@@ -273,11 +273,11 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Acceptance checks
 
-- [ ] `derive` PRF output is finalized exactly once
-- [ ] `encrypt` PRF path no longer re-derives already-finalized output
-- [ ] `keygen` PRF path no longer re-derives already-finalized output
-- [ ] native rejects `--org`, `--purpose`, and `--context`
-- [ ] context merge semantics behave exactly as described in the ADR
+- [x] `derive` PRF output is finalized exactly once
+- [x] `encrypt` PRF path no longer re-derives already-finalized output
+- [x] `keygen` PRF path no longer re-derives already-finalized output
+- [x] native rejects `--org`, `--purpose`, and `--context`
+- [x] context merge semantics behave exactly as described in the ADR
 
 ---
 
@@ -309,48 +309,48 @@ Some workstreams can run in parallel. Some have hard dependencies.
 #### Sign/verify
 - [ ] Extract sign logic out of `src/cli/mod.rs`
 - [ ] Extract verify logic out of `src/cli/mod.rs`
-- [ ] Implement PRF sign
-- [ ] Implement PRF verify
-- [ ] Keep seed sign/verify working through the shared derivation helper
-- [ ] Keep native sign/verify working
+- [x] Implement PRF sign
+- [x] Implement PRF verify
+- [x] Keep seed sign/verify working through the shared derivation helper
+- [x] Keep native sign/verify working
 
 #### Export
-- [ ] Expand export kinds to:
-  - [ ] `public-key`
-  - [ ] `secret-key`
-  - [ ] `keypair`
-- [ ] Keep or consciously isolate `recovery-bundle` if still needed for `import`
-- [ ] Implement PRF public-key export for effective derived identity key
-- [ ] Implement PRF secret-key export gated on `export-secret`
-- [ ] Implement PRF keypair export gated on `export-secret`
-- [ ] Implement seed secret-key export gated on `export-secret`
-- [ ] Implement seed keypair export gated on `export-secret`
-- [ ] Keep native export limited to public-key
+- [x] Expand export kinds to:
+  - [x] `public-key`
+  - [x] `secret-key`
+  - [x] `keypair`
+- [x] Keep or consciously isolate `recovery-bundle` if still needed for `import`
+- [x] Implement PRF public-key export for effective derived identity key
+- [x] Implement PRF secret-key export gated on `export-secret`
+- [x] Implement PRF keypair export gated on `export-secret`
+- [x] Implement seed secret-key export gated on `export-secret`
+- [x] Implement seed keypair export gated on `export-secret`
+- [x] Keep native export limited to public-key
 
 #### Secret-material policy
-- [ ] Enforce `export-secret` for `secret-key`
-- [ ] Enforce `export-secret` for `keypair`
-- [ ] Enforce `--confirm`
-- [ ] Enforce `--reason`
-- [ ] Ensure `keygen` cannot bypass this policy
+- [x] Enforce `export-secret` for `secret-key`
+- [x] Enforce `export-secret` for `keypair`
+- [x] Enforce `--confirm`
+- [x] Enforce `--reason`
+- [x] Ensure `keygen` cannot bypass this policy
 - [ ] Decide whether to remove `keygen`, hide it, or make it a thin alias over export logic
 
 #### SSH
-- [ ] Rename command flow to `ssh-add`
-- [ ] Implement PRF `ssh-add`
-- [ ] Keep seed `ssh-add`
-- [ ] Keep native rejected for `ssh-add`
-- [ ] Make sure `use=ssh` is separate from the `ssh-add` command behavior
+- [x] Rename command flow to `ssh-add`
+- [x] Implement PRF `ssh-add`
+- [x] Keep seed `ssh-add`
+- [x] Keep native rejected for `ssh-add`
+- [x] Make sure `use=ssh` is separate from the `ssh-add` command behavior
 
 ### Important semantic check
 
 The ADR implies identity-level consistency. For the same effective identity inputs, confirm which operations must share the same asymmetric key material:
 
-- [ ] sign
-- [ ] verify
-- [ ] export public-key
-- [ ] export secret-key / keypair
-- [ ] ssh-add
+- [x] sign
+- [x] verify
+- [x] export public-key
+- [x] export secret-key / keypair
+- [x] ssh-add
 
 If one of these intentionally uses a different derivation branch, that must be made explicit in code comments/tests. Otherwise they should be unified.
 
@@ -362,14 +362,14 @@ If one of these intentionally uses a different derivation branch, that must be m
 
 ### Acceptance checks
 
-- [ ] PRF sign/verify round-trip works
-- [ ] seed sign/verify round-trip still works
-- [ ] PRF public-key export works
-- [ ] PRF secret-key and keypair export require `export-secret`
-- [ ] seed secret-key and keypair export require `export-secret`
-- [ ] native secret export fails
-- [ ] PRF ssh-add works
-- [ ] native ssh-add fails
+- [x] PRF sign/verify round-trip works
+- [x] seed sign/verify round-trip still works
+- [x] PRF public-key export works
+- [x] PRF secret-key and keypair export require `export-secret`
+- [x] seed secret-key and keypair export require `export-secret`
+- [x] native secret export fails
+- [x] PRF ssh-add works
+- [x] native ssh-add fails
 
 ---
 
@@ -575,12 +575,12 @@ Before calling the refactor done:
 - [ ] internal code no longer treats `profile` as the main public abstraction
 - [x] `inspect` shows a truthful capability matrix
 - [x] `auto` chooses exactly one valid mode or fails
-- [ ] `native` rejects derivation-input flags
-- [ ] `prf` and `seed` support the same top-level command surface
-- [ ] `derive` does not double-expand PRF output
-- [ ] `export-secret` gates secret-bearing export
-- [ ] `keygen` cannot bypass secret-export policy
-- [ ] `ssh-add` works for PRF and seed, and rejects native
+- [x] `native` rejects derivation-input flags
+- [x] `prf` and `seed` support the same top-level command surface
+- [x] `derive` does not double-expand PRF output
+- [x] `export-secret` gates secret-bearing export
+- [x] `keygen` cannot bypass secret-export policy
+- [x] `ssh-add` works for PRF and seed, and rejects native
 - [x] native support advertised by inspect matches real backend execution
 - [ ] README/help/examples match the accepted ADR
 

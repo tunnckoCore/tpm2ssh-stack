@@ -443,7 +443,12 @@ mod tests {
             vec![UseCase::Ssh],
             vec![UseCase::ExportSecret],
         ] {
-            assert!(report_supports_mode(&report, Algorithm::P256, &uses, Mode::Prf));
+            assert!(report_supports_mode(
+                &report,
+                Algorithm::P256,
+                &uses,
+                Mode::Prf
+            ));
         }
     }
 

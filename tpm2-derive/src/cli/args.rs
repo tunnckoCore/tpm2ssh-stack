@@ -284,12 +284,12 @@ pub struct ExportArgs {
     pub state_dir: Option<PathBuf>,
     #[arg(
         long,
-        help = "Operator-provided reason required for recovery-bundle export"
+        help = "Operator-provided reason required for secret-bearing or recovery-bundle export"
     )]
     pub reason: Option<String>,
     #[arg(
         long,
-        help = "Acknowledge this is a break-glass recovery export and exported material leaves TPM protection"
+        help = "Acknowledge this export removes TPM-only protection from secret-bearing material"
     )]
     pub confirm: bool,
     #[arg(
@@ -394,6 +394,10 @@ pub enum ModeArg {
 pub enum ExportKindArg {
     /// Export public key material.
     PublicKey,
+    /// Export a derived secret key in hex form.
+    SecretKey,
+    /// Export both derived secret and public key material together as JSON.
+    Keypair,
     /// Export a break-glass seed recovery bundle.
     RecoveryBundle,
 }
