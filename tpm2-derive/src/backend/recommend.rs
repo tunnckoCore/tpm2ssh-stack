@@ -248,7 +248,8 @@ fn supports_mode(
                 return false;
             };
             !concrete_uses.is_empty()
-                && (!concrete_uses.contains(&UseCase::Verify) || concrete_uses.contains(&UseCase::Sign))
+                && (!concrete_uses.contains(&UseCase::Verify)
+                    || concrete_uses.contains(&UseCase::Sign))
                 && concrete_uses
                     .iter()
                     .all(|use_case| native.supports_use(algorithm, *use_case))
@@ -332,7 +333,8 @@ fn unsupported_mode_reason(
             if concrete_uses.contains(&UseCase::Ssh)
                 && !algorithm.is_some_and(algorithm_supports_ssh_identity)
             {
-                return "PRF mode does not currently support use=ssh for this algorithm".to_string();
+                return "PRF mode does not currently support use=ssh for this algorithm"
+                    .to_string();
             }
             let missing = concrete_uses
                 .iter()
@@ -358,7 +360,8 @@ fn unsupported_mode_reason(
             if concrete_uses.contains(&UseCase::Ssh)
                 && !algorithm.is_some_and(algorithm_supports_ssh_identity)
             {
-                return "Seed mode does not currently support use=ssh for this algorithm".to_string();
+                return "Seed mode does not currently support use=ssh for this algorithm"
+                    .to_string();
             }
             let missing = concrete_uses
                 .iter()
@@ -463,7 +466,6 @@ mod tests {
         for uses in [
             vec![UseCase::Sign],
             vec![UseCase::Verify],
-            vec![UseCase::Derive],
             vec![UseCase::Encrypt, UseCase::Decrypt],
             vec![UseCase::Ssh],
             vec![UseCase::ExportSecret],
@@ -507,12 +509,16 @@ mod tests {
         assert!(!report_supports_mode(
             &report,
             Algorithm::Ed25519,
-            &[UseCase::Derive],
+            &[UseCase::ExportSecret],
             Mode::Prf,
         ));
 
-        let reason =
-            mode_rejection_reason(&report, Algorithm::Ed25519, &[UseCase::Derive], Mode::Prf);
+        let reason = mode_rejection_reason(
+            &report,
+            Algorithm::Ed25519,
+            &[UseCase::ExportSecret],
+            Mode::Prf,
+        );
         assert!(reason.contains("actual PRF support"));
     }
 

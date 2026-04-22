@@ -69,26 +69,6 @@ pub enum InputFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DeriveRequest {
-    pub identity: String,
-    pub derivation: DerivationOverrides,
-    pub length: u16,
-    pub format: Format,
-    pub output: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DeriveResult {
-    pub identity: String,
-    pub mode: Mode,
-    pub length: u16,
-    pub format: Format,
-    pub output_path: Option<PathBuf>,
-    pub bytes_written: usize,
-    pub material: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SignRequest {
     pub identity: String,
     pub input: InputSource,

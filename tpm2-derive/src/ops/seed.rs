@@ -1472,7 +1472,7 @@ mod tests {
         SeedIdentity::scaffold(
             "seed-identity".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Derive, UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh],
         )
         .expect("seed identity")
     }
@@ -1578,7 +1578,7 @@ mod tests {
             identity: SeedRecoveryBundleIdentity {
                 name: "seed-identity".to_string(),
                 algorithm: Algorithm::Ed25519,
-                uses: vec![UseCase::Derive],
+                uses: vec![UseCase::Sign],
                 derivation: SeedDerivation::hkdf_sha256_v1(),
             },
             seed: SeedRecoveryBundleSecret {
@@ -1606,7 +1606,7 @@ mod tests {
                 identity: SeedRecoveryBundleIdentity {
                     name: "old-identity".to_string(),
                     algorithm: Algorithm::Ed25519,
-                    uses: vec![UseCase::Derive, UseCase::Ssh],
+                    uses: vec![UseCase::Sign, UseCase::Ssh],
                     derivation: SeedDerivation::hkdf_sha256_v1(),
                 },
                 seed: SeedRecoveryBundleSecret {
@@ -1650,7 +1650,7 @@ mod tests {
         let mut identity = crate::model::Identity::new(
             "seed-identity".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Derive],
+            vec![UseCase::Sign],
             crate::model::IdentityModeResolution {
                 requested: crate::model::ModePreference::Seed,
                 resolved: crate::model::Mode::Seed,

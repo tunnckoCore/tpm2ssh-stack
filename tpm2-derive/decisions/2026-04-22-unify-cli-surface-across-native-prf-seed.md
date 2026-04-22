@@ -74,7 +74,6 @@ tpm2x sign --with <name> ...
 tpm2x verify --with <name> ...
 tpm2x encrypt --with <name> ...
 tpm2x decrypt --with <name> ...
-tpm2x derive --with <name> ...
 tpm2x export --with <name> ...
 tpm2x ssh-add --with <name> ...
 ```
@@ -85,12 +84,6 @@ Examples:
 tpm2x sign --with wgw --input msg.txt
 tpm2x verify --with wgwprf --input msg.txt --signature msg.sig
 tpm2x encrypt --with wgwseed --input secret.txt --output secret.bin
-tpm2x derive --with wgwprf --length 32
-
-# for prf/seed, command flags can override org/purpose and merge context by key
-tpm2x derive --with wgwprf --length 32 --org com.acme
-tpm2x derive --with wgwprf --length 32 --org com.acme --context foo=user1
-tpm2x derive --with wgwprf --length 32 --org com.acme --context foo=user2
 
 tpm2x export --with wgw --kind public-key --output wgw.spki.der
 tpm2x export --with wgwprf --kind public-key --output wgwprf.spki.der
@@ -158,7 +151,6 @@ The user-facing use vocabulary is:
 - `verify`
 - `encrypt`
 - `decrypt`
-- `derive`
 - `ssh`
 
 The current `ssh-agent` "use" bit is renamed to just `ssh`.
@@ -189,7 +181,6 @@ The intended native surface is:
 
 with these constraints:
 
-- `derive` is never allowed on `native`
 - `ssh` as a use bit is allowed on `native` as a future-facing intent bit for helper-based flows that use `sign` rather than daemon agents, eg. git helper for signing commits should be allowed only if the identity has `ssh` use bit set.
 - `encrypt` and `decrypt` are allowed only if inspection says the TPM natively supports them for that algorithm
 - `all` expands only to the native-compatible uses that are actually available for that algorithm on that TPM
@@ -209,7 +200,6 @@ Allowed seed/PRF uses are:
 - `verify`
 - `encrypt`
 - `decrypt`
-- `derive`
 - `ssh`
 
 The `--use all` on `prf` and `seed` expands to all of the above.
@@ -257,7 +247,6 @@ Native supports:
 
 Native does not support:
 
-- derive
 - secret-key export
 - `ssh-add`
 
@@ -273,7 +262,6 @@ PRF supports:
 - verify
 - encrypt
 - decrypt
-- derive
 - `ssh-add`
 - public-key export
 - secret-key export (only if `export-secret` use bit)
@@ -292,7 +280,6 @@ Seed supports:
 - verify
 - encrypt
 - decrypt
-- derive
 - `ssh-add`
 - public-key export
 - secret-key export (only if `export-secret` use bit)
@@ -394,7 +381,7 @@ For `prf` and `seed`:
 - if a command provides a context key that already exists in the identity defaults, the command value replaces the default value for that key
 - if the same context key is repeated multiple times on one command, the last provided value wins
 - omitted derivation inputs fall back to the identity defaults
-- the effective derivation input set is what determines the derived child material for sign/verify/encrypt/decrypt/export/ssh-add/derive
+- the effective derivation input set is what determines the derived child material for sign/verify/encrypt/decrypt/export/ssh-add
 
 For `native` identity:
 
@@ -405,53 +392,20 @@ For `native` identity:
 
 This applies both when the identity was explicitly created as `native` and when it resolved to `native` through `auto`.
 
-### 10. `derive` becomes the explicit surfaced form of the PRF/seed internal flow
+### 10. Standalone `derive` is removed
 
-`derive` works only with:
+The standalone `derive` command is removed from the public CLI surface.
 
-- `prf`
-- `seed`
-
-It does not work with:
-
-- `native`
-
-The `derive` is not a special second derivation model. It simply exposes the same derivation pipeline that powers PRF/seed-backed operational commands.
+The underlying PRF/seed derivation behavior still exists, but it is now reached through the identity-bound operational commands and through `export` with derivation overrides/default merges.
 
 That means:
 
-- no extra HKDF layer beyond the mode’s normal derivation flow
-- no double expansion
-- `derive --format hex|base64` returns the direct surfaced derived bytes from the effective PRF/seed derivation path
-- `derive --format der|pem|openssh` derives the effective child asymmetric identity key and renders its public key
-
-More specifically:
-
-- for `prf`, the command must return the single derived output of the PRF pipeline for the effective derivation inputs/spec
-- for `seed`, the command must return the single derived output of the seed HKDF pipeline for the effective derivation inputs/spec
-- the public-key rendering forms are only valid when the selected algorithm/container pairing is actually supported (`openssh` remains limited to the currently supported SSH key shapes)
-
-`derive` is therefore the third-party integration escape hatch for PRF/seed identities.
-
-Example:
-
-```bash
-tpm2x derive \
-  --with wgwprf \
-  --org com.example \
-  --purpose session \
-  --context tenant=alpha \
-  --length 32
-
-# derived public key form of the effective child identity
-
-tpm2x derive \
-  --with wgwprf \
-  --org com.example \
-  --purpose session \
-  --context tenant=alpha \
-  --format pem
-```
+- no standalone `derive` command in the public surface
+- no `use=derive` in the public use vocabulary
+- the old raw-byte derive workflow is intentionally removed from the public CLI
+- PRF/seed derivation remains the internal mechanism that powers `sign`, `verify`, `encrypt`, `decrypt`, `export`, and `ssh-add`
+- for `seed`, operations still use derived child material rather than exposing the raw sealed seed
+- for `prf`, operations still use finalized PRF-derived output rather than exporting the PRF root itself
 
 ### 11. Export rules are unified at the command level and differentiated by mode
 
@@ -498,7 +452,6 @@ Important: exporting the secret key or the keypair requires `export-secret` use 
 | verify     | yes    | yes | yes  |
 | encrypt    | yes¹   | yes | yes  |
 | decrypt    | yes¹   | yes | yes  |
-| derive     | no     | yes | yes  |
 | export public key | yes | yes | yes |
 | export secret key | no | yes² | yes² |
 | ssh-add    | no     | yes³ | yes³  |
@@ -515,7 +468,6 @@ Important: exporting the secret key or the keypair requires `export-secret` use 
 | verify   | yes*   | yes | yes  |
 | encrypt  | yes*   | yes | yes  |
 | decrypt  | yes*   | yes | yes  |
-| derive   | no     | yes | yes  |
 | ssh      | yes    | yes | yes  |
 | export-secret | no | yes | yes  |
 
@@ -561,12 +513,12 @@ If native sign/verify exists for `p256`, `auto` may resolve to `native`.
 #### 13.4 Auto does not create a hybrid identity
 
 ```bash
-tpm2x identity mixed_id --mode auto --algorithm p256 --use sign --use verify --use derive
+tpm2x identity mixed_id --mode auto --algorithm p256 --use sign --use verify --use export-secret
 ```
 
 This must resolve to exactly one mode that can satisfy the full use set. If no single mode is valid, identity creation fails.
 
-If the operator wants native sign/verify plus separate derived workflows, they must create separate identities.
+If the operator wants native sign/verify plus separate secret-export workflows, they must create separate identities.
 
 If `auto` would otherwise choose `native`, but the TPM does not support one of the requested native uses for the selected algorithm, identity creation must fail instead of silently switching modes.
 
@@ -669,7 +621,7 @@ tpm2x export --with wgwseed --kind keypair --output wgwseed.json --confirm --rea
 - Good, because `--with <identity>` gives a stable, reusable selector across all operational commands.
 - Good, because `ssh-add` the command is separated from `use=ssh` the use bit, which leaves room for future native helper flows without daemon-agent requirements.
 - Good, because derivation-input overrides now work uniformly for `prf` and `seed` and are rejected clearly for `native`.
-- Good, because `derive` becomes a first-class surface of the same PRF/seed derivation path rather than a special unrelated command.
+- Good, because the operational commands and `export` now carry the whole derivation story without a redundant standalone `derive` command.
 - Good, because adds explicit `export-secret` for `prf` and `seed` modes, disallowing secret/keypair export if the `use=export-secret` is missing for the selected identity.
 - Good, because adds separate kinds for the `export` command like `--kind public-key`, `--kind secret-key`, and `--kind keypair`.
 - Good, because makes the `export` command require `use=export-secret` for `--kind secret-key` and `--kind keypair`.

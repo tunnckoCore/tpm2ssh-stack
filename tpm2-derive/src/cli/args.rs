@@ -7,8 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "tpm2-derive",
     version,
     about = "TPM-backed identity operations with native, PRF, and seed modes",
-    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format pem\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format pem --output prod-signer.pem\n  tpm2-derive export --with wallet-seed --kind public-key --format eth --output wallet.address\n  tpm2-derive export --with app-prf --kind secret-key --format der --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format pem --confirm --reason \"hardware migration\" --output app-prf.json"
+    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, and the operational subcommands ('sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format pem --output prod-signer.pem\n  tpm2-derive export --with wallet-seed --kind public-key --format eth --output wallet.address\n  tpm2-derive export --with app-prf --kind secret-key --format der --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format pem --confirm --reason \"hardware migration\" --output app-prf.json"
 )]
 pub struct Cli {
     #[arg(
@@ -27,8 +27,6 @@ pub enum Command {
     Inspect(InspectArgs),
     /// Create or update an identity and materialize backend state unless --dry-run is used.
     Identity(IdentityArgs),
-    /// Derive deterministic bytes or a derived public key from a persisted PRF or seed identity.
-    Derive(DeriveArgs),
     /// Sign input with a persisted identity.
     Sign(SignArgs),
     /// Verify a signature against a persisted identity.
@@ -95,38 +93,6 @@ pub struct DerivationInputArgs {
     pub purpose: Option<String>,
     #[arg(long = "context", value_parser = parse_key_value, help = "Additional key=value context fields; repeat as needed")]
     pub context: Vec<(String, String)>,
-}
-
-#[derive(Debug, Args)]
-#[command(about = "Derive deterministic bytes or a derived public key from a persisted identity")]
-pub struct DeriveArgs {
-    #[arg(long = "with", help = "Existing identity name to use")]
-    pub identity: String,
-    #[command(flatten)]
-    pub derivation: DerivationInputArgs,
-    #[arg(
-        long,
-        default_value_t = 32,
-        help = "Number of derived bytes to produce"
-    )]
-    pub length: u16,
-    #[arg(
-        long = "format",
-        value_enum,
-        default_value_t = DeriveFormatArg::Hex,
-        help = "Output format for derived output (hex/base64 return derived bytes; der/pem/openssh return the derived public key for the effective child identity and require --length 32; der also requires --output)"
-    )]
-    pub format: DeriveFormatArg,
-    #[arg(
-        long,
-        help = "Write derived output to a file instead of returning it inline"
-    )]
-    pub output: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Override the state root directory instead of the default local state path"
-    )]
-    pub state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -309,8 +275,6 @@ pub enum UseArg {
     Sign,
     /// Allow signature verification operations.
     Verify,
-    /// Allow deterministic derivation operations.
-    Derive,
     /// Intended for SSH usage.
     Ssh,
     /// Allow encryption operations.
@@ -342,20 +306,6 @@ pub enum ExportKindArg {
     SecretKey,
     /// Export both derived secret and public key material together as JSON; --format applies to the embedded key values, and `eth` (secp256k1 only) also adds an address field.
     Keypair,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum DeriveFormatArg {
-    /// Write binary DER public-key output for the effective derived child identity.
-    Der,
-    /// Write PEM public-key output for the effective derived child identity.
-    Pem,
-    /// Write an OpenSSH public key for the effective derived child identity when supported.
-    Openssh,
-    /// Write lowercase hexadecimal text.
-    Hex,
-    /// Write base64 text.
-    Base64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -445,7 +395,7 @@ mod tests {
     fn operational_commands_parse_with_selector_and_derivation_inputs() {
         let cli = Cli::try_parse_from([
             "tpm2-derive",
-            "derive",
+            "export",
             "--with",
             "app-prf",
             "--org",
@@ -454,8 +404,8 @@ mod tests {
             "session",
             "--context",
             "tenant=alpha",
-            "--length",
-            "32",
+            "--kind",
+            "public-key",
             "--format",
             "base64",
             "--output",
@@ -464,7 +414,7 @@ mod tests {
         .expect("cli should parse");
 
         match cli.command {
-            Command::Derive(args) => {
+            Command::Export(args) => {
                 assert_eq!(args.identity, "app-prf");
                 assert_eq!(args.derivation.org.as_deref(), Some("com.example"));
                 assert_eq!(args.derivation.purpose.as_deref(), Some("session"));
@@ -472,10 +422,10 @@ mod tests {
                     args.derivation.context,
                     vec![("tenant".to_string(), "alpha".to_string())]
                 );
-                assert_eq!(args.format, DeriveFormatArg::Base64);
+                assert_eq!(args.format, Some(ExportFormatArg::Base64));
                 assert_eq!(args.output, Some(PathBuf::from("derived.txt")));
             }
-            other => panic!("expected derive command, found {other:?}"),
+            other => panic!("expected export command, found {other:?}"),
         }
     }
 
@@ -487,24 +437,6 @@ mod tests {
         match cli.command {
             Command::SshAdd(args) => assert_eq!(args.identity, "seed-user"),
             other => panic!("expected ssh-add command, found {other:?}"),
-        }
-    }
-
-    #[test]
-    fn derive_parses_public_key_formats() {
-        let cli = Cli::try_parse_from([
-            "tpm2-derive",
-            "derive",
-            "--with",
-            "app-prf",
-            "--format",
-            "pem",
-        ])
-        .expect("derive pem should parse");
-
-        match cli.command {
-            Command::Derive(args) => assert_eq!(args.format, DeriveFormatArg::Pem),
-            other => panic!("expected derive command, found {other:?}"),
         }
     }
 
@@ -646,6 +578,7 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(Cli::try_parse_from(["tpm2-derive", "derive", "--with", "app-prf"]).is_err());
 
         assert!(Cli::try_parse_from(["tpm2-derive", "keygen", "--with", "seed-user"]).is_err());
         assert!(Cli::try_parse_from(["tpm2-derive", "import", "--bundle", "backup.json"]).is_err());
@@ -661,6 +594,7 @@ mod tests {
         assert!(help.contains("identity"));
         assert!(help.contains("ssh-add"));
         assert!(help.contains("supports PRF- and seed-backed identities"));
+        assert!(!help.contains("\n  derive\n"));
         assert!(!help.contains("seed-backed slice"));
         assert!(!help.contains("\n  keygen\n"));
         assert!(!help.contains("\n  import\n"));

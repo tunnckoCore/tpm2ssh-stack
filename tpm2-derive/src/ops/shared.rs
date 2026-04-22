@@ -86,16 +86,6 @@ pub(crate) fn resolve_effective_derivation_inputs(
     })
 }
 
-pub(crate) fn derive_command_spec(
-    effective: &EffectiveDerivationInputs,
-    length: u16,
-) -> Result<DerivationSpec> {
-    Ok(DerivationSpec::V1(DerivationSpecV1::new(
-        base_context(effective),
-        OutputSpec::new(OutputKind::SecretBytes, length)?,
-    )?))
-}
-
 pub(crate) fn encrypt_command_spec(
     effective: &EffectiveDerivationInputs,
 ) -> Result<DerivationSpec> {

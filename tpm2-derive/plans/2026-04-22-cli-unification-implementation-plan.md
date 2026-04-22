@@ -31,7 +31,7 @@ The plan is written so multiple parallel agents can work on it.
 - `native` rejects derivation-input flags.
 - `prf` and `seed` share the same top-level command surface.
 - coupled use rules are enforced: `verify` requires `sign`, `decrypt` requires `encrypt`, and `ssh` requires `sign`.
-- `derive` must not do double HKDF expansion.
+- PRF/seed derivation paths must not do double HKDF expansion.
 - `auto` must choose exactly one mode or fail.
 
 ## Explicit non-goals
@@ -95,10 +95,9 @@ Some workstreams can run in parallel. Some have hard dependencies.
   - [x] `verify`
   - [x] `encrypt`
   - [x] `decrypt`
-  - [x] `derive`
   - [x] `export`
   - [x] `ssh-add`
-- [x] Remove derive-specific ssh-agent flags:
+- [x] Remove derivation-related ssh-agent flags:
   - [x] `--ssh-agent-add`
   - [x] `--ssh-agent-comment`
   - [x] `--ssh-agent-socket`
@@ -115,7 +114,7 @@ Some workstreams can run in parallel. Some have hard dependencies.
 - [x] `tpm2-derive identity wgw --mode native --algorithm p256 --use sign --use verify` parses
 - [x] `tpm2-derive sign --with wgw --input msg.txt` parses
 - [x] `tpm2-derive ssh-add --with wgwprf` parses
-- [x] `tpm2-derive derive --with wgwprf --org com.example --purpose session --context tenant=alpha --length 32` parses
+- [x] `tpm2-derive export --with wgwprf --kind public-key --org com.example --purpose session --context tenant=alpha` parses
 - [x] old `setup` no longer parses
 - [x] old `ssh agent add` no longer parses
 - [x] old `--namespace` no longer parses
@@ -274,7 +273,7 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Acceptance checks
 
-- [x] `derive` PRF output is finalized exactly once
+- [x] PRF-derived operation output is finalized exactly once
 - [x] `encrypt` PRF path no longer re-derives already-finalized output
 - [x] `keygen` PRF path no longer re-derives already-finalized output
 - [x] native rejects `--org`, `--purpose`, and `--context`
@@ -476,7 +475,7 @@ If one of these intentionally uses a different derivation branch, that must be m
 - [x] PRF sign/verify tests
 - [x] seed encrypt/decrypt tests
 - [x] PRF encrypt/decrypt tests
-- [x] derive no-double-expansion PRF regression tests
+- [x] no-double-expansion PRF regression tests
 - [x] export public-key tests for native/prf/seed
 - [x] export secret-key tests for prf/seed
 - [x] export keypair tests for prf/seed
@@ -578,7 +577,7 @@ Before calling the refactor done:
 - [x] `auto` chooses exactly one valid mode or fails
 - [x] `native` rejects derivation-input flags
 - [x] `prf` and `seed` support the same top-level command surface
-- [x] `derive` does not double-expand PRF output
+- [x] PRF-backed derived operation flows do not double-expand output
 - [x] `export-secret` gates secret-bearing export
 - [x] `keygen` cannot bypass secret-export policy
 - [x] `ssh-add` works for PRF and seed on the currently supported SSH algorithms (`ed25519`, `p256`), and rejects native

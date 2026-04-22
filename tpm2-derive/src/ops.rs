@@ -3,7 +3,6 @@
 //! This file is the `crate::ops` module root and intentionally coexists with
 //! the `src/ops/` directory, which contains its submodules.
 
-pub mod derive;
 pub mod encrypt;
 mod enforcement;
 pub mod keygen;
@@ -2031,7 +2030,7 @@ mod tests {
         let request = IdentityCreateRequest {
             identity: "prf-default".to_string(),
             algorithm: Algorithm::Ed25519,
-            uses: vec![UseCase::Derive],
+            uses: vec![UseCase::Sign],
             requested_mode: ModePreference::Prf,
             defaults: crate::model::DerivationOverrides::default(),
             state_dir: Some(root_dir.clone()),
@@ -2098,7 +2097,7 @@ mod tests {
         let request = IdentityCreateRequest {
             identity: "seed-default".to_string(),
             algorithm: Algorithm::Ed25519,
-            uses: vec![UseCase::Sign, UseCase::Derive, UseCase::Ssh],
+            uses: vec![UseCase::Sign, UseCase::Sign, UseCase::Ssh],
             requested_mode: ModePreference::Seed,
             defaults: crate::model::DerivationOverrides::default(),
             state_dir: Some(root_dir.clone()),
@@ -2344,7 +2343,7 @@ mod tests {
         let identity = Identity::new(
             "seed-secp256k1".to_string(),
             Algorithm::Secp256k1,
-            vec![UseCase::Derive],
+            vec![UseCase::Sign],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -2388,7 +2387,7 @@ mod tests {
         let identity = Identity::new(
             "seed-p256".to_string(),
             Algorithm::P256,
-            vec![UseCase::Derive],
+            vec![UseCase::Sign],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -2432,7 +2431,7 @@ mod tests {
         let identity = Identity::new(
             "seed-secp256k1".to_string(),
             Algorithm::Secp256k1,
-            vec![UseCase::Derive],
+            vec![UseCase::Sign],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -2476,7 +2475,7 @@ mod tests {
         let identity = Identity::new(
             "seed-p256".to_string(),
             Algorithm::P256,
-            vec![UseCase::Derive],
+            vec![UseCase::Sign],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -2581,7 +2580,7 @@ mod tests {
         let identity = Identity::new(
             "prf-default".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Derive],
+            vec![UseCase::Sign],
             IdentityModeResolution {
                 requested: ModePreference::Prf,
                 resolved: Mode::Prf,

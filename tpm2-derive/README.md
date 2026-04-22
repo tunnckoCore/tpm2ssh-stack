@@ -17,7 +17,6 @@ tpm2-derive sign --with <name> ...
 tpm2-derive verify --with <name> ...
 tpm2-derive encrypt --with <name> ...
 tpm2-derive decrypt --with <name> ...
-tpm2-derive derive --with <name> ...
 tpm2-derive export --with <name> --kind <public-key|secret-key|keypair> ...
 tpm2-derive ssh-add --with <name> ...
 ```
@@ -45,7 +44,6 @@ Supported today:
 
 Not supported today:
 
-- `derive`
 - `ssh-add`
 - secret-key export
 - native encrypt/decrypt in this prototype slice
@@ -60,7 +58,6 @@ Supported:
 - `verify`
 - `encrypt`
 - `decrypt`
-- `derive`
 - `ssh-add`
 - public-key export
 - secret-key and keypair export when the identity was created with `--use export-secret`
@@ -75,7 +72,6 @@ Supported:
 - `verify`
 - `encrypt`
 - `decrypt`
-- `derive`
 - `ssh-add`
 - public-key export
 - secret-key and keypair export when the identity was created with `--use export-secret`
@@ -110,7 +106,7 @@ tpm2-derive identity app-prf \
   --context tenant=alpha
 ```
 
-Use that identity for sign/derive/export/ssh-add:
+Use that identity for sign/export/ssh-add:
 
 ```bash
 tpm2-derive sign \
@@ -124,22 +120,6 @@ tpm2-derive verify \
   --input message.bin \
   --signature message.sig \
   --format base64
-
-tpm2-derive derive \
-  --with app-prf \
-  --org com.example \
-  --purpose session \
-  --context tenant=alpha \
-  --length 32 \
-  --format base64 \
-  --output session.key
-
-tpm2-derive derive \
-  --with app-prf \
-  --org com.example \
-  --purpose session \
-  --context tenant=alpha \
-  --format pem
 
 tpm2-derive export \
   --with app-prf \
@@ -193,7 +173,8 @@ tpm2-derive export \
 
 - `--use all` expands according to the resolved mode and the native capability matrix.
 - `ssh-add` is intentionally separate from `use=ssh` and rejects native identities.
-- `derive --format hex|base64` returns derived bytes; `derive --format der|pem|openssh` returns the derived public key for the effective child identity. `der` requires `--output`, and `openssh` is currently wired for ed25519 and p256.
+- There is no standalone `derive` command anymore; use the operational commands for actual work, and use `export` when you intentionally need key material artifacts from an existing identity with derivation overrides/default merges.
+- The old raw-byte `derive --format hex|base64 --length N` workflow is intentionally gone from the public CLI.
 - `export --kind public-key --format hex|base64` emits raw public key bytes (Ed25519 raw key bytes; secp curves as uncompressed SEC1 bytes), not SPKI-wrapped bytes.
 - `export --format openssh` is currently wired for the SSH-capable key shapes in this project (ed25519 and p256), not secp256k1.
 - `export --kind public-key --format eth` emits a checksummed Ethereum address for secp256k1 identities.

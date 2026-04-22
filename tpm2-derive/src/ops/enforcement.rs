@@ -81,7 +81,6 @@ mod tests {
                 UseCase::Verify,
                 UseCase::Encrypt,
                 UseCase::Decrypt,
-                UseCase::Derive,
                 UseCase::Ssh,
                 UseCase::ExportSecret,
             ],
@@ -106,14 +105,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_native_rejects_derive() {
-        let error = UseCase::validate_for_mode(&[UseCase::Derive], Mode::Native)
-            .expect_err("native should reject derive");
-        assert!(matches!(error, Error::PolicyRefusal(_)));
-        assert!(error.to_string().contains("not allowed in Native mode"));
-    }
-
-    #[test]
     fn validate_native_rejects_export_secret() {
         let error = UseCase::validate_for_mode(&[UseCase::ExportSecret], Mode::Native)
             .expect_err("native should reject export-secret");
@@ -128,7 +119,6 @@ mod tests {
             vec![UseCase::Sign, UseCase::Ssh],
             vec![UseCase::Encrypt],
             vec![UseCase::Encrypt, UseCase::Decrypt],
-            vec![UseCase::Derive],
             vec![UseCase::ExportSecret],
         ];
 
@@ -139,28 +129,6 @@ mod tests {
     }
 
     // ── Setup-time enforcement tests ────────────────────────────────
-
-    #[test]
-    fn setup_rejects_native_mode_with_derive_use() {
-        let root_dir = unique_temp_path("setup-native-derive");
-        let error = ops::resolve_identity(
-            &HeuristicProbe,
-            &request(
-                "test-native-derive",
-                Algorithm::P256,
-                vec![UseCase::Derive],
-                ModePreference::Native,
-                root_dir.clone(),
-            ),
-        )
-        .expect_err("native + derive should fail at setup");
-
-        assert!(matches!(
-            error,
-            Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)
-        ));
-        let _ = std::fs::remove_dir_all(root_dir);
-    }
 
     #[test]
     fn setup_allows_native_mode_with_sign_and_ssh_use() {
@@ -220,25 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn setup_allows_prf_mode_with_derive_use() {
-        let root_dir = unique_temp_path("setup-prf-derive");
-        let result = ops::resolve_identity(
-            &AlwaysAvailableProbe,
-            &request(
-                "test-prf-derive",
-                Algorithm::Ed25519,
-                vec![UseCase::Derive],
-                ModePreference::Prf,
-                root_dir.clone(),
-            ),
-        )
-        .expect("prf + derive should succeed at setup (dry-run)");
-
-        assert_eq!(result.identity.mode.resolved, Mode::Prf);
-        let _ = std::fs::remove_dir_all(root_dir);
-    }
-
-    #[test]
     fn setup_allows_seed_mode_with_everything() {
         let root_dir = unique_temp_path("setup-seed-all");
         let result = ops::resolve_identity(
@@ -249,7 +198,6 @@ mod tests {
                 vec![
                     UseCase::Sign,
                     UseCase::Verify,
-                    UseCase::Derive,
                     UseCase::Ssh,
                     UseCase::Encrypt,
                     UseCase::Decrypt,
@@ -299,8 +247,16 @@ mod tests {
         )
         .expect_err("verify-only should be rejected by the coupled use contract");
 
-        assert!(matches!(error, Error::CapabilityMismatch(_) | Error::PolicyRefusal(_)));
-        assert!(error.to_string().contains("use=verify requires use=sign") || error.to_string().contains("verify-only native identities are not wired"));
+        assert!(matches!(
+            error,
+            Error::CapabilityMismatch(_) | Error::PolicyRefusal(_)
+        ));
+        assert!(
+            error.to_string().contains("use=verify requires use=sign")
+                || error
+                    .to_string()
+                    .contains("verify-only native identities are not wired")
+        );
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -338,7 +294,10 @@ mod tests {
         )
         .expect("native --use all should expand to supported native uses");
 
-        assert_eq!(result.identity.uses, vec![UseCase::Sign, UseCase::Verify, UseCase::Ssh]);
+        assert_eq!(
+            result.identity.uses,
+            vec![UseCase::Sign, UseCase::Verify, UseCase::Ssh]
+        );
     }
 
     #[test]
@@ -357,7 +316,11 @@ mod tests {
         .expect_err("decrypt-only should be rejected by the coupled use contract");
 
         assert!(matches!(error, Error::PolicyRefusal(_)));
-        assert!(error.to_string().contains("use=decrypt requires use=encrypt"));
+        assert!(
+            error
+                .to_string()
+                .contains("use=decrypt requires use=encrypt")
+        );
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -395,7 +358,10 @@ mod tests {
         )
         .expect_err("ssh-only should be rejected by the coupled use contract");
 
-        assert!(matches!(error, Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)));
+        assert!(matches!(
+            error,
+            Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)
+        ));
         assert!(error.to_string().contains("use=ssh requires use=sign"));
         let _ = std::fs::remove_dir_all(root_dir);
     }
@@ -409,12 +375,11 @@ mod tests {
             UseCase::Sign,
             UseCase::Verify,
             UseCase::Ssh,
-            UseCase::Derive,
             UseCase::Encrypt,
             UseCase::Decrypt,
             UseCase::ExportSecret,
         ];
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 7);
 
         for use_case in &all {
             let json = serde_json::to_string(use_case).expect("serialize");

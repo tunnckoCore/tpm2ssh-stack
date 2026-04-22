@@ -44,7 +44,7 @@ impl NativeAlgorithmCapability {
             UseCase::Ssh => self.sign,
             UseCase::Encrypt => self.encrypt,
             UseCase::Decrypt => self.decrypt,
-            UseCase::Derive | UseCase::ExportSecret => false,
+            UseCase::ExportSecret => false,
         }
     }
 }

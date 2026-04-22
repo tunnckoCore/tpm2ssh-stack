@@ -162,9 +162,24 @@ impl Identity {
             ))
         })?;
 
-        let mut identity: Self = serde_json::from_str(&contents).map_err(|error| {
+        let mut parsed: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
             Error::State(format!(
                 "failed to parse identity '{}' from '{}': {error}",
+                name,
+                identity_path.display()
+            ))
+        })?;
+
+        if let Some(uses) = parsed
+            .get_mut("uses")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            uses.retain(|value| value.as_str() != Some("derive"));
+        }
+
+        let mut identity: Self = serde_json::from_value(parsed).map_err(|error| {
+            Error::State(format!(
+                "failed to decode identity '{}' from '{}': {error}",
                 name,
                 identity_path.display()
             ))
@@ -301,7 +316,10 @@ mod tests {
         assert!(json.contains("\"purpose\": \"backup\""));
 
         let round_tripped: Identity = serde_json::from_str(&json).expect("deserialize identity");
-        assert_eq!(round_tripped.uses, vec![UseCase::Sign, UseCase::ExportSecret]);
+        assert_eq!(
+            round_tripped.uses,
+            vec![UseCase::Sign, UseCase::ExportSecret]
+        );
         assert_eq!(
             round_tripped.defaults.context,
             BTreeMap::from([("tenant".to_string(), "alpha".to_string())])

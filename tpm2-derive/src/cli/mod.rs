@@ -1,15 +1,14 @@
 mod args;
 mod render;
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
 use args::{
-    AlgorithmArg, DecryptArgs, DeriveArgs, DeriveFormatArg, EncryptArgs, ExportArgs,
-    ExportFormatArg, ExportKindArg, IdentityArgs, InspectArgs, ModeArg, SignArgs, SignFormatArg,
-    SshAddArgs, UseArg, VerifyArgs, VerifyFormatArg,
+    AlgorithmArg, DecryptArgs, EncryptArgs, ExportArgs, ExportFormatArg, ExportKindArg,
+    IdentityArgs, InspectArgs, ModeArg, SignArgs, SignFormatArg, SshAddArgs, UseArg, VerifyArgs,
+    VerifyFormatArg,
 };
 pub use args::{Cli, Command};
 use render::{failure, success, success_with_diagnostics};
@@ -17,10 +16,10 @@ use render::{failure, success, success_with_diagnostics};
 use crate::backend::{CapabilityProbe, CommandRunner, ProcessCommandRunner, default_probe};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, CommandPath, DecryptRequest, DerivationOverrides, DeriveRequest, EncryptRequest,
-    ErrorEnvelope, ExportKind, ExportRequest, Format, IdentityCreateRequest, InputFormat,
-    InputSource, InspectRequest, ModePreference, PendingOperation, SignRequest, SshAddRequest,
-    UseCase, VerifyRequest,
+    Algorithm, CommandPath, DecryptRequest, DerivationOverrides, EncryptRequest, ErrorEnvelope,
+    ExportKind, ExportRequest, Format, IdentityCreateRequest, InputFormat, InputSource,
+    InspectRequest, ModePreference, PendingOperation, SignRequest, SshAddRequest, UseCase,
+    VerifyRequest,
 };
 use crate::ops;
 use crate::ops::sign::SignOperationResult;
@@ -55,7 +54,6 @@ impl From<UseArg> for UseCase {
             UseArg::All => Self::All,
             UseArg::Sign => Self::Sign,
             UseArg::Verify => Self::Verify,
-            UseArg::Derive => Self::Derive,
             UseArg::Ssh => Self::Ssh,
             UseArg::Encrypt => Self::Encrypt,
             UseArg::Decrypt => Self::Decrypt,
@@ -81,18 +79,6 @@ impl From<ExportKindArg> for ExportKind {
             ExportKindArg::PublicKey => Self::PublicKey,
             ExportKindArg::SecretKey => Self::SecretKey,
             ExportKindArg::Keypair => Self::Keypair,
-        }
-    }
-}
-
-impl From<DeriveFormatArg> for Format {
-    fn from(value: DeriveFormatArg) -> Self {
-        match value {
-            DeriveFormatArg::Der => Self::Der,
-            DeriveFormatArg::Pem => Self::Pem,
-            DeriveFormatArg::Openssh => Self::Openssh,
-            DeriveFormatArg::Hex => Self::Hex,
-            DeriveFormatArg::Base64 => Self::Base64,
         }
     }
 }
@@ -152,7 +138,6 @@ pub fn run(cli: Cli) -> Result<String> {
     match cli.command {
         Command::Inspect(args) => run_inspect(cli.json, &probe, args),
         Command::Identity(args) => run_identity(cli.json, &probe, args),
-        Command::Derive(args) => run_derive(cli.json, args),
         Command::Sign(args) => run_sign(cli.json, args),
         Command::Verify(args) => run_verify(cli.json, args),
         Command::Encrypt(args) => run_encrypt(cli.json, args),
@@ -188,44 +173,6 @@ fn run_identity(json: bool, probe: &dyn CapabilityProbe, args: IdentityArgs) -> 
         Err(error) => failure(
             json,
             CommandPath::from_segments(["identity"]),
-            ErrorEnvelope {
-                code: error.code().as_str().to_string(),
-                message: error.to_string(),
-            },
-            Vec::new(),
-        ),
-    }
-}
-
-fn run_derive(json: bool, args: DeriveArgs) -> Result<String> {
-    let command = CommandPath::from_segments(["derive"]);
-    let request = DeriveRequest {
-        identity: args.identity.clone(),
-        derivation: derivation_overrides(args.derivation),
-        length: args.length,
-        format: args.format.into(),
-        output: args.output,
-    };
-
-    match ops::load_identity(&request.identity, args.state_dir.clone()) {
-        Ok(identity) => {
-            let runner = ProcessCommandRunner;
-            match ops::derive::execute_with_defaults(&identity, &request, &runner) {
-                Ok(result) => success(json, command, result),
-                Err(error) => failure(
-                    json,
-                    command,
-                    ErrorEnvelope {
-                        code: error.code().as_str().to_string(),
-                        message: error.to_string(),
-                    },
-                    Vec::new(),
-                ),
-            }
-        }
-        Err(error) => failure(
-            json,
-            command,
             ErrorEnvelope {
                 code: error.code().as_str().to_string(),
                 message: error.to_string(),
@@ -696,18 +643,6 @@ fn write_output_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
 #[allow(dead_code)]
 fn build_placeholder_request(operation: &str, identity: String) -> serde_json::Value {
     match operation {
-        "derive" => serde_json::to_value(DeriveRequest {
-            identity,
-            derivation: DerivationOverrides {
-                org: Some("planned".to_string()),
-                purpose: Some("planned".to_string()),
-                context: BTreeMap::new(),
-            },
-            length: 32,
-            format: Format::Hex,
-            output: None,
-        })
-        .unwrap_or_default(),
         "sign" => serde_json::to_value(SignRequest {
             identity,
             input: InputSource::Stdin,
