@@ -1,9 +1,10 @@
 use crate::model::{
-    Algorithm, CapabilityReport, Diagnostic, Mode, NativeCapabilitySummary, TpmStatus, UseCase,
+    Algorithm, CapabilityReport, Mode, NativeAlgorithmCapability, NativeCapabilitySummary,
+    TpmStatus, UseCase,
 };
 
 mod parser;
-mod recommend;
+pub(crate) mod recommend;
 mod subprocess;
 #[cfg(feature = "backend-tss-esapi")]
 mod tss_esapi;
@@ -29,58 +30,51 @@ pub struct HeuristicProbe;
 
 impl CapabilityProbe for HeuristicProbe {
     fn detect(&self, algorithm: Option<Algorithm>, uses: &[UseCase]) -> CapabilityReport {
-        let mut recommendation_reasons = Vec::new();
-        let mut diagnostics = Vec::new();
+        let mut recommendation_reasons = vec![
+            "heuristic probe assumes the common prototype surface: native p256 sign/verify, TPM PRF, and sealed-seed fallback"
+                .to_string(),
+        ];
+        let diagnostics = Vec::new();
 
-        let recommended_mode = match algorithm {
-            Some(Algorithm::Ed25519) => {
-                recommendation_reasons
-                    .push("ed25519 is typically not TPM-native on TPM 2.0 chips".to_string());
-                Some(Mode::Prf)
-            }
-            Some(Algorithm::Secp256k1) => {
-                recommendation_reasons
-                    .push("secp256k1 is typically not TPM-native on TPM 2.0 chips".to_string());
-                Some(Mode::Prf)
-            }
-            Some(Algorithm::P256)
-                if uses
-                    .iter()
-                    .all(|use_case| matches!(use_case, UseCase::Sign | UseCase::Verify)) =>
-            {
-                recommendation_reasons.push(
-                    "p256 sign/verify is the best candidate for native TPM MVP support".to_string(),
-                );
-                Some(Mode::Native)
-            }
-            Some(Algorithm::P256) => {
-                recommendation_reasons.push(
-                    "p256 supports native, PRF, and seed strategies depending on requested operations"
-                        .to_string(),
-                );
-                Some(Mode::Prf)
-            }
-            None => None,
+        let native = NativeCapabilitySummary {
+            algorithms: vec![NativeAlgorithmCapability {
+                algorithm: Algorithm::P256,
+                sign: true,
+                verify: true,
+                encrypt: false,
+                decrypt: false,
+            }],
         };
 
-        if uses
-            .iter()
-            .any(|use_case| matches!(use_case, UseCase::Ssh | UseCase::Derive))
-        {
+        let recommended_mode = algorithm.and_then(|algorithm| {
+            [Mode::Native, Mode::Prf, Mode::Seed]
+                .into_iter()
+                .find(|mode| {
+                    recommend::report_supports_mode(
+                        &CapabilityReport {
+                            tpm: TpmStatus {
+                                present: None,
+                                accessible: None,
+                            },
+                            native: native.clone(),
+                            prf_available: Some(true),
+                            seed_available: Some(true),
+                            recommended_mode: None,
+                            recommendation_reasons: Vec::new(),
+                            diagnostics: Vec::new(),
+                        },
+                        algorithm,
+                        uses,
+                        *mode,
+                    )
+                })
+        });
+
+        if recommended_mode == Some(Mode::Native) {
             recommendation_reasons.push(
-                "requested operation benefits from deterministic derived output; prefer PRF and fall back to seed mode"
+                "heuristic probe prefers native first when the requested p256 use set is fully supported"
                     .to_string(),
             );
-        }
-
-        if uses
-            .iter()
-            .any(|use_case| matches!(use_case, UseCase::Encrypt | UseCase::Decrypt))
-        {
-            diagnostics.push(Diagnostic::warning(
-                "mvp-not-implemented",
-                "encrypt/decrypt is planned but not part of the initial scaffold MVP",
-            ));
         }
 
         CapabilityReport {
@@ -88,12 +82,9 @@ impl CapabilityProbe for HeuristicProbe {
                 present: None,
                 accessible: None,
             },
-            native: NativeCapabilitySummary {
-                supported_algorithms: vec![Algorithm::P256],
-                supported_uses: vec![UseCase::Sign, UseCase::Verify],
-            },
-            prf_available: None,
-            seed_available: None,
+            native,
+            prf_available: Some(true),
+            seed_available: Some(true),
             recommended_mode,
             recommendation_reasons,
             diagnostics,

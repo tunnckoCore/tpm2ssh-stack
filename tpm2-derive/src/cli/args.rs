@@ -359,6 +359,8 @@ pub enum AlgorithmArg {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 pub enum UseArg {
+    /// Expand to the mode-aware full supported set.
+    All,
     /// Allow signing operations.
     Sign,
     /// Allow signature verification operations.
@@ -373,8 +375,6 @@ pub enum UseArg {
     Decrypt,
     /// Allow secret-bearing export operations.
     ExportSecret,
-    /// Expand to the mode-aware full supported set.
-    All,
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]

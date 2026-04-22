@@ -10,7 +10,7 @@ mod tests {
     use crate::error::Error;
     use crate::model::{
         Algorithm, CapabilityReport, DerivationOverrides, IdentityCreateRequest, Mode,
-        ModePreference, NativeCapabilitySummary, TpmStatus, UseCase,
+        ModePreference, NativeAlgorithmCapability, NativeCapabilitySummary, TpmStatus, UseCase,
     };
     use crate::ops;
 
@@ -36,8 +36,13 @@ mod tests {
                     accessible: Some(true),
                 },
                 native: NativeCapabilitySummary {
-                    supported_algorithms: vec![Algorithm::P256],
-                    supported_uses: vec![UseCase::Sign, UseCase::Verify],
+                    algorithms: vec![NativeAlgorithmCapability {
+                        algorithm: Algorithm::P256,
+                        sign: true,
+                        verify: true,
+                        encrypt: false,
+                        decrypt: false,
+                    }],
                 },
                 prf_available: Some(true),
                 seed_available: Some(true),
@@ -277,11 +282,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
+    #[test]
+    fn auto_chooses_seed_when_prf_cannot_satisfy_signing_request() {
+        let root_dir = unique_temp_path("setup-auto-sign-seed");
+        let result = ops::resolve_identity(
+            &AlwaysAvailableProbe,
+            &request(
+                "test-auto-sign-seed",
+                Algorithm::Ed25519,
+                vec![UseCase::Sign],
+                ModePreference::Auto,
+                root_dir.clone(),
+            ),
+        )
+        .expect("auto should skip PRF and choose seed for sign support");
+
+        assert_eq!(result.identity.mode.resolved, Mode::Seed);
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn use_all_expands_for_native_setup() {
+        let root_dir = unique_temp_path("setup-native-all");
+        let result = ops::resolve_identity(
+            &HeuristicProbe,
+            &request(
+                "test-native-all",
+                Algorithm::P256,
+                vec![UseCase::All],
+                ModePreference::Native,
+                root_dir.clone(),
+            ),
+        )
+        .expect("native --use all should expand to supported native uses");
+
+        assert_eq!(result.identity.uses, vec![UseCase::Sign, UseCase::Verify]);
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
     // ── UseCase enum variant correctness ────────────────────────────
 
     #[test]
     fn use_case_enum_has_expected_variants() {
         let all = [
+            UseCase::All,
             UseCase::Sign,
             UseCase::Verify,
             UseCase::Ssh,
@@ -290,7 +334,7 @@ mod tests {
             UseCase::Decrypt,
             UseCase::ExportSecret,
         ];
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
 
         for use_case in &all {
             let json = serde_json::to_string(use_case).expect("serialize");

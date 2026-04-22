@@ -197,24 +197,24 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Checklist
 
-- [ ] Replace the coarse native capability summary with a per-algorithm action matrix
-- [ ] Represent native support separately for:
-  - [ ] sign
-  - [ ] verify
-  - [ ] encrypt
-  - [ ] decrypt
-- [ ] Represent PRF availability explicitly as “actual PRF support on the TPM”
-- [ ] Represent seed availability explicitly
-- [ ] Update `inspect` rendering/output to surface the matrix
-- [ ] Rewrite `auto` mode resolution to:
-  - [ ] try `native`
-  - [ ] then `prf`
-  - [ ] then `seed`
-  - [ ] evaluate the full requested use set against one mode at a time
-  - [ ] never create a hybrid identity
-  - [ ] never silently switch away from an explicit mode
-  - [ ] fail with a reason when no one mode satisfies the request
-- [ ] Move `--use all` expansion to a point where the resolved mode + capability matrix are known
+- [x] Replace the coarse native capability summary with a per-algorithm action matrix
+- [x] Represent native support separately for:
+  - [x] sign
+  - [x] verify
+  - [x] encrypt
+  - [x] decrypt
+- [x] Represent PRF availability explicitly as “actual PRF support on the TPM”
+- [x] Represent seed availability explicitly
+- [x] Update `inspect` rendering/output to surface the matrix
+- [x] Rewrite `auto` mode resolution to:
+  - [x] try `native`
+  - [x] then `prf`
+  - [x] then `seed`
+  - [x] evaluate the full requested use set against one mode at a time
+  - [x] never create a hybrid identity
+  - [x] never silently switch away from an explicit mode
+  - [x] fail with a reason when no one mode satisfies the request
+- [x] Move `--use all` expansion to a point where the resolved mode + capability matrix are known
 
 ### Deliverables
 
@@ -224,10 +224,10 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Acceptance checks
 
-- [ ] `inspect` can tell whether native encrypt/decrypt exists for a given algorithm
-- [ ] explicit `--mode prf` fails if PRF backing is unavailable even if seed is available
-- [ ] `auto` chooses one mode only
-- [ ] `auto` fails instead of silently downgrading or switching explicit mode requests
+- [x] `inspect` can tell whether native encrypt/decrypt exists for a given algorithm
+- [x] explicit `--mode prf` fails if PRF backing is unavailable even if seed is available
+- [x] `auto` chooses one mode only
+- [x] `auto` fails instead of silently downgrading or switching explicit mode requests
 
 ---
 
@@ -391,18 +391,18 @@ If one of these intentionally uses a different derivation branch, that must be m
 
 ### Checklist
 
-- [ ] Audit current native support assumptions
-- [ ] Confirm exactly what native actions are truly executable today
+- [x] Audit current native support assumptions
+- [x] Confirm exactly what native actions are truly executable today
 - [ ] If native encrypt/decrypt is implementable:
   - [ ] implement native encrypt
   - [ ] implement native decrypt
   - [ ] expose capability matrix truthfully
-- [ ] If native encrypt/decrypt is not implementable in this prototype slice:
-  - [ ] keep capability matrix false
-  - [ ] keep explicit failures truthful
-  - [ ] ensure `use=all` excludes unsupported native actions
-- [ ] Keep native public-key export working
-- [ ] Keep native secret export forbidden
+- [x] If native encrypt/decrypt is not implementable in this prototype slice:
+  - [x] keep capability matrix false
+  - [x] keep explicit failures truthful
+  - [x] ensure `use=all` excludes unsupported native actions
+- [x] Keep native public-key export working
+- [x] Keep native secret export forbidden
 
 ### Deliverables
 
@@ -411,9 +411,9 @@ If one of these intentionally uses a different derivation branch, that must be m
 
 ### Acceptance checks
 
-- [ ] native never advertises unsupported actions
+- [x] native never advertises unsupported actions
 - [ ] if native encrypt/decrypt is implemented, round-trip tests exist
-- [ ] if native encrypt/decrypt is not implemented, inspect/auto/errors all reflect that cleanly
+- [x] if native encrypt/decrypt is not implemented, inspect/auto/errors all reflect that cleanly
 
 ---
 
@@ -573,15 +573,15 @@ Before calling the refactor done:
 
 - [ ] public CLI uses `identity` and `--with`
 - [ ] internal code no longer treats `profile` as the main public abstraction
-- [ ] `inspect` shows a truthful capability matrix
-- [ ] `auto` chooses exactly one valid mode or fails
+- [x] `inspect` shows a truthful capability matrix
+- [x] `auto` chooses exactly one valid mode or fails
 - [ ] `native` rejects derivation-input flags
 - [ ] `prf` and `seed` support the same top-level command surface
 - [ ] `derive` does not double-expand PRF output
 - [ ] `export-secret` gates secret-bearing export
 - [ ] `keygen` cannot bypass secret-export policy
 - [ ] `ssh-add` works for PRF and seed, and rejects native
-- [ ] native support advertised by inspect matches real backend execution
+- [x] native support advertised by inspect matches real backend execution
 - [ ] README/help/examples match the accepted ADR
 
 # Suggested commit slicing

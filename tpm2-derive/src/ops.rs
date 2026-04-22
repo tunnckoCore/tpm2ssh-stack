@@ -29,6 +29,7 @@ use ssh_key::{
     public::{EcdsaPublicKey as SshEcdsaPublicKey, KeyData as SshKeyData},
 };
 
+use crate::backend::recommend::mode_rejection_reason;
 use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
@@ -37,6 +38,7 @@ use crate::model::{
     ExportResult, Identity, IdentityCreateRequest, IdentityCreateResult,
     IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode, ModePreference,
     PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult, StateLayout, UseCase,
+    expand_mode_requested_uses,
 };
 use crate::ops::native::subprocess::{
     NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
@@ -157,30 +159,49 @@ fn build_identity_record(
 ) -> Result<Identity> {
     validate_profile_name(&request.identity)?;
 
-    let uses = normalize_uses(request.uses.clone());
-    if uses.is_empty() {
+    let requested_uses = normalize_uses(request.uses.clone());
+    if requested_uses.is_empty() {
         return Err(Error::Validation(
             "at least one --use value is required for identity creation".to_string(),
         ));
     }
 
-    let report = probe.detect(Some(request.algorithm), &uses);
+    let report = probe.detect(Some(request.algorithm), &requested_uses);
     let resolved_mode = resolve_mode(
         probe,
         request.requested_mode,
         request.algorithm,
-        &uses,
+        &requested_uses,
         &report,
     )?;
+    let uses = expand_mode_requested_uses(
+        resolved_mode,
+        Some(request.algorithm),
+        &report.native,
+        &requested_uses,
+    );
+    if uses.is_empty() {
+        return Err(Error::CapabilityMismatch(format!(
+            "requested uses {:?} expand to an empty supported set for {resolved_mode:?} mode and {:?}",
+            requested_uses, request.algorithm
+        )));
+    }
 
-    // Enforce mode/use compatibility at setup time.
+    // Enforce mode/use compatibility at setup time after mode-aware expansion.
     UseCase::validate_for_mode(&uses, resolved_mode)?;
 
-    let reasons = if let Some(explicit) = request.requested_mode.explicit() {
+    let mut reasons = if let Some(explicit) = request.requested_mode.explicit() {
         vec![format!("mode explicitly requested as {explicit:?}")]
     } else {
         report.recommendation_reasons.clone()
     };
+
+    if requested_uses.iter().any(|use_case| use_case.is_all()) {
+        reasons.push(format!(
+            "expanded --use all for {resolved_mode:?} mode into {:?}",
+            uses
+        ));
+    }
 
     Ok(Identity::with_defaults(
         request.identity.clone(),
@@ -1490,12 +1511,19 @@ fn resolve_mode(
 ) -> Result<Mode> {
     match requested_mode.explicit() {
         Some(mode) if probe.supports_mode(algorithm, uses, mode) => Ok(mode),
-        Some(mode) => Err(Error::CapabilityMismatch(format!(
-            "requested mode {mode:?} is not supported for {algorithm:?} with uses {uses:?}"
+        Some(mode) => Err(Error::CapabilityMismatch(mode_rejection_reason(
+            report, algorithm, uses, mode,
         ))),
-        None => report
-            .recommended_mode
-            .ok_or_else(|| Error::CapabilityMismatch("unable to recommend a mode".to_string())),
+        None => report.recommended_mode.ok_or_else(|| {
+            let reasons = [Mode::Native, Mode::Prf, Mode::Seed]
+                .into_iter()
+                .map(|mode| mode_rejection_reason(report, algorithm, uses, mode))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Error::CapabilityMismatch(format!(
+                "no single mode can satisfy {uses:?} for {algorithm:?}: {reasons}"
+            ))
+        }),
     }
 }
 
@@ -2172,8 +2200,7 @@ mod tests {
                         accessible: Some(true),
                     },
                     native: NativeCapabilitySummary {
-                        supported_algorithms: Vec::new(),
-                        supported_uses: Vec::new(),
+                        algorithms: Vec::new(),
                     },
                     prf_available: Some(true),
                     seed_available: Some(true),
@@ -2192,8 +2219,7 @@ mod tests {
                         accessible: Some(true),
                     },
                     native: NativeCapabilitySummary {
-                        supported_algorithms: Vec::new(),
-                        supported_uses: Vec::new(),
+                        algorithms: Vec::new(),
                     },
                     prf_available: Some(false),
                     seed_available: Some(true),

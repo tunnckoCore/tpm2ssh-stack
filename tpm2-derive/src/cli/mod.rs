@@ -67,6 +67,7 @@ impl From<AlgorithmArg> for Algorithm {
 impl From<UseArg> for UseCase {
     fn from(value: UseArg) -> Self {
         match value {
+            UseArg::All => Self::All,
             UseArg::Sign => Self::Sign,
             UseArg::Verify => Self::Verify,
             UseArg::Derive => Self::Derive,
@@ -74,7 +75,6 @@ impl From<UseArg> for UseCase {
             UseArg::Encrypt => Self::Encrypt,
             UseArg::Decrypt => Self::Decrypt,
             UseArg::ExportSecret => Self::ExportSecret,
-            UseArg::All => unreachable!("use=all must be expanded before conversion"),
         }
     }
 }

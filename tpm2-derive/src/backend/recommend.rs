@@ -1,6 +1,6 @@
 use crate::model::{
-    Algorithm, CapabilityReport, Diagnostic, DiagnosticLevel, Mode, NativeCapabilitySummary,
-    TpmStatus, UseCase,
+    Algorithm, CapabilityReport, Mode, NativeAlgorithmCapability, NativeCapabilitySummary,
+    TpmStatus, UseCase, expand_mode_requested_uses,
 };
 
 use super::subprocess::ProbeSnapshot;
@@ -12,43 +12,38 @@ pub fn build_report(
 ) -> CapabilityReport {
     let support = SupportMatrix::from_snapshot(snapshot);
     let mut reasons = Vec::new();
-    let mut warnings = snapshot.diagnostics.clone();
 
     if let Some(summary) = snapshot.manufacturer_summary() {
         reasons.push(summary);
     }
 
-    if support.native_p256_sign || support.native_p256_verify {
+    if support
+        .native
+        .supported_algorithms()
+        .contains(&Algorithm::P256)
+    {
         reasons.push(
-            "detected TPM ECC P-256 support through algorithms/commands/ecc-curves probing"
+            "detected TPM ECC P-256 sign/verify support through algorithms/commands/ecc-curves probing"
+                .to_string(),
+        );
+        reasons.push(
+            "native encrypt/decrypt remains disabled because the current subprocess backend only wires truthful P-256 sign/verify + public-key export flows"
                 .to_string(),
         );
     }
 
     if support.prf {
         reasons.push(
-            "detected HMAC/keyed-hash and supporting commands; PRF mode is feasible on this backend"
+            "detected TPM HMAC/keyed-hash support plus required commands/tools; actual TPM-backed PRF mode is feasible"
                 .to_string(),
         );
     }
 
     if support.seed {
         reasons.push(
-            "detected create/load/unseal support and required subprocess tools; sealed seed fallback is feasible"
+            "detected create/load/unseal support plus required commands/tools; sealed-seed mode is feasible"
                 .to_string(),
         );
-    }
-
-    if uses
-        .iter()
-        .any(|use_case| matches!(use_case, UseCase::Encrypt | UseCase::Decrypt))
-    {
-        warnings.push(Diagnostic {
-            level: DiagnosticLevel::Warning,
-            code: "MVP_NOT_IMPLEMENTED".to_string(),
-            message: "encrypt/decrypt remains out of scope for the current tpm2-derive MVP"
-                .to_string(),
-        });
     }
 
     let recommended_mode = recommend_mode(&support, algorithm, uses, &mut reasons);
@@ -58,15 +53,12 @@ pub fn build_report(
             present: snapshot.tpm_present,
             accessible: snapshot.tpm_accessible,
         },
-        native: NativeCapabilitySummary {
-            supported_algorithms: support.native_supported_algorithms(),
-            supported_uses: support.native_supported_uses(),
-        },
+        native: support.native,
         prf_available: Some(support.prf),
         seed_available: Some(support.seed),
         recommended_mode,
         recommendation_reasons: reasons,
-        diagnostics: warnings,
+        diagnostics: snapshot.diagnostics.clone(),
     }
 }
 
@@ -76,21 +68,30 @@ pub fn report_supports_mode(
     uses: &[UseCase],
     mode: Mode,
 ) -> bool {
-    match mode {
-        Mode::Native => {
-            report.native.supported_algorithms.contains(&algorithm)
-                && uses
-                    .iter()
-                    .all(|use_case| report.native.supported_uses.contains(use_case))
-        }
-        Mode::Seed => report.seed_available == Some(true),
-        Mode::Prf => {
-            report.prf_available == Some(true)
-                || (matches!(algorithm, Algorithm::P256)
-                    && !is_sign_verify_only(uses)
-                    && report.seed_available == Some(true))
-        }
-    }
+    supports_mode(
+        &report.native,
+        report.prf_available == Some(true),
+        report.seed_available == Some(true),
+        Some(algorithm),
+        uses,
+        mode,
+    )
+}
+
+pub fn mode_rejection_reason(
+    report: &CapabilityReport,
+    algorithm: Algorithm,
+    uses: &[UseCase],
+    mode: Mode,
+) -> String {
+    unsupported_mode_reason(
+        &report.native,
+        report.prf_available == Some(true),
+        report.seed_available == Some(true),
+        Some(algorithm),
+        uses,
+        mode,
+    )
 }
 
 pub fn snapshot_supports_mode(
@@ -100,24 +101,19 @@ pub fn snapshot_supports_mode(
     mode: Mode,
 ) -> bool {
     let support = SupportMatrix::from_snapshot(snapshot);
-    match mode {
-        Mode::Native => match algorithm {
-            Algorithm::P256 => uses.iter().all(|use_case| match use_case {
-                UseCase::Sign => support.native_p256_sign,
-                UseCase::Verify => support.native_p256_verify,
-                _ => false,
-            }),
-            Algorithm::Ed25519 | Algorithm::Secp256k1 => false,
-        },
-        Mode::Prf => support.prf,
-        Mode::Seed => support.seed,
-    }
+    supports_mode(
+        &support.native,
+        support.prf,
+        support.seed,
+        Some(algorithm),
+        uses,
+        mode,
+    )
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SupportMatrix {
-    native_p256_sign: bool,
-    native_p256_verify: bool,
+    native: NativeCapabilitySummary,
     prf: bool,
     seed: bool,
 }
@@ -158,30 +154,18 @@ impl SupportMatrix {
             && snapshot.tool_available("tpm2_unseal");
 
         Self {
-            native_p256_sign: native_sign,
-            native_p256_verify: native_verify,
+            native: NativeCapabilitySummary {
+                algorithms: vec![NativeAlgorithmCapability {
+                    algorithm: Algorithm::P256,
+                    sign: native_sign,
+                    verify: native_verify,
+                    encrypt: false,
+                    decrypt: false,
+                }],
+            },
             prf,
             seed,
         }
-    }
-
-    fn native_supported_algorithms(self) -> Vec<Algorithm> {
-        if self.native_p256_sign || self.native_p256_verify {
-            vec![Algorithm::P256]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn native_supported_uses(self) -> Vec<UseCase> {
-        let mut supported = Vec::new();
-        if self.native_p256_sign {
-            supported.push(UseCase::Sign);
-        }
-        if self.native_p256_verify {
-            supported.push(UseCase::Verify);
-        }
-        supported
     }
 }
 
@@ -191,153 +175,327 @@ fn recommend_mode(
     uses: &[UseCase],
     reasons: &mut Vec<String>,
 ) -> Option<Mode> {
-    let sign_verify_only = is_sign_verify_only(uses);
-    let deterministic_workflow = needs_deterministic_output(uses);
+    for mode in [Mode::Native, Mode::Prf, Mode::Seed] {
+        if supports_mode(
+            &support.native,
+            support.prf,
+            support.seed,
+            algorithm,
+            uses,
+            mode,
+        ) {
+            reasons.push(selection_reason(mode, algorithm, uses));
+            return Some(mode);
+        }
 
+        reasons.push(unsupported_mode_reason(
+            &support.native,
+            support.prf,
+            support.seed,
+            algorithm,
+            uses,
+            mode,
+        ));
+    }
+
+    None
+}
+
+fn selection_reason(mode: Mode, algorithm: Option<Algorithm>, uses: &[UseCase]) -> String {
+    let requested = describe_requested_uses(uses);
     match algorithm {
-        Some(Algorithm::P256) if sign_verify_only && support.native_p256_sign => {
-            reasons.push(
-                "p256 sign/verify workloads prefer native mode when the TPM exposes P-256 signing support"
-                    .to_string(),
-            );
-            Some(Mode::Native)
-        }
-        Some(Algorithm::Ed25519) => recommend_prf_then_seed(
-            support,
-            reasons,
-            "ed25519 is not expected to be TPM-native on TPM 2.0; prefer PRF and fall back to sealed-seed derivation",
-        ),
-        Some(Algorithm::Secp256k1) => recommend_prf_then_seed(
-            support,
-            reasons,
-            "secp256k1 is not expected to be TPM-native on TPM 2.0; prefer PRF and fall back to sealed-seed derivation",
-        ),
-        Some(Algorithm::P256) if deterministic_workflow || !sign_verify_only => {
-            reasons.push(
-                "requested workflow benefits from deterministic derived output, so PRF is preferred over native signing"
-                    .to_string(),
-            );
-            recommend_prf_seed_native(support)
-        }
-        Some(Algorithm::P256) => recommend_prf_seed_native(support),
-        None if deterministic_workflow => {
-            reasons.push(
-                "deterministic derivation-oriented uses prefer PRF and fall back to sealed seed when PRF is unavailable"
-                    .to_string(),
-            );
-            recommend_prf_then_seed(
-                support,
-                reasons,
-                "mode chosen from requested uses because no algorithm was supplied",
+        Some(algorithm) => {
+            format!(
+                "{mode:?} mode satisfies the full requested use set {requested} for {algorithm:?}"
             )
         }
-        None if support.prf => Some(Mode::Prf),
-        None if support.seed => Some(Mode::Seed),
-        None if support.native_p256_sign => Some(Mode::Native),
-        None => {
-            reasons.push(
-                "capability probe could not find a supported mode recommendation from the current TPM/tooling surface"
-                    .to_string(),
-            );
-            None
+        None => format!("{mode:?} mode satisfies the requested use set {requested}"),
+    }
+}
+
+fn supports_mode(
+    native: &NativeCapabilitySummary,
+    prf_available: bool,
+    seed_available: bool,
+    algorithm: Option<Algorithm>,
+    uses: &[UseCase],
+    mode: Mode,
+) -> bool {
+    if uses.is_empty() {
+        return match mode {
+            Mode::Native => algorithm.is_some_and(|algorithm| {
+                native
+                    .for_algorithm(algorithm)
+                    .is_some_and(|capability| !capability.supported_uses().is_empty())
+            }),
+            Mode::Prf => prf_available,
+            Mode::Seed => seed_available,
+        };
+    }
+
+    let concrete_uses = expand_mode_requested_uses(mode, algorithm, native, uses);
+    if uses.iter().any(|use_case| use_case.is_all()) && concrete_uses.is_empty() {
+        return false;
+    }
+
+    match mode {
+        Mode::Native => {
+            let Some(algorithm) = algorithm else {
+                return false;
+            };
+            !concrete_uses.is_empty()
+                && concrete_uses
+                    .iter()
+                    .all(|use_case| native.supports_use(algorithm, *use_case))
+        }
+        Mode::Prf => {
+            prf_available
+                && concrete_uses
+                    .iter()
+                    .all(|use_case| UseCase::allowed_for_mode(Mode::Prf).contains(use_case))
+        }
+        Mode::Seed => {
+            seed_available
+                && concrete_uses
+                    .iter()
+                    .all(|use_case| UseCase::allowed_for_mode(Mode::Seed).contains(use_case))
         }
     }
 }
 
-fn recommend_prf_then_seed(
-    support: &SupportMatrix,
-    reasons: &mut Vec<String>,
-    rationale: &str,
-) -> Option<Mode> {
-    reasons.push(rationale.to_string());
-    if support.prf {
-        Some(Mode::Prf)
-    } else if support.seed {
-        Some(Mode::Seed)
-    } else {
-        None
+fn unsupported_mode_reason(
+    native: &NativeCapabilitySummary,
+    prf_available: bool,
+    seed_available: bool,
+    algorithm: Option<Algorithm>,
+    uses: &[UseCase],
+    mode: Mode,
+) -> String {
+    let requested = describe_requested_uses(uses);
+    match mode {
+        Mode::Native => {
+            let Some(algorithm) = algorithm else {
+                return format!(
+                    "Native mode cannot be evaluated for requested uses {requested} without an explicit algorithm"
+                );
+            };
+
+            let Some(capability) = native.for_algorithm(algorithm) else {
+                return format!(
+                    "Native mode does not expose truthful support for {algorithm:?} on this TPM/backend"
+                );
+            };
+
+            let concrete_uses = expand_mode_requested_uses(mode, Some(algorithm), native, uses);
+            if uses.iter().any(|use_case| use_case.is_all()) && concrete_uses.is_empty() {
+                return format!(
+                    "Native mode has no supported actions to expand --use all for {algorithm:?} on this TPM/backend"
+                );
+            }
+
+            let missing = concrete_uses
+                .iter()
+                .copied()
+                .filter(|use_case| !capability.supports_use(*use_case))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                format!("Native mode cannot satisfy requested uses {requested} for {algorithm:?}")
+            } else {
+                format!(
+                    "Native mode cannot satisfy requested uses {requested} for {algorithm:?}; missing native actions: {}",
+                    describe_use_list(&missing)
+                )
+            }
+        }
+        Mode::Prf => {
+            if !prf_available {
+                return "PRF mode is unavailable because the TPM/backend does not expose actual PRF support"
+                    .to_string();
+            }
+
+            let concrete_uses = expand_mode_requested_uses(mode, algorithm, native, uses);
+            let missing = concrete_uses
+                .iter()
+                .copied()
+                .filter(|use_case| !UseCase::allowed_for_mode(Mode::Prf).contains(use_case))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                "PRF mode could not satisfy the request for an unspecified reason".to_string()
+            } else {
+                format!(
+                    "PRF mode does not currently support requested uses {}",
+                    describe_use_list(&missing)
+                )
+            }
+        }
+        Mode::Seed => {
+            if !seed_available {
+                return "Seed mode is unavailable because the TPM/backend cannot create/load/unseal sealed seed material"
+                    .to_string();
+            }
+
+            let concrete_uses = expand_mode_requested_uses(mode, algorithm, native, uses);
+            let missing = concrete_uses
+                .iter()
+                .copied()
+                .filter(|use_case| !UseCase::allowed_for_mode(Mode::Seed).contains(use_case))
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                "Seed mode could not satisfy the request for an unspecified reason".to_string()
+            } else {
+                format!(
+                    "Seed mode does not currently support requested uses {}",
+                    describe_use_list(&missing)
+                )
+            }
+        }
     }
 }
 
-fn recommend_prf_seed_native(support: &SupportMatrix) -> Option<Mode> {
-    if support.prf {
-        Some(Mode::Prf)
-    } else if support.seed {
-        Some(Mode::Seed)
-    } else if support.native_p256_sign {
-        Some(Mode::Native)
-    } else {
-        None
+fn describe_requested_uses(uses: &[UseCase]) -> String {
+    if uses.is_empty() {
+        return "[]".to_string();
     }
+
+    describe_use_list(uses)
 }
 
-fn is_sign_verify_only(uses: &[UseCase]) -> bool {
-    !uses.is_empty()
-        && uses
-            .iter()
-            .all(|use_case| matches!(use_case, UseCase::Sign | UseCase::Verify))
-}
-
-fn needs_deterministic_output(uses: &[UseCase]) -> bool {
-    uses.iter()
-        .any(|use_case| matches!(use_case, UseCase::Derive | UseCase::Ssh))
+fn describe_use_list(uses: &[UseCase]) -> String {
+    format!(
+        "[{}]",
+        uses.iter()
+            .map(|use_case| format!("{use_case:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{Algorithm, Mode, UseCase};
+    use crate::model::{
+        Algorithm, Mode, NativeAlgorithmCapability, NativeCapabilitySummary, UseCase,
+    };
 
-    use super::{SupportMatrix, is_sign_verify_only, needs_deterministic_output, recommend_mode};
+    use super::{mode_rejection_reason, report_supports_mode, supports_mode};
+    use crate::model::{CapabilityReport, TpmStatus};
 
-    #[test]
-    fn detects_sign_verify_only() {
-        assert!(is_sign_verify_only(&[UseCase::Sign, UseCase::Verify]));
-        assert!(!is_sign_verify_only(&[]));
-        assert!(!is_sign_verify_only(&[UseCase::Sign, UseCase::Ssh]));
+    fn native_summary(sign: bool, verify: bool) -> NativeCapabilitySummary {
+        NativeCapabilitySummary {
+            algorithms: vec![NativeAlgorithmCapability {
+                algorithm: Algorithm::P256,
+                sign,
+                verify,
+                encrypt: false,
+                decrypt: false,
+            }],
+        }
     }
 
-    #[test]
-    fn detects_deterministic_workflows() {
-        assert!(needs_deterministic_output(&[UseCase::Derive]));
-        assert!(needs_deterministic_output(&[UseCase::Ssh]));
-        assert!(!needs_deterministic_output(&[UseCase::Sign]));
-    }
-
-    #[test]
-    fn prefers_native_for_p256_signing() {
-        let mut reasons = Vec::new();
-        let mode = recommend_mode(
-            &SupportMatrix {
-                native_p256_sign: true,
-                native_p256_verify: true,
-                prf: true,
-                seed: true,
+    fn report(
+        native: NativeCapabilitySummary,
+        prf_available: bool,
+        seed_available: bool,
+    ) -> CapabilityReport {
+        CapabilityReport {
+            tpm: TpmStatus {
+                present: Some(true),
+                accessible: Some(true),
             },
+            native,
+            prf_available: Some(prf_available),
+            seed_available: Some(seed_available),
+            recommended_mode: None,
+            recommendation_reasons: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn native_requires_every_requested_action() {
+        let native = native_summary(true, true);
+        assert!(supports_mode(
+            &native,
+            true,
+            true,
             Some(Algorithm::P256),
-            &[UseCase::Sign],
-            &mut reasons,
-        );
-
-        assert_eq!(mode, Some(Mode::Native));
-        assert!(reasons.iter().any(|reason| reason.contains("native mode")));
+            &[UseCase::Sign, UseCase::Verify],
+            Mode::Native,
+        ));
+        assert!(!supports_mode(
+            &native,
+            true,
+            true,
+            Some(Algorithm::P256),
+            &[UseCase::Sign, UseCase::Encrypt],
+            Mode::Native,
+        ));
     }
 
     #[test]
-    fn prefers_prf_then_seed_for_ed25519() {
-        let mut reasons = Vec::new();
-        let mode = recommend_mode(
-            &SupportMatrix {
-                native_p256_sign: false,
-                native_p256_verify: false,
-                prf: false,
-                seed: true,
-            },
-            Some(Algorithm::Ed25519),
-            &[UseCase::Ssh],
-            &mut reasons,
+    fn prf_support_matches_the_current_identity_surface() {
+        let report = report(native_summary(true, true), true, true);
+
+        for uses in [
+            vec![UseCase::Sign],
+            vec![UseCase::Verify],
+            vec![UseCase::Derive],
+            vec![UseCase::Encrypt, UseCase::Decrypt],
+            vec![UseCase::Ssh],
+            vec![UseCase::ExportSecret],
+        ] {
+            assert!(report_supports_mode(&report, Algorithm::P256, &uses, Mode::Prf));
+        }
+    }
+
+    #[test]
+    fn use_all_expands_against_candidate_mode() {
+        let report = report(native_summary(true, true), true, true);
+
+        assert!(report_supports_mode(
+            &report,
+            Algorithm::P256,
+            &[UseCase::All],
+            Mode::Native,
+        ));
+        assert!(report_supports_mode(
+            &report,
+            Algorithm::P256,
+            &[UseCase::All],
+            Mode::Prf,
+        ));
+        assert!(report_supports_mode(
+            &report,
+            Algorithm::P256,
+            &[UseCase::All],
+            Mode::Seed,
+        ));
+    }
+
+    #[test]
+    fn explicit_prf_request_does_not_fall_back_to_seed() {
+        let report = report(native_summary(true, true), false, true);
+        assert!(!report_supports_mode(
+            &report,
+            Algorithm::Ed25519,
+            &[UseCase::Derive],
+            Mode::Prf,
+        ));
+
+        let reason =
+            mode_rejection_reason(&report, Algorithm::Ed25519, &[UseCase::Derive], Mode::Prf);
+        assert!(reason.contains("actual PRF support"));
+    }
+
+    #[test]
+    fn rejection_reason_lists_missing_native_actions() {
+        let report = report(native_summary(true, false), true, true);
+        let reason = mode_rejection_reason(
+            &report,
+            Algorithm::P256,
+            &[UseCase::Sign, UseCase::Verify],
+            Mode::Native,
         );
 
-        assert_eq!(mode, Some(Mode::Seed));
-        assert!(reasons.iter().any(|reason| reason.contains("ed25519")));
+        assert!(reason.contains("Verify"));
     }
 }

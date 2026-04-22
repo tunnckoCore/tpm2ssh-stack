@@ -519,8 +519,16 @@ mod tests {
         assert!(
             report
                 .native
-                .supported_algorithms
+                .supported_algorithms()
                 .contains(&Algorithm::P256)
         );
+        let native = report
+            .native
+            .for_algorithm(Algorithm::P256)
+            .expect("p256 native capability should exist");
+        assert!(native.sign);
+        assert!(native.verify);
+        assert!(!native.encrypt);
+        assert!(!native.decrypt);
     }
 }
