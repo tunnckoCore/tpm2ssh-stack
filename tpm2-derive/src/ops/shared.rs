@@ -1,17 +1,16 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secrecy::ExposeSecret;
-
-use crate::backend::CommandRunner;
+use crate::backend::{CommandOutput, CommandRunner};
 use crate::crypto::{
     DerivationContext as CryptoDerivationContext, DerivationDomain, DerivationSpec,
     DerivationSpecV1, OutputKind, OutputSpec,
 };
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, DerivationOverrides, Identity, Mode};
+use crate::model::{Algorithm, DerivationOverrides, Identity, InputSource, Mode};
 
 use super::prf::{
     PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
@@ -253,6 +252,96 @@ fn temporary_workspace_root(kind: &str, identity: &str) -> Result<PathBuf> {
         std::process::id(),
         now.as_nanos()
     )))
+}
+
+pub(crate) fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
+    match input {
+        InputSource::Stdin => {
+            let mut buffer = Vec::new();
+            std::io::stdin().read_to_end(&mut buffer).map_err(|error| {
+                Error::State(format!("failed to read {label} from stdin: {error}"))
+            })?;
+            Ok(buffer)
+        }
+        InputSource::Path { path } => fs::read(path).map_err(|error| {
+            Error::State(format!(
+                "failed to read {label} '{}': {error}",
+                path.display()
+            ))
+        }),
+    }
+}
+
+pub(crate) fn ensure_dir(path: &Path, label: &str) -> Result<()> {
+    fs::create_dir_all(path).map_err(|error| {
+        Error::State(format!(
+            "failed to create {label} directory '{}': {error}",
+            path.display()
+        ))
+    })
+}
+
+pub(crate) fn classify_native_command_failure(program: &str, output: &CommandOutput) -> Error {
+    let detail = render_command_failure_detail(output);
+    let lower = detail.to_ascii_lowercase();
+    let message = format!(
+        "native TPM command '{}' failed{}{}",
+        program,
+        output
+            .exit_code
+            .map(|code| format!(" with exit status {code}"))
+            .unwrap_or_default(),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    );
+
+    if lower.contains("auth") || lower.contains("authorization") {
+        Error::AuthFailure(message)
+    } else if output.error.is_some()
+        || lower.contains("tcti")
+        || lower.contains("/dev/tpm")
+        || lower.contains("no standard tcti")
+        || lower.contains("connection refused")
+    {
+        Error::TpmUnavailable(message)
+    } else if lower.contains("no such file")
+        || lower.contains("could not open")
+        || lower.contains("cannot open")
+        || lower.contains("context")
+        || lower.contains("handle")
+    {
+        Error::State(message)
+    } else {
+        Error::CapabilityMismatch(message)
+    }
+}
+
+fn render_command_failure_detail(output: &CommandOutput) -> String {
+    if let Some(error) = output.error.as_deref() {
+        return error.to_string();
+    }
+
+    let detail = if !output.stderr.trim().is_empty() {
+        output.stderr.trim()
+    } else {
+        output.stdout.trim()
+    };
+
+    preview(detail)
+}
+
+fn preview(value: &str) -> String {
+    let single_line = value.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+    let trimmed = single_line.trim();
+    const LIMIT: usize = 180;
+    if trimmed.len() > LIMIT {
+        format!("{}…", &trimmed[..LIMIT])
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn validate_non_empty(field: &str, value: &str) -> Result<()> {

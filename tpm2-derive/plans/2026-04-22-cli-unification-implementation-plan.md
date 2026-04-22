@@ -307,8 +307,8 @@ Some workstreams can run in parallel. Some have hard dependencies.
 ### Checklist
 
 #### Sign/verify
-- [ ] Extract sign logic out of `src/cli/mod.rs`
-- [ ] Extract verify logic out of `src/cli/mod.rs`
+- [x] Extract sign logic out of `src/cli/mod.rs`
+- [x] Extract verify logic out of `src/cli/mod.rs`
 - [x] Implement PRF sign
 - [x] Implement PRF verify
 - [x] Keep seed sign/verify working through the shared derivation helper
@@ -333,7 +333,8 @@ Some workstreams can run in parallel. Some have hard dependencies.
 - [x] Enforce `--confirm`
 - [x] Enforce `--reason`
 - [x] Ensure `keygen` cannot bypass this policy
-- [ ] Decide whether to remove `keygen`, hide it, or make it a thin alias over export logic
+- [x] Decide whether to remove `keygen`, hide it, or make it a thin alias over export logic
+  - Decision: remove the public `keygen` CLI command entirely; keep `src/ops/keygen.rs` only as an internal shared key-material helper behind `export`, `sign`, `verify`, and `ssh-add`
 
 #### SSH
 - [x] Rename command flow to `ssh-add`

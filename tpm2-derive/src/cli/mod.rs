@@ -4,56 +4,40 @@ mod render;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
-
-use tempfile::Builder as TempfileBuilder;
+use std::path::PathBuf;
 
 use args::{
     AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, IdentityArgs,
-    ImportArgs, InspectArgs, KeygenArgs, KeygenFormatArg, KeygenKindArg, ModeArg,
-    PublicKeyExportFormatArg, SignArgs, SshAddArgs, UseArg, VerifyArgs,
+    ImportArgs, InspectArgs, ModeArg, PublicKeyExportFormatArg, SignArgs, SshAddArgs, UseArg,
+    VerifyArgs,
 };
 pub use args::{Cli, Command};
-use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey};
-use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
-use p256::ecdsa::signature::Verifier as _;
-use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey};
-use p256::pkcs8::DecodePublicKey as _;
 use render::{failure, success, success_with_diagnostics};
-use secrecy::ExposeSecret;
-use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
-use crate::backend::{
-    CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner,
-    default_probe,
-};
-use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
+use crate::backend::{CapabilityProbe, CommandRunner, ProcessCommandRunner, default_probe};
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CommandPath, DecryptRequest, DerivationOverrides, DeriveRequest, EncryptRequest,
-    ErrorEnvelope, ExportKind, ExportRequest, Identity, IdentityCreateRequest, InputSource,
-    InspectRequest, KeygenFormat, KeygenKind, Mode, ModePreference, PendingOperation,
-    PublicKeyExportFormat, RecoveryImportRequest, SignRequest, SshAddRequest, UseCase,
-    VerifyRequest,
+    ErrorEnvelope, ExportKind, ExportRequest, IdentityCreateRequest, InputSource, InspectRequest,
+    ModePreference, PendingOperation, PublicKeyExportFormat, RecoveryImportRequest, SignRequest,
+    SshAddRequest, UseCase, VerifyRequest,
 };
 use crate::ops;
-use crate::ops::keygen::derive_identity_key_material_with_defaults;
-use crate::ops::native::subprocess::{
-    NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
-    NativeSignOptions, NativeSignPlan, plan_sign,
-};
-use crate::ops::native::{
-    DigestAlgorithm, NativeKeyRef, NativeSignRequest, NativeSignatureFormat, NativeSignatureScheme,
-};
-use crate::ops::seed::{
-    HkdfSha256SeedDeriver, SeedBackend, SeedIdentity, SeedOpenAuthSource, SeedOpenOutput,
-    SeedOpenRequest, SoftwareSeedDerivationRequest, SubprocessSeedBackend, open_and_derive,
-    plan_open, seed_profile_from_profile,
-};
+use crate::ops::sign::SignOperationResult;
 
-const SEED_SIGNING_KEY_NAMESPACE: &str = "tpm2-derive.sign";
-const SEED_SIGNING_KEY_PATH: &str = "m/signature/default";
+#[cfg(test)]
+use crate::model::{Identity, Mode};
+#[cfg(test)]
+use crate::ops::sign::{
+    SEED_SIGNING_KEY_NAMESPACE, SeedSignatureFormat, execute_native_sign_plan_with_runner,
+    seed_sign_open_request, sign_seed_p256, sign_seed_secp256k1, sign_seed_with_backend,
+    stage_native_sign,
+};
+#[cfg(test)]
+use crate::ops::verify::{
+    VerifySignatureFormat, seed_verify_open_request, verify_native_with_runner,
+    verify_seed_with_backend,
+};
 
 impl From<AlgorithmArg> for Algorithm {
     fn from(value: AlgorithmArg) -> Self {
@@ -113,25 +97,6 @@ impl From<PublicKeyExportFormatArg> for PublicKeyExportFormat {
     }
 }
 
-impl From<KeygenKindArg> for KeygenKind {
-    fn from(value: KeygenKindArg) -> Self {
-        match value {
-            KeygenKindArg::Auto => Self::Auto,
-            KeygenKindArg::Prf => Self::Prf,
-            KeygenKindArg::Seed => Self::Seed,
-        }
-    }
-}
-
-impl From<KeygenFormatArg> for KeygenFormat {
-    fn from(value: KeygenFormatArg) -> Self {
-        match value {
-            KeygenFormatArg::Hex => Self::Hex,
-            KeygenFormatArg::Json => Self::Json,
-        }
-    }
-}
-
 fn derivation_overrides(args: args::DerivationInputArgs) -> DerivationOverrides {
     DerivationOverrides {
         org: args.org,
@@ -175,7 +140,6 @@ pub fn run(cli: Cli) -> Result<String> {
         Command::Verify(args) => run_verify(cli.json, args),
         Command::Encrypt(args) => run_encrypt(cli.json, args),
         Command::Decrypt(args) => run_decrypt(cli.json, args),
-        Command::Keygen(args) => run_keygen(cli.json, args),
         Command::Export(args) => run_export(cli.json, args),
         Command::Import(args) => run_import(cli.json, args),
         Command::SshAdd(args) => run_ssh_add(cli.json, args),
@@ -454,93 +418,6 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
     }
 }
 
-fn run_keygen(json: bool, args: KeygenArgs) -> Result<String> {
-    let command = CommandPath::from_segments(["keygen"]);
-    let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
-        Ok(identity) => identity,
-        Err(error) => {
-            return failure(
-                json,
-                command,
-                ErrorEnvelope {
-                    code: error.code().as_str().to_string(),
-                    message: error.to_string(),
-                },
-                Vec::new(),
-            );
-        }
-    };
-
-    // Validate kind constraint against resolved mode
-    let kind: KeygenKind = args.kind.into();
-    match kind {
-        KeygenKind::Auto => {} // accept whatever mode the identity resolved to
-        KeygenKind::Prf if identity.mode.resolved != Mode::Prf => {
-            return failure(
-                json,
-                command,
-                ErrorEnvelope {
-                    code: "validation".to_string(),
-                    message: format!(
-                        "--kind prf requested but identity '{}' resolved to {:?}",
-                        identity.name, identity.mode.resolved
-                    ),
-                },
-                Vec::new(),
-            );
-        }
-        KeygenKind::Seed if identity.mode.resolved != Mode::Seed => {
-            return failure(
-                json,
-                command,
-                ErrorEnvelope {
-                    code: "validation".to_string(),
-                    message: format!(
-                        "--kind seed requested but identity '{}' resolved to {:?}",
-                        identity.name, identity.mode.resolved
-                    ),
-                },
-                Vec::new(),
-            );
-        }
-        _ => {}
-    }
-
-    let runner = ProcessCommandRunner;
-    match ops::keygen::execute_with_defaults(&identity, &runner) {
-        Ok(mut result) => {
-            let format: KeygenFormat = args.format.into();
-            if let Some(ref output) = args.output {
-                let rendered = render_keygen_output(format, &result);
-                write_output_file(output, rendered.as_bytes())?;
-                result.output_path = Some(output.clone());
-            }
-            success(json, command, result)
-        }
-        Err(error) => failure(
-            json,
-            command,
-            ErrorEnvelope {
-                code: error.code().as_str().to_string(),
-                message: error.to_string(),
-            },
-            Vec::new(),
-        ),
-    }
-}
-
-fn render_keygen_output(format: KeygenFormat, result: &crate::model::KeygenResult) -> String {
-    match format {
-        KeygenFormat::Hex => {
-            format!(
-                "secret_key: {}\npublic_key: {}\n",
-                result.secret_key_hex, result.public_key_hex
-            )
-        }
-        KeygenFormat::Json => serde_json::to_string_pretty(result).unwrap_or_default(),
-    }
-}
-
 fn run_sign(json: bool, args: SignArgs) -> Result<String> {
     let request = SignRequest {
         identity: args.identity.clone(),
@@ -582,88 +459,27 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
         ),
     ];
 
-    match identity.mode.resolved {
-        Mode::Native => match stage_native_sign(&request, &identity) {
-            Ok(staged) => {
-                diagnostics.extend(staged.diagnostics.clone());
-
-                let signature_bytes_written = if staged.ready_for_execution {
-                    match execute_native_sign_plan_with_runner(&staged.plan, &ProcessCommandRunner)
-                    {
-                        Ok(bytes_written) => {
-                            diagnostics.push(crate::model::Diagnostic::info(
-                                "native-sign-executed",
-                                format!(
-                                    "executed native sign and wrote {} bytes to '{}'",
-                                    bytes_written,
-                                    staged.output_path.display()
-                                ),
-                            ));
-                            Some(bytes_written)
-                        }
-                        Err(error) => {
-                            return failure(
-                                json,
-                                command,
-                                ErrorEnvelope {
-                                    code: error.code().as_str().to_string(),
-                                    message: error.to_string(),
-                                },
-                                diagnostics,
-                            );
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                success_with_diagnostics(
-                    json,
-                    command,
-                    SignOperationResult {
-                        identity,
-                        request,
-                        mode: Mode::Native,
-                        state: if signature_bytes_written.is_some() {
-                            "executed".to_string()
-                        } else {
-                            "planned".to_string()
-                        },
-                        digest_algorithm: staged.digest_algorithm,
-                        input_bytes: staged.input_bytes,
-                        digest_path: staged.digest_path,
-                        output_path: staged.output_path,
-                        signature_bytes_written,
-                        plan: staged.plan,
-                    },
-                    diagnostics,
-                )
+    match ops::sign::execute_with_defaults(&identity, &request, &derivation) {
+        Ok((result, sign_diagnostics)) => {
+            diagnostics.extend(sign_diagnostics);
+            match result {
+                SignOperationResult::Native(result) => {
+                    success_with_diagnostics(json, command, result, diagnostics)
+                }
+                SignOperationResult::Derived(result) => {
+                    success_with_diagnostics(json, command, result, diagnostics)
+                }
             }
-            Err(error) => failure(
-                json,
-                command,
-                ErrorEnvelope {
-                    code: error.code().as_str().to_string(),
-                    message: error.to_string(),
-                },
-                diagnostics,
-            ),
-        },
-        Mode::Seed | Mode::Prf => match sign_derived_identity(&request, &identity, &derivation) {
-            Ok((result, sign_diagnostics)) => {
-                diagnostics.extend(sign_diagnostics);
-                success_with_diagnostics(json, command, result, diagnostics)
-            }
-            Err(error) => failure(
-                json,
-                command,
-                ErrorEnvelope {
-                    code: error.code().as_str().to_string(),
-                    message: error.to_string(),
-                },
-                diagnostics,
-            ),
-        },
+        }
+        Err(error) => failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            diagnostics,
+        ),
     }
 }
 
@@ -716,12 +532,7 @@ where
         ),
     ];
 
-    let verification = match identity.mode.resolved {
-        Mode::Native => verify_native_with_runner(&request, &identity, runner),
-        Mode::Seed | Mode::Prf => verify_derived_identity(&request, &identity, &derivation),
-    };
-
-    match verification {
+    match ops::verify::execute_with_runner(&identity, &request, &derivation, runner) {
         Ok((result, verify_diagnostics)) => {
             diagnostics.extend(verify_diagnostics);
             success_with_diagnostics(json, command, result, diagnostics)
@@ -736,602 +547,6 @@ where
             diagnostics,
         ),
     }
-}
-
-fn sign_derived_identity(
-    request: &SignRequest,
-    identity: &Identity,
-    derivation: &DerivationOverrides,
-) -> Result<(SeedSignOperationResult, Vec<crate::model::Diagnostic>)> {
-    if !identity.uses.contains(&UseCase::Sign) {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' is not configured with sign use",
-            identity.name
-        )));
-    }
-
-    let input_bytes = load_sign_input(&request.input)?;
-    if input_bytes.is_empty() {
-        return Err(Error::Validation(
-            "sign input must not be empty".to_string(),
-        ));
-    }
-
-    let runner = ProcessCommandRunner;
-    let derived = derive_identity_key_material_with_defaults(identity, derivation, &runner)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
-    let diagnostics = vec![crate::model::Diagnostic::info(
-        "derived-signer-material",
-        format!(
-            "derived {} bytes of {:?} signing key material from {:?} backing using the effective derivation inputs",
-            derived.len(),
-            identity.algorithm,
-            identity.mode.resolved,
-        ),
-    )];
-
-    let (signature_bytes, signature_format) = match identity.algorithm {
-        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, &derived)?,
-        Algorithm::P256 => sign_seed_p256(&input_bytes, &derived, identity)?,
-        Algorithm::Secp256k1 => sign_seed_secp256k1(&input_bytes, &derived, identity)?,
-    };
-
-    Ok((
-        SeedSignOperationResult {
-            identity: identity.clone(),
-            request: request.clone(),
-            mode: identity.mode.resolved,
-            digest_algorithm: DigestAlgorithm::Sha256,
-            digest_hex: hex_encode(&digest),
-            input_bytes: input_bytes.len(),
-            signature_bytes: signature_bytes.len(),
-            signature_hex: hex_encode(&signature_bytes),
-            signature_format,
-        },
-        diagnostics,
-    ))
-}
-
-fn verify_derived_identity(
-    request: &VerifyRequest,
-    identity: &Identity,
-    derivation: &DerivationOverrides,
-) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
-    if !identity.uses.contains(&UseCase::Verify) {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' is not configured with verify use",
-            identity.name
-        )));
-    }
-
-    if matches!(request.input, InputSource::Stdin)
-        && matches!(request.signature, InputSource::Stdin)
-    {
-        return Err(Error::Validation(
-            "verify cannot read both --input and --signature from stdin at the same time"
-                .to_string(),
-        ));
-    }
-
-    let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
-    if signature_bytes.is_empty() {
-        return Err(Error::Validation(
-            "verify signature must not be empty".to_string(),
-        ));
-    }
-
-    let runner = ProcessCommandRunner;
-    let derived = derive_identity_key_material_with_defaults(identity, derivation, &runner)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
-    let diagnostics = vec![crate::model::Diagnostic::info(
-        "derived-verifier-material",
-        format!(
-            "derived {} bytes of {:?} verifier material from {:?} backing using the effective derivation inputs",
-            derived.len(),
-            identity.algorithm,
-            identity.mode.resolved,
-        ),
-    )];
-
-    match identity.algorithm {
-        Algorithm::Ed25519 => verify_seed_ed25519(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            &derived,
-            diagnostics,
-        ),
-        Algorithm::P256 => verify_seed_p256(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            &derived,
-            diagnostics,
-        ),
-        Algorithm::Secp256k1 => verify_seed_secp256k1(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            &derived,
-            diagnostics,
-        ),
-    }
-}
-
-fn verify_native_with_runner<R>(
-    request: &VerifyRequest,
-    identity: &Identity,
-    runner: &R,
-) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)>
-where
-    R: CommandRunner,
-{
-    if identity.algorithm != Algorithm::P256 {
-        return Err(Error::Unsupported(format!(
-            "native verify is currently wired only for p256 identities, found {:?}",
-            identity.algorithm
-        )));
-    }
-
-    if !identity.uses.contains(&UseCase::Verify) {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' is not configured with verify use",
-            identity.name
-        )));
-    }
-
-    if matches!(request.input, InputSource::Stdin)
-        && matches!(request.signature, InputSource::Stdin)
-    {
-        return Err(Error::Validation(
-            "verify cannot read both --input and --signature from stdin at the same time"
-                .to_string(),
-        ));
-    }
-
-    let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
-    if signature_bytes.is_empty() {
-        return Err(Error::Validation(
-            "verify signature must not be empty".to_string(),
-        ));
-    }
-
-    let digest = Sha256::digest(&input_bytes).to_vec();
-    let public_key_der = export_native_public_key_der_with_runner(identity, runner)?;
-    let verifying_key = load_p256_verifying_key(&public_key_der)?;
-    let (signature, signature_format) = parse_p256_verify_signature(&signature_bytes)?;
-    let verified = verifying_key.verify(&input_bytes, &signature).is_ok();
-
-    Ok((
-        VerifyOperationResult {
-            identity: identity.clone(),
-            request: request.clone(),
-            mode: Mode::Native,
-            verified,
-            digest_algorithm: DigestAlgorithm::Sha256,
-            digest_hex: hex_encode(&digest),
-            input_bytes: input_bytes.len(),
-            signature_bytes: signature_bytes.len(),
-            signature_format,
-        },
-        vec![crate::model::Diagnostic::info(
-            "native-public-key-exported",
-            format!(
-                "exported {} bytes of SPKI DER public key material from native TPM state for verify",
-                public_key_der.len()
-            ),
-        )],
-    ))
-}
-
-fn sign_seed_with_backend<B, D>(
-    request: &SignRequest,
-    identity: &Identity,
-    backend: &B,
-    deriver: &D,
-) -> Result<(SeedSignOperationResult, Vec<crate::model::Diagnostic>)>
-where
-    B: SeedBackend,
-    D: crate::ops::seed::SeedSoftwareDeriver,
-{
-    if !identity.uses.contains(&UseCase::Sign) {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' is not configured with sign use",
-            identity.name
-        )));
-    }
-
-    let input_bytes = load_sign_input(&request.input)?;
-    if input_bytes.is_empty() {
-        return Err(Error::Validation(
-            "sign input must not be empty".to_string(),
-        ));
-    }
-
-    let seed_request = seed_sign_open_request(identity)?;
-    let seed_plan = plan_open(&seed_request)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
-    let derived = open_and_derive(backend, deriver, &seed_request)?;
-    let diagnostics =
-        seed_sign_diagnostics(identity, &seed_plan.warnings, derived.expose_secret().len());
-
-    let (signature_bytes, signature_format) = match identity.algorithm {
-        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, derived.expose_secret())?,
-        Algorithm::P256 => sign_seed_p256(&input_bytes, derived.expose_secret(), identity)?,
-        Algorithm::Secp256k1 => {
-            sign_seed_secp256k1(&input_bytes, derived.expose_secret(), identity)?
-        }
-    };
-
-    Ok((
-        SeedSignOperationResult {
-            identity: identity.clone(),
-            request: request.clone(),
-            mode: Mode::Seed,
-            digest_algorithm: DigestAlgorithm::Sha256,
-            digest_hex: hex_encode(&digest),
-            input_bytes: input_bytes.len(),
-            signature_bytes: signature_bytes.len(),
-            signature_hex: hex_encode(&signature_bytes),
-            signature_format,
-        },
-        diagnostics,
-    ))
-}
-
-fn sign_seed_ed25519(
-    input_bytes: &[u8],
-    derived_seed: &[u8],
-) -> Result<(Vec<u8>, SeedSignatureFormat)> {
-    let seed_bytes: [u8; 32] = derived_seed.try_into().map_err(|_| {
-        Error::Internal(
-            "seed sign ed25519 derivation produced a non-32-byte seed unexpectedly".to_string(),
-        )
-    })?;
-    let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
-    let signature = signing_key.sign(input_bytes);
-    Ok((signature.to_bytes().to_vec(), SeedSignatureFormat::Raw))
-}
-
-fn sign_seed_p256(
-    input_bytes: &[u8],
-    derived_seed: &[u8],
-    identity: &Identity,
-) -> Result<(Vec<u8>, SeedSignatureFormat)> {
-    let scalar_bytes =
-        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
-        Error::Internal(format!(
-            "failed to materialize p256 seed signing key for identity '{}': {error}",
-            identity.name
-        ))
-    })?;
-    let signature: P256Signature = <P256SigningKey as p256::ecdsa::signature::Signer<
-        P256Signature,
-    >>::sign(&signing_key, input_bytes);
-    Ok((
-        signature.to_der().as_bytes().to_vec(),
-        SeedSignatureFormat::Der,
-    ))
-}
-
-fn sign_seed_secp256k1(
-    input_bytes: &[u8],
-    derived_seed: &[u8],
-    identity: &Identity,
-) -> Result<(Vec<u8>, SeedSignatureFormat)> {
-    let scalar_bytes =
-        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
-        Error::Internal(format!(
-            "failed to materialize secp256k1 seed signing key for identity '{}': {error}",
-            identity.name
-        ))
-    })?;
-    let signature: K256Signature = <K256SigningKey as k256::ecdsa::signature::Signer<
-        K256Signature,
-    >>::sign(&signing_key, input_bytes);
-    Ok((
-        signature.to_der().as_bytes().to_vec(),
-        SeedSignatureFormat::Der,
-    ))
-}
-
-fn seed_sign_open_request(identity: &Identity) -> Result<SeedOpenRequest> {
-    Ok(SeedOpenRequest {
-        identity: seed_sign_profile(identity)?,
-        auth_source: SeedOpenAuthSource::None,
-        output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
-            spec: seed_sign_derivation_spec(identity.algorithm)?,
-            output_bytes: 32,
-        }),
-        require_fresh_unseal: true,
-        confirm_software_derivation: true,
-    })
-}
-
-fn seed_sign_profile(identity: &Identity) -> Result<SeedIdentity> {
-    if identity.mode.resolved != Mode::Seed {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' did not resolve to seed mode",
-            identity.name
-        )));
-    }
-
-    seed_profile_from_profile(identity)
-}
-
-fn seed_sign_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
-    seed_signing_key_derivation_spec(algorithm)
-}
-
-fn seed_sign_diagnostics(
-    identity: &Identity,
-    warnings: &[crate::model::Diagnostic],
-    derived_bytes: usize,
-) -> Vec<crate::model::Diagnostic> {
-    let mut diagnostics = warnings.to_vec();
-    diagnostics.push(crate::model::Diagnostic::info(
-        "seed-signer-derived",
-        format!(
-            "derived {} bytes of {:?} signer material from sealed seed using {} {}",
-            derived_bytes, identity.algorithm, SEED_SIGNING_KEY_NAMESPACE, SEED_SIGNING_KEY_PATH,
-        ),
-    ));
-    diagnostics
-}
-
-fn verify_seed_with_backend<B, D>(
-    request: &VerifyRequest,
-    identity: &Identity,
-    backend: &B,
-    deriver: &D,
-) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)>
-where
-    B: SeedBackend,
-    D: crate::ops::seed::SeedSoftwareDeriver,
-{
-    if !identity.uses.contains(&UseCase::Verify) {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' is not configured with verify use",
-            identity.name
-        )));
-    }
-
-    if matches!(request.input, InputSource::Stdin)
-        && matches!(request.signature, InputSource::Stdin)
-    {
-        return Err(Error::Validation(
-            "verify cannot read both --input and --signature from stdin at the same time"
-                .to_string(),
-        ));
-    }
-
-    let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let signature_bytes = load_input_bytes(&request.signature, "verify signature")?;
-    if signature_bytes.is_empty() {
-        return Err(Error::Validation(
-            "verify signature must not be empty".to_string(),
-        ));
-    }
-
-    let seed_request = seed_verify_open_request(identity)?;
-    let seed_plan = plan_open(&seed_request)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
-    let derived = open_and_derive(backend, deriver, &seed_request)?;
-    let diagnostics =
-        seed_verify_diagnostics(identity, &seed_plan.warnings, derived.expose_secret().len());
-
-    match identity.algorithm {
-        Algorithm::Ed25519 => verify_seed_ed25519(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            derived.expose_secret(),
-            diagnostics,
-        ),
-        Algorithm::P256 => verify_seed_p256(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            derived.expose_secret(),
-            diagnostics,
-        ),
-        Algorithm::Secp256k1 => verify_seed_secp256k1(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            derived.expose_secret(),
-            diagnostics,
-        ),
-    }
-}
-
-fn verify_seed_ed25519(
-    request: &VerifyRequest,
-    identity: &Identity,
-    input_bytes: &[u8],
-    signature_bytes: &[u8],
-    digest: &[u8],
-    derived_seed: &[u8],
-    diagnostics: Vec<crate::model::Diagnostic>,
-) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
-    let seed_bytes: [u8; 32] = derived_seed.try_into().map_err(|_| {
-        Error::Internal(
-            "seed verify ed25519 derivation produced a non-32-byte seed unexpectedly".to_string(),
-        )
-    })?;
-    let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
-    let (signature, signature_format) = parse_ed25519_verify_signature(signature_bytes)?;
-    let verified = signing_key
-        .verifying_key()
-        .verify_strict(input_bytes, &signature)
-        .is_ok();
-
-    Ok((
-        VerifyOperationResult {
-            identity: identity.clone(),
-            request: request.clone(),
-            mode: identity.mode.resolved,
-            verified,
-            digest_algorithm: DigestAlgorithm::Sha256,
-            digest_hex: hex_encode(digest),
-            input_bytes: input_bytes.len(),
-            signature_bytes: signature_bytes.len(),
-            signature_format,
-        },
-        diagnostics,
-    ))
-}
-
-fn verify_seed_p256(
-    request: &VerifyRequest,
-    identity: &Identity,
-    input_bytes: &[u8],
-    signature_bytes: &[u8],
-    digest: &[u8],
-    derived_seed: &[u8],
-    diagnostics: Vec<crate::model::Diagnostic>,
-) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
-    let scalar_bytes =
-        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
-        Error::Internal(format!(
-            "failed to materialize p256 seed verifying key for identity '{}': {error}",
-            identity.name
-        ))
-    })?;
-    let verifying_key = signing_key.verifying_key();
-    let (signature, signature_format) = parse_p256_verify_signature(signature_bytes)?;
-    let verified = verifying_key.verify(input_bytes, &signature).is_ok();
-
-    Ok((
-        VerifyOperationResult {
-            identity: identity.clone(),
-            request: request.clone(),
-            mode: identity.mode.resolved,
-            verified,
-            digest_algorithm: DigestAlgorithm::Sha256,
-            digest_hex: hex_encode(digest),
-            input_bytes: input_bytes.len(),
-            signature_bytes: signature_bytes.len(),
-            signature_format: VerifySignatureFormat::from(signature_format),
-        },
-        diagnostics,
-    ))
-}
-
-fn verify_seed_secp256k1(
-    request: &VerifyRequest,
-    identity: &Identity,
-    input_bytes: &[u8],
-    signature_bytes: &[u8],
-    digest: &[u8],
-    derived_seed: &[u8],
-    diagnostics: Vec<crate::model::Diagnostic>,
-) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
-    let scalar_bytes =
-        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
-        Error::Internal(format!(
-            "failed to materialize secp256k1 seed verifying key for identity '{}': {error}",
-            identity.name
-        ))
-    })?;
-    let verifying_key = signing_key.verifying_key();
-    let (signature, signature_format) = parse_k256_verify_signature(signature_bytes)?;
-    let verified =
-        k256::ecdsa::signature::Verifier::verify(verifying_key, input_bytes, &signature).is_ok();
-
-    Ok((
-        VerifyOperationResult {
-            identity: identity.clone(),
-            request: request.clone(),
-            mode: identity.mode.resolved,
-            verified,
-            digest_algorithm: DigestAlgorithm::Sha256,
-            digest_hex: hex_encode(digest),
-            input_bytes: input_bytes.len(),
-            signature_bytes: signature_bytes.len(),
-            signature_format: VerifySignatureFormat::from(signature_format),
-        },
-        diagnostics,
-    ))
-}
-
-fn seed_verify_open_request(identity: &Identity) -> Result<SeedOpenRequest> {
-    Ok(SeedOpenRequest {
-        identity: seed_verify_profile(identity)?,
-        auth_source: SeedOpenAuthSource::None,
-        output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
-            spec: seed_verify_derivation_spec(identity.algorithm)?,
-            output_bytes: 32,
-        }),
-        require_fresh_unseal: true,
-        confirm_software_derivation: true,
-    })
-}
-
-fn seed_verify_profile(identity: &Identity) -> Result<SeedIdentity> {
-    if identity.mode.resolved != Mode::Seed {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' did not resolve to seed mode",
-            identity.name
-        )));
-    }
-
-    seed_profile_from_profile(identity)
-}
-
-fn seed_verify_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
-    seed_signing_key_derivation_spec(algorithm)
-}
-
-/// Shared derivation spec for both sign and verify operations.
-/// Sign and verify must derive the same key to round-trip.
-fn seed_signing_key_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
-    let (algo_name, output_kind) = match algorithm {
-        Algorithm::Ed25519 => ("ed25519", OutputKind::Ed25519Seed),
-        Algorithm::P256 => ("p256", OutputKind::P256Scalar),
-        Algorithm::Secp256k1 => ("secp256k1", OutputKind::Secp256k1Scalar),
-    };
-
-    Ok(DerivationSpec::V1(DerivationSpecV1::software_child_key(
-        SEED_SIGNING_KEY_NAMESPACE,
-        algo_name,
-        SEED_SIGNING_KEY_PATH,
-        output_kind,
-    )?))
-}
-
-fn seed_verify_diagnostics(
-    identity: &Identity,
-    warnings: &[crate::model::Diagnostic],
-    derived_bytes: usize,
-) -> Vec<crate::model::Diagnostic> {
-    let mut diagnostics = warnings.to_vec();
-    diagnostics.push(crate::model::Diagnostic::info(
-        "seed-verifier-derived",
-        format!(
-            "derived {} bytes of {:?} verifier material from sealed seed using {} {}",
-            derived_bytes, identity.algorithm, SEED_SIGNING_KEY_NAMESPACE, SEED_SIGNING_KEY_PATH,
-        ),
-    ));
-    diagnostics
 }
 
 fn export_command_path(kind: ExportKind) -> CommandPath {
@@ -1367,375 +582,6 @@ fn run_placeholder(
     )
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct SignOperationResult {
-    identity: Identity,
-    request: SignRequest,
-    mode: Mode,
-    state: String,
-    digest_algorithm: DigestAlgorithm,
-    input_bytes: usize,
-    digest_path: PathBuf,
-    output_path: PathBuf,
-    signature_bytes_written: Option<usize>,
-    plan: NativeSignPlan,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SeedSignOperationResult {
-    identity: Identity,
-    request: SignRequest,
-    mode: Mode,
-    digest_algorithm: DigestAlgorithm,
-    digest_hex: String,
-    input_bytes: usize,
-    signature_bytes: usize,
-    signature_hex: String,
-    signature_format: SeedSignatureFormat,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-enum SeedSignatureFormat {
-    Raw,
-    Der,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-enum VerifySignatureFormat {
-    Der,
-    P1363,
-    Raw,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct VerifyOperationResult {
-    identity: Identity,
-    request: VerifyRequest,
-    mode: Mode,
-    verified: bool,
-    digest_algorithm: DigestAlgorithm,
-    digest_hex: String,
-    input_bytes: usize,
-    signature_bytes: usize,
-    signature_format: VerifySignatureFormat,
-}
-
-#[derive(Debug, Clone)]
-struct StagedNativeSign {
-    digest_algorithm: DigestAlgorithm,
-    input_bytes: usize,
-    digest_path: PathBuf,
-    output_path: PathBuf,
-    plan: NativeSignPlan,
-    ready_for_execution: bool,
-    diagnostics: Vec<crate::model::Diagnostic>,
-}
-
-fn unsupported_mode_operation(
-    json: bool,
-    command: CommandPath,
-    mode: Mode,
-    diagnostics: Vec<crate::model::Diagnostic>,
-    message: &str,
-) -> Result<String> {
-    failure(
-        json,
-        command,
-        ErrorEnvelope {
-            code: Error::Unsupported(message.to_string())
-                .code()
-                .as_str()
-                .to_string(),
-            message: format!("{message} (resolved mode: {})", mode_name(mode)),
-        },
-        diagnostics,
-    )
-}
-
-fn stage_native_sign(request: &SignRequest, identity: &Identity) -> Result<StagedNativeSign> {
-    if identity.algorithm != Algorithm::P256 {
-        return Err(Error::Unsupported(format!(
-            "native sign is currently wired only for p256 identities, found {:?}",
-            identity.algorithm
-        )));
-    }
-
-    if !identity.uses.contains(&UseCase::Sign) {
-        return Err(Error::Unsupported(format!(
-            "identity '{}' is not configured with sign use",
-            identity.name
-        )));
-    }
-
-    identity.storage.state_layout.ensure_dirs()?;
-
-    let runtime_dir = identity
-        .storage
-        .state_layout
-        .objects_dir
-        .join(&identity.name)
-        .join("native-sign");
-    let output_dir = identity
-        .storage
-        .state_layout
-        .exports_dir
-        .join(&identity.name)
-        .join("signatures");
-
-    ensure_dir(&runtime_dir, "native sign runtime")?;
-    ensure_dir(&output_dir, "native sign output")?;
-
-    let input_bytes = load_sign_input(&request.input)?;
-    if input_bytes.is_empty() {
-        return Err(Error::Validation(
-            "sign input must not be empty".to_string(),
-        ));
-    }
-
-    let digest = Sha256::digest(&input_bytes).to_vec();
-    let digest_path = runtime_dir.join("sha256.digest.bin");
-    let plain_signature_path = runtime_dir.join("signature.p1363.bin");
-    let output_path = output_dir.join("signature.der");
-    fs::write(&digest_path, &digest).map_err(|error| {
-        Error::State(format!(
-            "failed to write staged sign digest '{}': {error}",
-            digest_path.display()
-        ))
-    })?;
-
-    let (locator, ready_for_execution, locator_diagnostics) = resolve_native_sign_locator(identity);
-    let plan = plan_sign(
-        &NativeSignRequest {
-            key: NativeKeyRef {
-                identity: identity.name.clone(),
-                key_id: ops::native_key_id(identity),
-            },
-            scheme: NativeSignatureScheme::Ecdsa,
-            format: NativeSignatureFormat::Der,
-            digest_algorithm: DigestAlgorithm::Sha256,
-            digest,
-        },
-        &NativeSignOptions {
-            locator,
-            auth: NativeAuthSource::Empty,
-            artifacts: NativeSignArtifacts {
-                digest_path: digest_path.clone(),
-                signature_path: output_path.clone(),
-                plain_signature_path: Some(plain_signature_path),
-            },
-        },
-    )?;
-
-    let mut diagnostics = plan.warnings.clone();
-    diagnostics.extend(locator_diagnostics);
-
-    Ok(StagedNativeSign {
-        digest_algorithm: DigestAlgorithm::Sha256,
-        input_bytes: input_bytes.len(),
-        digest_path,
-        output_path,
-        plan,
-        ready_for_execution,
-        diagnostics,
-    })
-}
-
-fn resolve_native_sign_locator(
-    identity: &Identity,
-) -> (NativeKeyLocator, bool, Vec<crate::model::Diagnostic>) {
-    if let Some(path) = ops::metadata_path(
-        identity,
-        &[
-            "native.serialized_handle_path",
-            "native.serialized-handle-path",
-        ],
-    ) {
-        if path.is_file() {
-            return (
-                NativeKeyLocator::SerializedHandle { path },
-                true,
-                Vec::new(),
-            );
-        }
-    }
-
-    if let Some(handle) = ops::metadata_value(
-        identity,
-        &["native.persistent_handle", "native.persistent-handle"],
-    ) {
-        return (
-            NativeKeyLocator::PersistentHandle { handle },
-            true,
-            Vec::new(),
-        );
-    }
-
-    for path in ops::native_handle_path_candidates(identity) {
-        if path.is_file() {
-            return (
-                NativeKeyLocator::SerializedHandle { path },
-                true,
-                Vec::new(),
-            );
-        }
-    }
-
-    let missing_handle_path = ops::metadata_path(
-        identity,
-        &[
-            "native.serialized_handle_path",
-            "native.serialized-handle-path",
-        ],
-    )
-    .or_else(|| {
-        ops::native_handle_path_candidates(identity)
-            .into_iter()
-            .next()
-    })
-    .unwrap_or_else(|| {
-        identity
-            .storage
-            .state_layout
-            .objects_dir
-            .join(format!("{}.handle", identity.name))
-    });
-
-    (
-        NativeKeyLocator::SerializedHandle {
-            path: missing_handle_path.clone(),
-        },
-        false,
-        vec![crate::model::Diagnostic::warning(
-            "native-key-handle-missing",
-            format!(
-                "serialized native key handle '{}' is not present yet; sign returns a concrete plan and staged digest, and will execute once native setup material is present",
-                missing_handle_path.display()
-            ),
-        )],
-    )
-}
-
-fn execute_native_sign_plan_with_runner<R>(plan: &NativeSignPlan, runner: &R) -> Result<usize>
-where
-    R: CommandRunner,
-{
-    let output = runner.run(&CommandInvocation::new(
-        &plan.command.program,
-        plan.command.args.iter().cloned(),
-    ));
-    if output.error.is_some() || output.exit_code != Some(0) {
-        return Err(classify_native_command_failure(
-            &plan.command.program,
-            &output,
-        ));
-    }
-
-    let signature = finalize_native_signature_output(plan)?;
-    Ok(signature.len())
-}
-
-fn finalize_native_signature_output(plan: &NativeSignPlan) -> Result<Vec<u8>> {
-    match &plan.post_process {
-        Some(NativePostProcessAction::P256PlainToDer {
-            input_path,
-            output_path,
-        }) => {
-            let plain_signature = fs::read(input_path).map_err(|error| {
-                Error::State(format!(
-                    "native sign completed but intermediate signature '{}' could not be read: {error}",
-                    input_path.display()
-                ))
-            })?;
-            let der_signature = crate::ops::native::subprocess::finalize_p256_signature(
-                NativeSignatureFormat::Der,
-                &plain_signature,
-            )?;
-            fs::write(output_path, &der_signature).map_err(|error| {
-                Error::State(format!(
-                    "failed to write DER signature '{}': {error}",
-                    output_path.display()
-                ))
-            })?;
-            let _ = fs::remove_file(input_path);
-            Ok(der_signature)
-        }
-        Some(other) => Err(Error::Unsupported(format!(
-            "native sign post-process action '{other:?}' is not wired for CLI execution"
-        ))),
-        None => fs::read(&plan.output_path).map_err(|error| {
-            Error::State(format!(
-                "native sign completed but output '{}' could not be read: {error}",
-                plan.output_path.display()
-            ))
-        }),
-    }
-}
-
-fn classify_native_command_failure(program: &str, output: &CommandOutput) -> Error {
-    let detail = render_command_failure_detail(output);
-    let lower = detail.to_ascii_lowercase();
-    let message = format!(
-        "native TPM command '{}' failed{}{}",
-        program,
-        output
-            .exit_code
-            .map(|code| format!(" with exit status {code}"))
-            .unwrap_or_default(),
-        if detail.is_empty() {
-            String::new()
-        } else {
-            format!(": {detail}")
-        }
-    );
-
-    if lower.contains("auth") || lower.contains("authorization") {
-        Error::AuthFailure(message)
-    } else if output.error.is_some()
-        || lower.contains("tcti")
-        || lower.contains("/dev/tpm")
-        || lower.contains("no standard tcti")
-        || lower.contains("connection refused")
-    {
-        Error::TpmUnavailable(message)
-    } else if lower.contains("no such file")
-        || lower.contains("could not open")
-        || lower.contains("cannot open")
-        || lower.contains("context")
-        || lower.contains("handle")
-    {
-        Error::State(message)
-    } else {
-        Error::CapabilityMismatch(message)
-    }
-}
-
-fn render_command_failure_detail(output: &CommandOutput) -> String {
-    if let Some(error) = output.error.as_deref() {
-        return error.to_string();
-    }
-
-    let detail = if !output.stderr.trim().is_empty() {
-        output.stderr.trim()
-    } else {
-        output.stdout.trim()
-    };
-
-    preview(detail)
-}
-
-fn preview(value: &str) -> String {
-    let single_line = value.lines().map(str::trim).collect::<Vec<_>>().join(" ");
-    let trimmed = single_line.trim();
-    const LIMIT: usize = 180;
-    if trimmed.len() > LIMIT {
-        format!("{}…", &trimmed[..LIMIT])
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn parse_input_source(input: &str) -> InputSource {
     if input == "-" {
         InputSource::Stdin
@@ -1744,10 +590,6 @@ fn parse_input_source(input: &str) -> InputSource {
             path: PathBuf::from(input),
         }
     }
-}
-
-fn load_sign_input(input: &InputSource) -> Result<Vec<u8>> {
-    load_input_bytes(input, "sign input")
 }
 
 fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
@@ -1766,136 +608,6 @@ fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
             ))
         }),
     }
-}
-
-fn export_native_public_key_der_with_runner<R>(identity: &Identity, runner: &R) -> Result<Vec<u8>>
-where
-    R: CommandRunner,
-{
-    if identity.algorithm != Algorithm::P256 {
-        return Err(Error::Unsupported(format!(
-            "native public-key export is currently wired only for p256 identities, got {:?}",
-            identity.algorithm
-        )));
-    }
-
-    identity.storage.state_layout.ensure_dirs()?;
-
-    let locator = ops::resolve_native_key_locator(identity)?;
-    let tempdir = TempfileBuilder::new()
-        .prefix("native-verify-public-key-")
-        .tempdir_in(&identity.storage.state_layout.exports_dir)
-        .map_err(|error| {
-            Error::State(format!(
-                "failed to create native verify workspace in '{}': {error}",
-                identity.storage.state_layout.exports_dir.display()
-            ))
-        })?;
-
-    let plan = crate::ops::native::subprocess::plan_export_public_key(
-        &crate::ops::native::NativePublicKeyExportRequest {
-            key: NativeKeyRef {
-                identity: identity.name.clone(),
-                key_id: ops::native_key_id(identity),
-            },
-            encodings: vec![crate::ops::native::NativePublicKeyEncoding::SpkiDer],
-        },
-        &crate::ops::native::subprocess::NativePublicKeyExportOptions {
-            locator,
-            output_dir: tempdir.path().to_path_buf(),
-            file_stem: identity.name.clone(),
-        },
-    )?;
-
-    for command in &plan.commands {
-        let output = runner.run(&CommandInvocation::new(
-            &command.program,
-            command.args.iter().cloned(),
-        ));
-        if output.error.is_some() || output.exit_code != Some(0) {
-            return Err(classify_native_command_failure(&command.program, &output));
-        }
-    }
-
-    let exported = plan
-        .outputs
-        .iter()
-        .find(|output| output.encoding == crate::ops::native::NativePublicKeyEncoding::SpkiDer)
-        .ok_or_else(|| {
-            Error::Internal(
-                "native verify export plan did not produce the expected SPKI DER artifact"
-                    .to_string(),
-            )
-        })?;
-
-    fs::read(&exported.path).map_err(|error| {
-        Error::State(format!(
-            "failed to read native verify public key from '{}': {error}",
-            exported.path.display()
-        ))
-    })
-}
-
-fn load_p256_verifying_key(public_key_der: &[u8]) -> Result<VerifyingKey> {
-    VerifyingKey::from_public_key_der(public_key_der).map_err(|error| {
-        Error::State(format!(
-            "native verify exported malformed SPKI DER public key material: {error}"
-        ))
-    })
-}
-
-fn parse_p256_verify_signature(
-    signature_bytes: &[u8],
-) -> Result<(P256Signature, VerifySignatureFormat)> {
-    if let Ok(signature) = P256Signature::from_der(signature_bytes) {
-        return Ok((signature, VerifySignatureFormat::Der));
-    }
-
-    if let Ok(signature) = P256Signature::from_slice(signature_bytes) {
-        return Ok((signature, VerifySignatureFormat::P1363));
-    }
-
-    Err(Error::Validation(
-        "verify signature must be either ASN.1 DER ECDSA or 64-byte P1363 for p256".to_string(),
-    ))
-}
-
-fn parse_k256_verify_signature(
-    signature_bytes: &[u8],
-) -> Result<(K256Signature, VerifySignatureFormat)> {
-    if let Ok(signature) = K256Signature::from_der(signature_bytes) {
-        return Ok((signature, VerifySignatureFormat::Der));
-    }
-
-    if let Ok(signature) = K256Signature::from_slice(signature_bytes) {
-        return Ok((signature, VerifySignatureFormat::P1363));
-    }
-
-    Err(Error::Validation(
-        "verify signature must be either ASN.1 DER ECDSA or 64-byte P1363 for secp256k1"
-            .to_string(),
-    ))
-}
-
-fn parse_ed25519_verify_signature(
-    signature_bytes: &[u8],
-) -> Result<(Ed25519Signature, VerifySignatureFormat)> {
-    let signature_bytes: [u8; 64] = signature_bytes.try_into().map_err(|_| {
-        Error::Validation("verify signature for ed25519 must be exactly 64 raw bytes".to_string())
-    })?;
-
-    Ok((
-        Ed25519Signature::from_bytes(&signature_bytes),
-        VerifySignatureFormat::Raw,
-    ))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    output
 }
 
 fn hex_decode_bytes(hex: &str) -> Vec<u8> {
@@ -1931,23 +643,6 @@ fn write_output_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
             path.display()
         ))
     })
-}
-
-fn ensure_dir(path: &Path, label: &str) -> Result<()> {
-    fs::create_dir_all(path).map_err(|error| {
-        Error::State(format!(
-            "failed to create {label} directory '{}': {error}",
-            path.display()
-        ))
-    })
-}
-
-fn mode_name(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Native => "native",
-        Mode::Prf => "prf",
-        Mode::Seed => "seed",
-    }
 }
 
 #[allow(dead_code)]
@@ -2021,11 +716,18 @@ mod tests {
     use super::*;
 
     use std::cell::RefCell;
+    use std::path::Path;
 
+    use crate::backend::{CommandInvocation, CommandOutput};
+    use crate::ops::native::NativeSignatureFormat;
+    use crate::ops::seed::{
+        HkdfSha256SeedDeriver, SeedBackend, SeedIdentity, SeedOpenAuthSource, SeedOpenOutput,
+    };
     use clap::Parser as _;
-    use ed25519_dalek::SigningKey as Ed25519SigningKey;
-    use p256::ecdsa::SigningKey as P256SigningKey;
+    use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
+    use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
     use p256::pkcs8::EncodePublicKey as _;
+    use secrecy::ExposeSecret;
     use secrecy::SecretBox;
     use serde_json::Value;
     use tempfile::tempdir;

@@ -37,8 +37,6 @@ pub enum Command {
     Encrypt(EncryptArgs),
     /// Decrypt data previously encrypted with the encrypt command.
     Decrypt(DecryptArgs),
-    /// Derive a keypair (secret key + public key) from a persisted identity.
-    Keygen(KeygenArgs),
     /// Export public material or recovery artifacts from a persisted identity.
     Export(ExportArgs),
     /// Import a break-glass recovery bundle and reseal it into TPM-backed state.
@@ -205,56 +203,6 @@ pub struct DecryptArgs {
         help = "Override the state root directory instead of the default local state path"
     )]
     pub state_dir: Option<std::path::PathBuf>,
-}
-
-#[derive(Debug, Args)]
-#[command(about = "Derive a keypair (secret key + public key) from a persisted identity")]
-pub struct KeygenArgs {
-    #[arg(long = "with", help = "Existing identity name to use")]
-    pub identity: String,
-    #[command(flatten)]
-    pub derivation: DerivationInputArgs,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = KeygenKindArg::Auto,
-        help = "Derivation kind: auto tries prf then seed, or force a specific kind"
-    )]
-    pub kind: KeygenKindArg,
-    #[arg(
-        long = "format",
-        value_enum,
-        default_value_t = KeygenFormatArg::Hex,
-        help = "Output encoding for the generated keypair"
-    )]
-    pub format: KeygenFormatArg,
-    #[arg(long, help = "Output file for the keypair; defaults to stdout")]
-    pub output: Option<std::path::PathBuf>,
-    #[arg(
-        long,
-        help = "Override the state root directory instead of the default local state path"
-    )]
-    pub state_dir: Option<std::path::PathBuf>,
-}
-
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
-pub enum KeygenKindArg {
-    /// Try PRF first, then seed, otherwise error.
-    #[default]
-    Auto,
-    /// Derive from a PRF-mode identity.
-    Prf,
-    /// Derive from a seed-mode identity.
-    Seed,
-}
-
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
-pub enum KeygenFormatArg {
-    /// Lowercase hexadecimal.
-    #[default]
-    Hex,
-    /// JSON object with hex-encoded fields.
-    Json,
 }
 
 #[derive(Debug, Args)]
@@ -564,5 +512,7 @@ mod tests {
             ])
             .is_err()
         );
+
+        assert!(Cli::try_parse_from(["tpm2-derive", "keygen", "--with", "seed-user"]).is_err());
     }
 }

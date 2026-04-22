@@ -11,7 +11,9 @@ pub mod native;
 pub mod prf;
 pub mod seed;
 mod shared;
+pub mod sign;
 pub mod ssh;
+pub mod verify;
 
 use std::collections::BTreeSet;
 use std::fs;
