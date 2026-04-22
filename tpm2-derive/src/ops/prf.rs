@@ -536,12 +536,13 @@ fn create_prf_root_invocation(
     CommandInvocation::new(
         "tpm2_create",
         [
+            "-R".to_string(),
             "-C".to_string(),
             path_arg(parent_context_path),
             "-g".to_string(),
             "sha256".to_string(),
             "-G".to_string(),
-            "keyedhash".to_string(),
+            "hmac".to_string(),
             "-a".to_string(),
             "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign".to_string(),
             "-u".to_string(),
@@ -768,8 +769,7 @@ fn validate_identity_name(identity: &str) -> Result<()> {
 
     if identity.contains("..") || identity.contains('/') || identity.contains('\\') {
         return Err(Error::Validation(
-            "identity must not contain path traversal or separators for PRF operations"
-                .to_string(),
+            "identity must not contain path traversal or separators for PRF operations".to_string(),
         ));
     }
 

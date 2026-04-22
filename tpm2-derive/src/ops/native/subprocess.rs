@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use p256::ecdsa::Signature as P256Signature;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -236,6 +237,7 @@ pub fn plan_setup(
         NativeCommandSpec::new(
             "tpm2_createprimary",
             [
+                "-R".to_string(),
                 "-C".to_string(),
                 OWNER_HIERARCHY.to_string(),
                 "-g".to_string(),
@@ -247,6 +249,7 @@ pub fn plan_setup(
         NativeCommandSpec::new(
             "tpm2_create",
             [
+                "-R".to_string(),
                 "-C".to_string(),
                 primary_context.display().to_string(),
                 "-g".to_string(),
@@ -264,6 +267,7 @@ pub fn plan_setup(
         NativeCommandSpec::new(
             "tpm2_load",
             [
+                "-R".to_string(),
                 "-C".to_string(),
                 primary_context.display().to_string(),
                 "-u".to_string(),
@@ -536,14 +540,24 @@ pub fn plan_export_public_key(
 
 pub fn finalize_p256_signature(
     format: NativeSignatureFormat,
-    plain_signature: &[u8],
+    signature_bytes: &[u8],
 ) -> Result<Vec<u8>> {
-    validate_p256_plain_signature(plain_signature)?;
-
-    match format {
-        NativeSignatureFormat::P1363 => Ok(plain_signature.to_vec()),
-        NativeSignatureFormat::Der => encode_p256_der_signature(plain_signature),
+    if signature_bytes.len() == P256_P1363_SIGNATURE_BYTES {
+        return match format {
+            NativeSignatureFormat::P1363 => Ok(signature_bytes.to_vec()),
+            NativeSignatureFormat::Der => encode_p256_der_signature(signature_bytes),
+        };
     }
+
+    if let Ok(signature) = P256Signature::from_der(signature_bytes) {
+        return match format {
+            NativeSignatureFormat::P1363 => Ok(signature.to_bytes().to_vec()),
+            NativeSignatureFormat::Der => Ok(signature_bytes.to_vec()),
+        };
+    }
+
+    validate_p256_plain_signature(signature_bytes)?;
+    unreachable!("64-byte P1363 signatures return earlier")
 }
 
 pub fn extract_p256_sec1_from_spki_der(der: &[u8]) -> Result<Vec<u8>> {
@@ -879,11 +893,14 @@ mod tests {
 
         assert_eq!(plan.commands.len(), 4);
         assert_eq!(plan.commands[0].program, "tpm2_createprimary");
+        assert!(plan.commands[0].args.iter().any(|arg| arg == "-R"));
         assert_eq!(plan.commands[1].program, "tpm2_create");
+        assert!(plan.commands[1].args.iter().any(|arg| arg == "-R"));
         assert!(plan.commands[1]
             .args
             .iter()
             .any(|arg| arg == "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign|noda"));
+        assert!(plan.commands[2].args.iter().any(|arg| arg == "-R"));
         assert_eq!(plan.commands[3].program, "tpm2_evictcontrol");
         assert_eq!(
             plan.retained_locator,
@@ -974,6 +991,22 @@ mod tests {
 
         assert_eq!(der[0], 0x30);
         assert!(der.windows(3).any(|window| window == [0x02, 0x21, 0x00]));
+    }
+
+    #[test]
+    fn finalize_der_signature_accepts_tooling_that_already_returns_der() {
+        let mut plain = vec![0u8; P256_P1363_SIGNATURE_BYTES];
+        plain[31] = 0x11;
+        plain[63] = 0x22;
+        let der = encode_p256_der_signature(&plain).expect("der");
+
+        let finalized_der =
+            finalize_p256_signature(NativeSignatureFormat::Der, &der).expect("pass through der");
+        let finalized_p1363 = finalize_p256_signature(NativeSignatureFormat::P1363, &der)
+            .expect("convert der to p1363");
+
+        assert_eq!(finalized_der, der);
+        assert_eq!(finalized_p1363, plain);
     }
 
     #[test]

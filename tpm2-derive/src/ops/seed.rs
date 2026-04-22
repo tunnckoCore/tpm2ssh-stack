@@ -868,6 +868,7 @@ fn create_primary_invocation(primary_context: &Path) -> CommandInvocation {
     CommandInvocation::new(
         "tpm2_createprimary",
         [
+            "-R".to_string(),
             "-C".to_string(),
             "o".to_string(),
             "-g".to_string(),
@@ -889,12 +890,11 @@ fn seal_seed_invocation(
     CommandInvocation::new(
         "tpm2_create",
         [
+            "-R".to_string(),
             "-C".to_string(),
             path_arg(primary_context),
             "-g".to_string(),
             "sha256".to_string(),
-            "-G".to_string(),
-            "keyedhash".to_string(),
             "-a".to_string(),
             "fixedtpm|fixedparent|userwithauth".to_string(),
             "-i".to_string(),
@@ -916,6 +916,7 @@ fn load_sealed_object_invocation(
     CommandInvocation::new(
         "tpm2_load",
         [
+            "-R".to_string(),
             "-C".to_string(),
             path_arg(primary_context),
             "-u".to_string(),
@@ -1919,6 +1920,24 @@ mod tests {
             recorded_programs(&state),
             vec!["tpm2_createprimary", "tpm2_create"]
         );
+        assert!(
+            state.invocations.borrow()[0]
+                .args
+                .iter()
+                .any(|arg| arg == "-R")
+        );
+        assert!(
+            state.invocations.borrow()[1]
+                .args
+                .iter()
+                .any(|arg| arg == "-R")
+        );
+        assert!(
+            !state.invocations.borrow()[1]
+                .args
+                .iter()
+                .any(|arg| arg == "-G")
+        );
         assert_eq!(
             fs::read(&layout.public_blob).expect("public blob"),
             b"public-blob"
@@ -1966,6 +1985,24 @@ mod tests {
             recorded_programs(&state),
             vec!["tpm2_getrandom", "tpm2_createprimary", "tpm2_create"]
         );
+        assert!(
+            state.invocations.borrow()[1]
+                .args
+                .iter()
+                .any(|arg| arg == "-R")
+        );
+        assert!(
+            state.invocations.borrow()[2]
+                .args
+                .iter()
+                .any(|arg| arg == "-R")
+        );
+        assert!(
+            !state.invocations.borrow()[2]
+                .args
+                .iter()
+                .any(|arg| arg == "-G")
+        );
         let create_input_path = state.create_input_paths.borrow()[0].clone();
         assert!(
             !create_input_path.exists(),
@@ -1995,6 +2032,18 @@ mod tests {
         assert_eq!(
             recorded_programs(&state),
             vec!["tpm2_createprimary", "tpm2_load", "tpm2_unseal"]
+        );
+        assert!(
+            state.invocations.borrow()[0]
+                .args
+                .iter()
+                .any(|arg| arg == "-R")
+        );
+        assert!(
+            state.invocations.borrow()[1]
+                .args
+                .iter()
+                .any(|arg| arg == "-R")
         );
         assert_eq!(unsealed.expose_secret().as_slice(), seed.as_slice());
 

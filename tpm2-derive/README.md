@@ -169,6 +169,22 @@ tpm2-derive export \
 ```
 
 
+## Testing
+
+The default `cargo test` suite stays mock-only.
+
+The real TPM integration suite is feature-gated and spins up `swtpm` against the real `tpm2-tools` command paths:
+
+```bash
+cargo test --features real-tpm-tests --test real_tpm_cli
+```
+
+If `swtpm` is not already installed on your PATH, one convenient Nix-based invocation is:
+
+```bash
+nix shell nixpkgs#swtpm -c cargo test --features real-tpm-tests --test real_tpm_cli
+```
+
 ## Notes
 
 - `--use all` expands according to the resolved mode and the native capability matrix.
