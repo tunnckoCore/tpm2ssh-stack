@@ -159,3 +159,110 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
+    use crate::model::{
+        Algorithm, DerivationOverrides, Identity, IdentityModeResolution, Mode, ModePreference,
+        StateLayout, UseCase,
+    };
+    use crate::ops::prf::{PRF_CONTEXT_PATH_METADATA_KEY, PrfRequest, RawPrfOutput, finalize};
+
+    use super::*;
+
+    struct RecordingPrfRunner {
+        raw_output: Vec<u8>,
+        invocations: RefCell<Vec<CommandInvocation>>,
+    }
+
+    impl RecordingPrfRunner {
+        fn new(raw_output: &[u8]) -> Self {
+            Self {
+                raw_output: raw_output.to_vec(),
+                invocations: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for RecordingPrfRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.invocations.borrow_mut().push(invocation.clone());
+            let output_path = invocation
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-o")
+                .map(|pair| PathBuf::from(&pair[1]))
+                .expect("prf output path");
+            std::fs::write(output_path, &self.raw_output).expect("write prf output");
+
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            }
+        }
+    }
+
+    fn prf_identity(root: &Path) -> Identity {
+        let mut identity = Identity::new(
+            "prf-derive".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Derive],
+            IdentityModeResolution {
+                requested: ModePreference::Prf,
+                resolved: Mode::Prf,
+                reasons: vec!["prf requested".to_string()],
+            },
+            StateLayout::new(root.to_path_buf()),
+        );
+        identity.metadata.insert(
+            PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+            format!("objects/{}/prf-root.ctx", identity.name),
+        );
+        identity
+    }
+
+    #[test]
+    fn prf_derive_returns_single_finalized_output_without_double_expansion() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let identity = prf_identity(temp.path());
+        let runner = RecordingPrfRunner::new(b"tpm-prf-material");
+        let request = DeriveRequest {
+            identity: identity.name.clone(),
+            derivation: DerivationOverrides::default(),
+            length: 32,
+        };
+
+        let result = execute_with_runner(
+            &identity,
+            &request,
+            &runner,
+            &crate::ops::seed::SubprocessSeedBackend::new(
+                identity.storage.state_layout.objects_dir.clone(),
+            ),
+            &crate::ops::seed::HkdfSha256SeedDeriver,
+        )
+        .expect("derive executes");
+
+        let effective = resolve_effective_derivation_inputs(&identity, &request.derivation)
+            .expect("effective derivation inputs");
+        let spec = derive_command_spec(&effective, request.length).expect("derive spec");
+        let expected = finalize(
+            PrfRequest::new(identity.name.clone(), spec).expect("prf request"),
+            RawPrfOutput::new(crate::ops::prf::PrfProtocolVersion::V1, b"tpm-prf-material".to_vec())
+                .expect("raw prf output"),
+        )
+        .expect("finalize")
+        .output
+        .expose_secret()
+        .to_vec();
+
+        assert_eq!(result.mode, Mode::Prf);
+        assert_eq!(result.material, hex_encode(&expected));
+    }
+}

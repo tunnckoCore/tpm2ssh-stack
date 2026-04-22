@@ -276,6 +276,38 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("temporary identity state should be removed");
     }
 
+    #[test]
+    fn serde_round_trip_keeps_export_secret_and_derivation_defaults() {
+        let identity = Identity::with_defaults(
+            "portable".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Sign, UseCase::ExportSecret],
+            IdentityModeResolution {
+                requested: ModePreference::Prf,
+                resolved: Mode::Prf,
+                reasons: vec!["test".to_string()],
+            },
+            IdentityDerivationDefaults {
+                org: Some("com.example".to_string()),
+                purpose: Some("backup".to_string()),
+                context: BTreeMap::from([("tenant".to_string(), "alpha".to_string())]),
+            },
+            StateLayout::new(PathBuf::from("/tmp/tpm2-derive-identity-serde")),
+        );
+
+        let json = serde_json::to_string_pretty(&identity).expect("serialize identity");
+        assert!(json.contains("\"export-secret\""));
+        assert!(json.contains("\"org\": \"com.example\""));
+        assert!(json.contains("\"purpose\": \"backup\""));
+
+        let round_tripped: Identity = serde_json::from_str(&json).expect("deserialize identity");
+        assert_eq!(round_tripped.uses, vec![UseCase::Sign, UseCase::ExportSecret]);
+        assert_eq!(
+            round_tripped.defaults.context,
+            BTreeMap::from([("tenant".to_string(), "alpha".to_string())])
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn persist_creates_identity_file_with_mode_0600() {

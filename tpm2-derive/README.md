@@ -1,27 +1,176 @@
 # tpm2-derive
 
-TPM-backed key operations with native, PRF, and seed modes.
+TPM-backed identity operations with native, PRF, and seed modes.
 
-## Design intent
+## CLI contract
 
-`tpm2-derive` is the shared core for TPM-backed and TPM-gated key workflows in this workspace.
+The persisted unit is a named **identity**:
 
-It is being built around three execution modes:
+```bash
+tpm2-derive identity <name> --mode <auto|native|prf|seed> --algorithm <p256|ed25519|secp256k1> --use <...>
+```
 
-- **native** — use TPM-native key operations when the local TPM supports the requested algorithm/operation combination.
-- **prf** — keep a TPM-resident secret and use TPM-backed PRF/HMAC-style derivation when the TPM can act as a deterministic oracle over labeled context.
-- **seed** — keep a high-entropy seed sealed in the TPM, then derive child material in software with strong domain separation when native or PRF support is unavailable or unsuitable.
+Operational commands stay flat and select an identity with `--with`:
 
-## Goals
+```bash
+tpm2-derive sign --with <name> ...
+tpm2-derive verify --with <name> ...
+tpm2-derive encrypt --with <name> ...
+tpm2-derive decrypt --with <name> ...
+tpm2-derive derive --with <name> ...
+tpm2-derive export --with <name> --kind <public-key|secret-key|keypair|recovery-bundle> ...
+tpm2-derive ssh-add --with <name> ...
+```
 
-- library-first architecture reusable by `tpm2ssh` and future tools
-- non-interactive, automation-friendly CLI
-- capability detection and mode recommendation
-- explicit and high-friction secret export path for recovery only
-- security-first handling of secret material
+Derivation inputs use the unified ADR vocabulary:
 
-## Status
+- `--org`
+- `--purpose`
+- repeated `--context key=value`
 
-Scaffold / planning stage.
+For PRF and seed identities, command-line derivation inputs override or merge with identity defaults.
+For native identities, derivation-input flags are rejected.
 
-See `../docs/TPM2_DERIVE_PLAN.md` for the current architecture and CLI plan.
+## Modes
+
+### native
+
+Uses TPM-native keys and TPM-native operations.
+
+Supported today:
+
+- `sign`
+- `verify`
+- public-key export
+
+Not supported today:
+
+- `derive`
+- `ssh-add`
+- secret-key export
+- native encrypt/decrypt in this prototype slice
+
+### prf
+
+Uses a TPM-backed PRF root and derives operation material from the effective identity inputs.
+
+Supported:
+
+- `sign`
+- `verify`
+- `encrypt`
+- `decrypt`
+- `derive`
+- `ssh-add`
+- public-key export
+- secret-key and keypair export when the identity was created with `--use export-secret`
+
+### seed
+
+Uses a TPM-sealed seed and derives child material in software after unsealing.
+
+Supported:
+
+- `sign`
+- `verify`
+- `encrypt`
+- `decrypt`
+- `derive`
+- `ssh-add`
+- public-key export
+- secret-key and keypair export when the identity was created with `--use export-secret`
+- recovery-bundle export/import
+
+## Examples
+
+Inspect the local TPM and recommendation surface:
+
+```bash
+tpm2-derive inspect --algorithm p256 --use sign --use verify
+```
+
+Create a native signing identity:
+
+```bash
+tpm2-derive identity prod-signer \
+  --mode native \
+  --algorithm p256 \
+  --use sign \
+  --use verify
+```
+
+Create a PRF identity with derivation defaults:
+
+```bash
+tpm2-derive identity app-prf \
+  --mode prf \
+  --algorithm p256 \
+  --use all \
+  --org com.example \
+  --purpose app \
+  --context tenant=alpha
+```
+
+Use that identity for sign/derive/export/ssh-add:
+
+```bash
+tpm2-derive sign --with prod-signer --input message.bin
+
+tpm2-derive derive \
+  --with app-prf \
+  --org com.example \
+  --purpose session \
+  --context tenant=alpha \
+  --length 32
+
+tpm2-derive export \
+  --with app-prf \
+  --kind public-key \
+  --format spki-pem \
+  --output app-prf.pem
+
+tpm2-derive ssh-add --with app-prf --org com.example --context account=prod
+```
+
+Create an export-enabled seed identity:
+
+```bash
+tpm2-derive identity backup-seed \
+  --mode seed \
+  --algorithm ed25519 \
+  --use all \
+  --use export-secret \
+  --org com.example \
+  --purpose personal
+```
+
+Secret-bearing export stays explicit and high-friction:
+
+```bash
+tpm2-derive export \
+  --with backup-seed \
+  --kind secret-key \
+  --confirm \
+  --reason backup \
+  --output backup-seed.secret.hex
+
+tpm2-derive export \
+  --with backup-seed \
+  --kind keypair \
+  --confirm \
+  --reason "hardware migration" \
+  --output backup-seed.keypair.json
+```
+
+Recovery-bundle import:
+
+```bash
+tpm2-derive import --bundle backup.json --identity restored-user --confirm
+```
+
+## Notes
+
+- `--use all` expands according to the resolved mode and the native capability matrix.
+- `ssh-add` is intentionally separate from `use=ssh` and rejects native identities.
+- The legacy `keygen` command is no longer part of the public ADR surface; use `export --kind ...` instead.
+- The accepted ADR for this CLI is in `decisions/2026-04-22-unify-cli-surface-across-native-prf-seed.md`.

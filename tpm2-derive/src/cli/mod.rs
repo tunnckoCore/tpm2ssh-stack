@@ -743,6 +743,18 @@ fn sign_derived_identity(
     identity: &Identity,
     derivation: &DerivationOverrides,
 ) -> Result<(SeedSignOperationResult, Vec<crate::model::Diagnostic>)> {
+    sign_derived_identity_with_runner(request, identity, derivation, &ProcessCommandRunner)
+}
+
+fn sign_derived_identity_with_runner<R>(
+    request: &SignRequest,
+    identity: &Identity,
+    derivation: &DerivationOverrides,
+    runner: &R,
+) -> Result<(SeedSignOperationResult, Vec<crate::model::Diagnostic>)>
+where
+    R: CommandRunner,
+{
     if !identity.uses.contains(&UseCase::Sign) {
         return Err(Error::Unsupported(format!(
             "identity '{}' is not configured with sign use",
@@ -757,8 +769,7 @@ fn sign_derived_identity(
         ));
     }
 
-    let runner = ProcessCommandRunner;
-    let derived = derive_identity_key_material_with_defaults(identity, derivation, &runner)?;
+    let derived = derive_identity_key_material_with_defaults(identity, derivation, runner)?;
     let digest = Sha256::digest(&input_bytes).to_vec();
     let diagnostics = vec![crate::model::Diagnostic::info(
         "derived-signer-material",
@@ -797,6 +808,18 @@ fn verify_derived_identity(
     identity: &Identity,
     derivation: &DerivationOverrides,
 ) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
+    verify_derived_identity_with_runner(request, identity, derivation, &ProcessCommandRunner)
+}
+
+fn verify_derived_identity_with_runner<R>(
+    request: &VerifyRequest,
+    identity: &Identity,
+    derivation: &DerivationOverrides,
+    runner: &R,
+) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)>
+where
+    R: CommandRunner,
+{
     if !identity.uses.contains(&UseCase::Verify) {
         return Err(Error::Unsupported(format!(
             "identity '{}' is not configured with verify use",
@@ -821,8 +844,7 @@ fn verify_derived_identity(
         ));
     }
 
-    let runner = ProcessCommandRunner;
-    let derived = derive_identity_key_material_with_defaults(identity, derivation, &runner)?;
+    let derived = derive_identity_key_material_with_defaults(identity, derivation, runner)?;
     let digest = Sha256::digest(&input_bytes).to_vec();
     let diagnostics = vec![crate::model::Diagnostic::info(
         "derived-verifier-material",
@@ -2170,6 +2192,65 @@ mod tests {
         )
     }
 
+    fn prf_identity(root: &Path, algorithm: Algorithm, uses: Vec<UseCase>) -> Identity {
+        let mut identity = Identity::new(
+            "prf-signer".to_string(),
+            algorithm,
+            uses,
+            IdentityModeResolution {
+                requested: ModePreference::Prf,
+                resolved: Mode::Prf,
+                reasons: vec!["prf requested".to_string()],
+            },
+            StateLayout::new(root.to_path_buf()),
+        );
+        identity.metadata.insert(
+            crate::ops::prf::PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+            format!("objects/{}/prf-root.ctx", identity.name),
+        );
+        identity
+    }
+
+    struct RecordingPrfRunner {
+        raw_output: Vec<u8>,
+        invocations: RefCell<Vec<CommandInvocation>>,
+    }
+
+    impl RecordingPrfRunner {
+        fn new(raw_output: &[u8]) -> Self {
+            Self {
+                raw_output: raw_output.to_vec(),
+                invocations: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn invocations(&self) -> Vec<CommandInvocation> {
+            self.invocations.borrow().clone()
+        }
+    }
+
+    impl CommandRunner for RecordingPrfRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.invocations.borrow_mut().push(invocation.clone());
+            assert_eq!(invocation.program, "tpm2_hmac");
+
+            let output_path = invocation
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-o")
+                .map(|pair| PathBuf::from(&pair[1]))
+                .expect("prf output path");
+            fs::write(output_path, &self.raw_output).expect("write fake prf output");
+
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            }
+        }
+    }
+
     fn example_verify_material() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let message = b"hello from native verify".to_vec();
         let signing_key = P256SigningKey::from_bytes((&[7u8; 32]).into()).expect("signing key");
@@ -2186,6 +2267,24 @@ mod tests {
             signature.to_der().as_bytes().to_vec(),
             public_key_der,
         )
+    }
+
+    #[test]
+    fn derivation_overrides_last_context_value_wins() {
+        let overrides = derivation_overrides(args::DerivationInputArgs {
+            org: Some("com.example".to_string()),
+            purpose: Some("deploy".to_string()),
+            context: vec![
+                ("tenant".to_string(), "alpha".to_string()),
+                ("tenant".to_string(), "beta".to_string()),
+                ("role".to_string(), "git".to_string()),
+            ],
+        });
+
+        assert_eq!(overrides.org.as_deref(), Some("com.example"));
+        assert_eq!(overrides.purpose.as_deref(), Some("deploy"));
+        assert_eq!(overrides.context.get("tenant").map(String::as_str), Some("beta"));
+        assert_eq!(overrides.context.get("role").map(String::as_str), Some("git"));
     }
 
     #[test]
@@ -2438,6 +2537,66 @@ mod tests {
         assert!(
             matches!(error, Error::Validation(message) if message.contains("both --input and --signature from stdin"))
         );
+    }
+
+    #[test]
+    fn prf_sign_then_verify_round_trip_ed25519() {
+        let state_root = tempdir().expect("state root");
+        let identity = prf_identity(
+            state_root.path(),
+            Algorithm::Ed25519,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
+        let runner = RecordingPrfRunner::new(b"tpm-prf-material");
+        let message = b"round-trip prf ed25519 test".to_vec();
+
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
+        let (sign_result, sign_diagnostics) = sign_derived_identity_with_runner(
+            &SignRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path {
+                    path: input_path.clone(),
+                },
+            },
+            &identity,
+            &DerivationOverrides::default(),
+            &runner,
+        )
+        .expect("prf sign");
+
+        assert_eq!(sign_result.mode, Mode::Prf);
+        assert_eq!(sign_result.signature_format, SeedSignatureFormat::Raw);
+        assert!(sign_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "derived-signer-material"
+                && diagnostic.message.contains("Prf")
+        }));
+
+        let signature_path = state_root.path().join("signature.raw");
+        fs::write(&signature_path, hex_decode_test(&sign_result.signature_hex))
+            .expect("signature file");
+        let (verify_result, verify_diagnostics) = verify_derived_identity_with_runner(
+            &VerifyRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path {
+                    path: signature_path,
+                },
+            },
+            &identity,
+            &DerivationOverrides::default(),
+            &runner,
+        )
+        .expect("prf verify");
+
+        assert!(verify_result.verified);
+        assert_eq!(verify_result.mode, Mode::Prf);
+        assert_eq!(verify_result.signature_format, VerifySignatureFormat::Raw);
+        assert!(verify_diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "derived-verifier-material"
+                && diagnostic.message.contains("Prf")
+        }));
+        assert_eq!(runner.invocations().len(), 2);
     }
 
     #[test]

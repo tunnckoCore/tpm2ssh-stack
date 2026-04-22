@@ -3,8 +3,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use secrecy::ExposeSecret;
-
 use crate::backend::CommandRunner;
 use crate::crypto::{
     DerivationContext as CryptoDerivationContext, DerivationDomain, DerivationSpec,
@@ -261,4 +259,129 @@ fn validate_non_empty(field: &str, value: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use crate::error::Error;
+    use crate::model::{
+        Algorithm, DerivationOverrides, Identity, IdentityDerivationDefaults,
+        IdentityModeResolution, Mode, ModePreference, StateLayout, UseCase,
+    };
+
+    use super::resolve_effective_derivation_inputs;
+
+    fn identity(mode: Mode, defaults: IdentityDerivationDefaults) -> Identity {
+        Identity::with_defaults(
+            "demo".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Derive],
+            IdentityModeResolution {
+                requested: ModePreference::Auto,
+                resolved: mode,
+                reasons: vec!["test".to_string()],
+            },
+            defaults,
+            StateLayout::new(PathBuf::from("/tmp/tpm2-derive-shared-tests")),
+        )
+    }
+
+    #[test]
+    fn defaults_only_case_uses_identity_defaults() {
+        let resolved = resolve_effective_derivation_inputs(
+            &identity(
+                Mode::Seed,
+                IdentityDerivationDefaults {
+                    org: Some("com.example".to_string()),
+                    purpose: Some("deploy".to_string()),
+                    context: BTreeMap::from([("tenant".to_string(), "alpha".to_string())]),
+                },
+            ),
+            &DerivationOverrides::default(),
+        )
+        .expect("defaults resolve");
+
+        assert_eq!(resolved.org, "com.example");
+        assert_eq!(resolved.purpose, "deploy");
+        assert_eq!(
+            resolved.context,
+            BTreeMap::from([("tenant".to_string(), "alpha".to_string())])
+        );
+    }
+
+    #[test]
+    fn org_and_purpose_overrides_win_over_identity_defaults() {
+        let resolved = resolve_effective_derivation_inputs(
+            &identity(
+                Mode::Prf,
+                IdentityDerivationDefaults {
+                    org: Some("com.example".to_string()),
+                    purpose: Some("default".to_string()),
+                    context: BTreeMap::new(),
+                },
+            ),
+            &DerivationOverrides {
+                org: Some("com.override".to_string()),
+                purpose: Some("session".to_string()),
+                context: BTreeMap::new(),
+            },
+        )
+        .expect("overrides resolve");
+
+        assert_eq!(resolved.org, "com.override");
+        assert_eq!(resolved.purpose, "session");
+    }
+
+    #[test]
+    fn context_merge_appends_new_keys_and_replaces_existing_keys() {
+        let resolved = resolve_effective_derivation_inputs(
+            &identity(
+                Mode::Seed,
+                IdentityDerivationDefaults {
+                    org: None,
+                    purpose: None,
+                    context: BTreeMap::from([
+                        ("tenant".to_string(), "alpha".to_string()),
+                        ("role".to_string(), "user".to_string()),
+                    ]),
+                },
+            ),
+            &DerivationOverrides {
+                org: None,
+                purpose: None,
+                context: BTreeMap::from([
+                    ("role".to_string(), "admin".to_string()),
+                    ("region".to_string(), "us-east-1".to_string()),
+                ]),
+            },
+        )
+        .expect("context merge resolves");
+
+        assert_eq!(
+            resolved.context,
+            BTreeMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("role".to_string(), "admin".to_string()),
+                ("tenant".to_string(), "alpha".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn native_derivation_flag_rejection_case_returns_validation_error() {
+        let error = resolve_effective_derivation_inputs(
+            &identity(Mode::Native, IdentityDerivationDefaults::default()),
+            &DerivationOverrides {
+                org: Some("com.example".to_string()),
+                purpose: None,
+                context: BTreeMap::new(),
+            },
+        )
+        .expect_err("native overrides should fail");
+
+        assert!(matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides")));
+    }
 }

@@ -361,3 +361,217 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    use secrecy::SecretBox;
+    use tempfile::tempdir;
+
+    use crate::backend::{CommandInvocation, CommandOutput};
+    use crate::model::{
+        Algorithm, DerivationOverrides, Identity, IdentityModeResolution, Mode, ModePreference,
+        StateLayout, UseCase,
+    };
+    use crate::ops::prf::PRF_CONTEXT_PATH_METADATA_KEY;
+    use crate::ops::seed::{SeedCreateRequest, SeedMaterial};
+
+    use super::*;
+
+    struct FakeSeedBackend {
+        seed: Vec<u8>,
+    }
+
+    impl FakeSeedBackend {
+        fn new(seed: &[u8]) -> Self {
+            Self {
+                seed: seed.to_vec(),
+            }
+        }
+    }
+
+    impl SeedBackend for FakeSeedBackend {
+        fn seal_seed(&self, _request: &SeedCreateRequest) -> Result<()> {
+            Ok(())
+        }
+
+        fn unseal_seed(
+            &self,
+            _profile: &crate::ops::seed::SeedIdentity,
+            _auth_source: &crate::ops::seed::SeedOpenAuthSource,
+        ) -> Result<SeedMaterial> {
+            Ok(SecretBox::new(Box::new(self.seed.clone())))
+        }
+    }
+
+    struct RecordingPrfRunner {
+        raw_output: Vec<u8>,
+    }
+
+    impl RecordingPrfRunner {
+        fn new(raw_output: &[u8]) -> Self {
+            Self {
+                raw_output: raw_output.to_vec(),
+            }
+        }
+    }
+
+    impl CommandRunner for RecordingPrfRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            let output_path = invocation
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-o")
+                .map(|pair| PathBuf::from(&pair[1]))
+                .expect("prf output path");
+            std::fs::write(output_path, &self.raw_output).expect("write prf output");
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSshAddClient {
+        private_keys: RefCell<Vec<String>>,
+    }
+
+    impl RecordingSshAddClient {
+        fn keys(&self) -> Vec<String> {
+            self.private_keys.borrow().clone()
+        }
+    }
+
+    impl SshAddClient for RecordingSshAddClient {
+        fn add_private_key(&self, _socket: &Path, private_key_openssh: &str) -> Result<()> {
+            self.private_keys
+                .borrow_mut()
+                .push(private_key_openssh.to_string());
+            Ok(())
+        }
+    }
+
+    fn seed_identity(root: &Path) -> Identity {
+        Identity::new(
+            "seed-ssh".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Ssh],
+            IdentityModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            StateLayout::new(root.to_path_buf()),
+        )
+    }
+
+    fn prf_identity(root: &Path) -> Identity {
+        let mut identity = Identity::new(
+            "prf-ssh".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Ssh],
+            IdentityModeResolution {
+                requested: ModePreference::Prf,
+                resolved: Mode::Prf,
+                reasons: vec!["prf requested".to_string()],
+            },
+            StateLayout::new(root.to_path_buf()),
+        );
+        identity.metadata.insert(
+            PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+            format!("objects/{}/prf-root.ctx", identity.name),
+        );
+        identity
+    }
+
+    #[test]
+    fn ssh_add_seed_adds_private_key_to_agent_client() {
+        let temp = tempdir().expect("tempdir");
+        let identity = seed_identity(temp.path());
+        let client = RecordingSshAddClient::default();
+        let result = add_with_backend(
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
+                comment: Some("seed@test".to_string()),
+                socket: Some(temp.path().join("agent.sock")),
+                state_dir: Some(temp.path().to_path_buf()),
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x44; 32]),
+            &HkdfSha256SeedDeriver,
+            &client,
+        )
+        .expect("seed ssh-add");
+
+        assert_eq!(result.mode, Mode::Seed);
+        assert_eq!(result.comment, "seed@test");
+        assert!(result.public_key_openssh.starts_with("ssh-ed25519 "));
+        assert_eq!(client.keys().len(), 1);
+    }
+
+    #[test]
+    fn ssh_add_prf_adds_private_key_to_agent_client() {
+        let temp = tempdir().expect("tempdir");
+        let identity = prf_identity(temp.path());
+        let client = RecordingSshAddClient::default();
+        let result = add_with_backend(
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
+                comment: Some("prf@test".to_string()),
+                socket: Some(temp.path().join("agent.sock")),
+                state_dir: Some(temp.path().to_path_buf()),
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"tpm-prf-material"),
+            &FakeSeedBackend::new(&[0x00; 32]),
+            &HkdfSha256SeedDeriver,
+            &client,
+        )
+        .expect("prf ssh-add");
+
+        assert_eq!(result.mode, Mode::Prf);
+        assert!(result.public_key_openssh.starts_with("ecdsa-sha2-nistp256 "));
+        assert_eq!(client.keys().len(), 1);
+    }
+
+    #[test]
+    fn ssh_add_native_rejection_is_explicit() {
+        let temp = tempdir().expect("tempdir");
+        let identity = Identity::new(
+            "native-ssh".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Ssh],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            StateLayout::new(temp.path().to_path_buf()),
+        );
+        let error = add_with_backend(
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
+                comment: None,
+                socket: Some(temp.path().join("agent.sock")),
+                state_dir: Some(temp.path().to_path_buf()),
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x00; 32]),
+            &HkdfSha256SeedDeriver,
+            &RecordingSshAddClient::default(),
+        )
+        .expect_err("native ssh-add should fail");
+
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("native mode")));
+    }
+}
