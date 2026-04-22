@@ -16,8 +16,7 @@ impl CapabilityProbe for TssEsapiCapabilityProbe {
                 accessible: None,
             },
             native: NativeCapabilitySummary {
-                supported_algorithms: Vec::new(),
-                supported_uses: Vec::new(),
+                algorithms: Vec::new(),
             },
             prf_available: None,
             seed_available: None,

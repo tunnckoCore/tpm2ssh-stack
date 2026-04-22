@@ -9,7 +9,7 @@ mod tests {
     use crate::backend::{CapabilityProbe, HeuristicProbe};
     use crate::error::Error;
     use crate::model::{
-        Algorithm, CapabilityReport, Mode, ModePreference,
+        Algorithm, CapabilityReport, Mode, ModePreference, NativeAlgorithmCapability,
         NativeCapabilitySummary, SetupRequest, TpmStatus, UseCase,
     };
     use crate::ops;
@@ -36,8 +36,13 @@ mod tests {
                     accessible: Some(true),
                 },
                 native: NativeCapabilitySummary {
-                    supported_algorithms: vec![Algorithm::P256],
-                    supported_uses: vec![UseCase::Sign, UseCase::Verify],
+                    algorithms: vec![NativeAlgorithmCapability {
+                        algorithm: Algorithm::P256,
+                        sign: true,
+                        verify: true,
+                        encrypt: false,
+                        decrypt: false,
+                    }],
                 },
                 prf_available: Some(true),
                 seed_available: Some(true),
@@ -51,9 +56,12 @@ mod tests {
     // ── UseCase::validate_for_mode unit tests ───────────────────────
 
     #[test]
-    fn validate_prf_allows_ssh_agent_and_derive() {
-        UseCase::validate_for_mode(&[UseCase::SshAgent, UseCase::Derive], Mode::Prf)
-            .expect("prf should allow ssh-agent + derive");
+    fn validate_prf_allows_derive_encrypt_and_decrypt() {
+        UseCase::validate_for_mode(
+            &[UseCase::Derive, UseCase::Encrypt, UseCase::Decrypt],
+            Mode::Prf,
+        )
+        .expect("prf should allow derive + encrypt + decrypt");
     }
 
     #[test]
@@ -72,16 +80,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_prf_rejects_encrypt() {
-        let error = UseCase::validate_for_mode(&[UseCase::Encrypt], Mode::Prf)
-            .expect_err("prf should reject encrypt");
-        assert!(matches!(error, Error::PolicyRefusal(_)));
-    }
-
-    #[test]
-    fn validate_prf_rejects_decrypt() {
-        let error = UseCase::validate_for_mode(&[UseCase::Decrypt], Mode::Prf)
-            .expect_err("prf should reject decrypt");
+    fn validate_prf_rejects_ssh_agent() {
+        let error = UseCase::validate_for_mode(&[UseCase::SshAgent], Mode::Prf)
+            .expect_err("prf should reject ssh-agent until ssh-add is wired");
         assert!(matches!(error, Error::PolicyRefusal(_)));
     }
 
@@ -153,7 +154,10 @@ mod tests {
         )
         .expect_err("native + derive should fail at setup");
 
-        assert!(matches!(error, Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)));
+        assert!(matches!(
+            error,
+            Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)
+        ));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -173,7 +177,10 @@ mod tests {
         )
         .expect_err("native + ssh-agent should fail at setup");
 
-        assert!(matches!(error, Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)));
+        assert!(matches!(
+            error,
+            Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)
+        ));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -193,8 +200,11 @@ mod tests {
         )
         .expect_err("prf + sign should fail at setup");
 
-        assert!(matches!(error, Error::PolicyRefusal(_)));
-        assert!(error.to_string().contains("not allowed in Prf mode"));
+        assert!(matches!(
+            error,
+            Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)
+        ));
+        assert!(error.to_string().contains("PRF mode"));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -214,7 +224,10 @@ mod tests {
         )
         .expect_err("prf + verify should fail at setup");
 
-        assert!(matches!(error, Error::PolicyRefusal(_)));
+        assert!(matches!(
+            error,
+            Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)
+        ));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -285,13 +298,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
+    #[test]
+    fn auto_chooses_seed_when_prf_cannot_satisfy_signing_request() {
+        let root_dir = unique_temp_path("setup-auto-sign-seed");
+        let result = ops::resolve_profile(
+            &AlwaysAvailableProbe,
+            &SetupRequest {
+                profile: "test-auto-sign-seed".to_string(),
+                algorithm: Algorithm::Ed25519,
+                uses: vec![UseCase::Sign],
+                requested_mode: ModePreference::Auto,
+                state_dir: Some(root_dir.clone()),
+                dry_run: true,
+            },
+        )
+        .expect("auto should skip PRF and choose seed for sign support");
+
+        assert_eq!(result.profile.mode.resolved, Mode::Seed);
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn use_all_expands_for_native_setup() {
+        let root_dir = unique_temp_path("setup-native-all");
+        let result = ops::resolve_profile(
+            &HeuristicProbe,
+            &SetupRequest {
+                profile: "test-native-all".to_string(),
+                algorithm: Algorithm::P256,
+                uses: vec![UseCase::All],
+                requested_mode: ModePreference::Native,
+                state_dir: Some(root_dir.clone()),
+                dry_run: true,
+            },
+        )
+        .expect("native --use all should expand to supported native uses");
+
+        assert_eq!(result.profile.uses, vec![UseCase::Sign, UseCase::Verify]);
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
     // ── UseCase enum variant correctness ────────────────────────────
 
     #[test]
-    fn use_case_enum_has_exactly_six_variants() {
-        // Compile-time exhaustiveness: if this match becomes non-exhaustive
-        // the test will fail to compile, proving the enum surface is locked.
+    fn use_case_enum_has_exactly_seven_variants() {
         let all = [
+            UseCase::All,
             UseCase::Sign,
             UseCase::Verify,
             UseCase::SshAgent,
@@ -299,9 +351,8 @@ mod tests {
             UseCase::Encrypt,
             UseCase::Decrypt,
         ];
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
 
-        // Round-trip through serde to confirm no hidden variants.
         for use_case in &all {
             let json = serde_json::to_string(use_case).expect("serialize");
             let deserialized: UseCase = serde_json::from_str(&json).expect("deserialize");
@@ -311,7 +362,6 @@ mod tests {
 
     #[test]
     fn ssh_and_ethereum_variants_do_not_exist_in_serde() {
-        // These were removed; deserialization should fail.
         let error = serde_json::from_str::<UseCase>("\"ssh\"");
         assert!(error.is_err(), "\"ssh\" should not deserialize");
 

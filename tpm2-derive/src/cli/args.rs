@@ -375,6 +375,8 @@ pub enum AlgorithmArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum UseArg {
+    /// Expand to every currently supported use for the resolved mode.
+    All,
     /// Allow signing operations.
     Sign,
     /// Allow signature verification operations.
@@ -383,9 +385,9 @@ pub enum UseArg {
     Derive,
     /// Intended for ssh-agent loading.
     SshAgent,
-    /// Placeholder for future encryption usage.
+    /// Allow encryption operations.
     Encrypt,
-    /// Placeholder for future decryption usage.
+    /// Allow decryption operations.
     Decrypt,
 }
 
@@ -461,6 +463,29 @@ mod tests {
                 );
             }
             other => panic!("expected export command, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_parses_use_all() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "setup",
+            "--profile",
+            "prod-signer",
+            "--algorithm",
+            "p256",
+            "--use",
+            "all",
+        ])
+        .expect("cli should parse use=all");
+
+        match cli.command {
+            Command::Setup(args) => {
+                assert_eq!(args.uses.len(), 1);
+                assert!(matches!(args.uses[0], UseArg::All));
+            }
+            other => panic!("expected setup command, found {other:?}"),
         }
     }
 }

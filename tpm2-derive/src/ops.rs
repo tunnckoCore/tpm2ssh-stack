@@ -5,12 +5,12 @@
 
 pub mod derive;
 pub mod encrypt;
+mod enforcement;
 pub mod keygen;
 pub mod native;
 pub mod prf;
 pub mod seed;
 pub mod ssh;
-mod enforcement;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -29,6 +29,7 @@ use ssh_key::{
     public::{EcdsaPublicKey as SshEcdsaPublicKey, KeyData as SshKeyData},
 };
 
+use crate::backend::recommend::mode_rejection_reason;
 use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
@@ -36,11 +37,11 @@ use crate::model::{
     Algorithm, CapabilityReport, ExportArtifact, ExportFormat, ExportKind, ExportRequest,
     ExportResult, InspectRequest, Mode, ModePreference, ModeResolution, Profile,
     PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult, SetupRequest, SetupResult,
-    StateLayout, UseCase,
+    StateLayout, UseCase, expand_mode_requested_uses,
 };
 use crate::ops::native::subprocess::{
-    plan_export_public_key, plan_setup, NativeCommandSpec, NativeKeyLocator,
-    NativePersistentHandle, NativePublicKeyExportOptions, NativeSetupArtifacts,
+    NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
+    NativeSetupArtifacts, plan_export_public_key, plan_setup,
 };
 use crate::ops::native::{
     NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativeKeyRef, NativeKeyUse,
@@ -152,30 +153,49 @@ fn resolve_profile_with_seed_backend(
 fn build_setup_profile(probe: &dyn CapabilityProbe, request: &SetupRequest) -> Result<Profile> {
     validate_profile_name(&request.profile)?;
 
-    let uses = normalize_uses(request.uses.clone());
-    if uses.is_empty() {
+    let requested_uses = normalize_uses(request.uses.clone());
+    if requested_uses.is_empty() {
         return Err(Error::Validation(
             "at least one --use value is required for setup".to_string(),
         ));
     }
 
-    let report = probe.detect(Some(request.algorithm), &uses);
+    let report = probe.detect(Some(request.algorithm), &requested_uses);
     let resolved_mode = resolve_mode(
         probe,
         request.requested_mode,
         request.algorithm,
-        &uses,
+        &requested_uses,
         &report,
     )?;
+    let uses = expand_mode_requested_uses(
+        resolved_mode,
+        Some(request.algorithm),
+        &report.native,
+        &requested_uses,
+    );
+    if uses.is_empty() {
+        return Err(Error::CapabilityMismatch(format!(
+            "requested uses {:?} expand to an empty supported set for {resolved_mode:?} mode and {:?}",
+            requested_uses, request.algorithm
+        )));
+    }
 
-    // Enforce mode/use compatibility at setup time.
+    // Enforce mode/use compatibility at setup time after mode-aware expansion.
     UseCase::validate_for_mode(&uses, resolved_mode)?;
 
-    let reasons = if let Some(explicit) = request.requested_mode.explicit() {
+    let mut reasons = if let Some(explicit) = request.requested_mode.explicit() {
         vec![format!("mode explicitly requested as {explicit:?}")]
     } else {
         report.recommendation_reasons.clone()
     };
+
+    if requested_uses.iter().any(|use_case| use_case.is_all()) {
+        reasons.push(format!(
+            "expanded --use all for {resolved_mode:?} mode into {:?}",
+            uses
+        ));
+    }
 
     Ok(Profile::new(
         request.profile.clone(),
@@ -758,8 +778,12 @@ pub fn seed_valid_ec_scalar_bytes_standalone(
     })?;
 
     let is_valid: Box<dyn Fn(&[u8]) -> bool> = match algorithm {
-        Algorithm::P256 => Box::new(|candidate: &[u8]| p256::SecretKey::from_slice(candidate).is_ok()),
-        Algorithm::Secp256k1 => Box::new(|candidate: &[u8]| k256::SecretKey::from_slice(candidate).is_ok()),
+        Algorithm::P256 => {
+            Box::new(|candidate: &[u8]| p256::SecretKey::from_slice(candidate).is_ok())
+        }
+        Algorithm::Secp256k1 => {
+            Box::new(|candidate: &[u8]| k256::SecretKey::from_slice(candidate).is_ok())
+        }
         Algorithm::Ed25519 => return Ok(seed_bytes),
     };
 
@@ -1235,8 +1259,7 @@ fn spki_der_to_pem(spki_der: &[u8]) -> String {
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
 
     for chunk in bytes.chunks(3) {
@@ -1470,12 +1493,19 @@ fn resolve_mode(
 ) -> Result<Mode> {
     match requested_mode.explicit() {
         Some(mode) if probe.supports_mode(algorithm, uses, mode) => Ok(mode),
-        Some(mode) => Err(Error::CapabilityMismatch(format!(
-            "requested mode {mode:?} is not supported for {algorithm:?} with uses {uses:?}"
+        Some(mode) => Err(Error::CapabilityMismatch(mode_rejection_reason(
+            report, algorithm, uses, mode,
         ))),
-        None => report
-            .recommended_mode
-            .ok_or_else(|| Error::CapabilityMismatch("unable to recommend a mode".to_string())),
+        None => report.recommended_mode.ok_or_else(|| {
+            let reasons = [Mode::Native, Mode::Prf, Mode::Seed]
+                .into_iter()
+                .map(|mode| mode_rejection_reason(report, algorithm, uses, mode))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Error::CapabilityMismatch(format!(
+                "no single mode can satisfy {uses:?} for {algorithm:?}: {reasons}"
+            ))
+        }),
     }
 }
 
@@ -1576,12 +1606,14 @@ mod tests {
             result.profile.metadata.get("native.persistent_handle"),
             Some(&"0x81010002".to_string())
         );
-        assert!(!root_dir
-            .join("objects")
-            .join("prod-signer")
-            .join("native")
-            .join("setup-work")
-            .exists());
+        assert!(
+            !root_dir
+                .join("objects")
+                .join("prod-signer")
+                .join("native")
+                .join("setup-work")
+                .exists()
+        );
 
         let loaded = load_profile("prod-signer", Some(root_dir.clone())).expect("profile loads");
         assert_eq!(loaded, result.profile);
@@ -2142,8 +2174,7 @@ mod tests {
                         accessible: Some(true),
                     },
                     native: NativeCapabilitySummary {
-                        supported_algorithms: Vec::new(),
-                        supported_uses: Vec::new(),
+                        algorithms: Vec::new(),
                     },
                     prf_available: Some(true),
                     seed_available: Some(true),
@@ -2162,8 +2193,7 @@ mod tests {
                         accessible: Some(true),
                     },
                     native: NativeCapabilitySummary {
-                        supported_algorithms: Vec::new(),
-                        supported_uses: Vec::new(),
+                        algorithms: Vec::new(),
                     },
                     prf_available: Some(false),
                     seed_available: Some(true),

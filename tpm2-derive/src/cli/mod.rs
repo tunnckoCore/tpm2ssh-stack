@@ -68,6 +68,7 @@ impl From<AlgorithmArg> for Algorithm {
 impl From<UseArg> for UseCase {
     fn from(value: UseArg) -> Self {
         match value {
+            UseArg::All => Self::All,
             UseArg::Sign => Self::Sign,
             UseArg::Verify => Self::Verify,
             UseArg::Derive => Self::Derive,
