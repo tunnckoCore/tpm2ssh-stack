@@ -2,8 +2,6 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::{ExposeSecret, SecretSlice};
 use serde::{Deserialize, Serialize};
@@ -208,8 +206,9 @@ pub struct PrfRootLayout {
 }
 
 impl PrfRootLayout {
-    pub fn for_profile(objects_dir: &Path, identity: &str) -> Self {
-        Self::for_object_dir(objects_dir.join(identity))
+    pub fn for_profile(objects_dir: &Path, identity: &str) -> Result<Self> {
+        validate_identity_name(identity)?;
+        Ok(Self::for_object_dir(objects_dir.join(identity)))
     }
 
     fn for_object_dir(object_dir: PathBuf) -> Self {
@@ -247,7 +246,7 @@ impl<R> SubprocessPrfBackend<R> {
         &self.objects_dir
     }
 
-    pub fn root_layout(&self, identity: &str) -> PrfRootLayout {
+    pub fn root_layout(&self, identity: &str) -> Result<PrfRootLayout> {
         PrfRootLayout::for_profile(&self.objects_dir, identity)
     }
 }
@@ -264,7 +263,7 @@ where
             ))
         })?;
 
-        let final_layout = self.root_layout(identity);
+        let final_layout = self.root_layout(identity)?;
         if final_layout.object_dir.exists() {
             return Err(Error::State(format!(
                 "PRF root material already exists for identity '{}' at '{}'",
@@ -603,8 +602,15 @@ fn ensure_matching_execution_version(
 }
 
 fn create_secure_prf_workspace(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Err(Error::State(format!(
+            "refusing to use pre-existing TPM PRF workspace '{}'; a fresh secure workspace is required",
+            path.display()
+        )));
+    }
+
     let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
+    builder.recursive(false);
     #[cfg(unix)]
     builder.mode(0o700);
     builder.create(path).map_err(|error| {
@@ -657,25 +663,17 @@ fn write_secure_workspace_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn temp_workspace_root(identity: &str) -> Result<PathBuf> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    validate_identity_name(identity)?;
+    let tempdir = TempfileBuilder::new()
+        .prefix("tpm2-derive-prf-")
+        .tempdir()
         .map_err(|error| {
             Error::State(format!(
-                "system clock error while creating TPM PRF workspace: {error}"
+                "failed to allocate secure temporary TPM PRF workspace: {error}"
             ))
         })?;
-
-    let sanitized_profile = identity
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>();
-
-    Ok(std::env::temp_dir().join(format!(
-        "tpm2-derive-prf-{}-{}-{}",
-        process::id(),
-        sanitized_profile,
-        now.as_nanos()
-    )))
+    let path = tempdir.keep();
+    Ok(path)
 }
 
 fn classify_prf_setup_command_error(
@@ -749,6 +747,33 @@ fn preview(value: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn validate_identity_name(identity: &str) -> Result<()> {
+    if identity.trim().is_empty() {
+        return Err(Error::Validation(
+            "identity must not be empty for PRF operations".to_string(),
+        ));
+    }
+
+    if !identity
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(Error::Validation(
+            "identity may only contain ASCII letters, digits, '.', '_' or '-' for PRF operations"
+                .to_string(),
+        ));
+    }
+
+    if identity.contains("..") || identity.contains('/') || identity.contains('\\') {
+        return Err(Error::Validation(
+            "identity must not contain path traversal or separators for PRF operations"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn path_arg(path: &Path) -> String {
@@ -899,12 +924,15 @@ mod tests {
 
     fn temp_test_dir(label: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "tpm2-derive-prf-test-{}-{}",
+            "tpm2-derive-prf-test-{}-{}-{}",
             label,
-            std::process::id()
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
         path
     }
 

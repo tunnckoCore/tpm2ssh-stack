@@ -1244,6 +1244,12 @@ fn validate_profile_name(identity: &str) -> Result<()> {
         ));
     }
 
+    if identity.contains("..") || identity.contains('/') || identity.contains('\\') {
+        return Err(Error::Validation(
+            "identity name must not contain path traversal or separators".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
