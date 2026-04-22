@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -371,7 +371,7 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
         }
     };
 
-    let metadata = fs::metadata(&path).map_err(|error| {
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
         Error::State(format!(
             "ssh-add requires a valid agent socket path '{}': {error}",
             path.display()
@@ -380,11 +380,47 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
 
     #[cfg(unix)]
     {
-        if !metadata.file_type().is_socket() {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Err(Error::Validation(format!(
+                "ssh-add requires '{}' to be a direct Unix-domain socket path, not a symlink",
+                path.display()
+            )));
+        }
+        if !file_type.is_socket() {
             return Err(Error::Validation(format!(
                 "ssh-add requires '{}' to be a Unix-domain socket",
                 path.display()
             )));
+        }
+
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid {
+            return Err(Error::Validation(format!(
+                "ssh-add requires socket '{}' to be owned by the current user",
+                path.display()
+            )));
+        }
+
+        if let Some(parent) = path.parent() {
+            let parent_metadata = fs::metadata(parent).map_err(|error| {
+                Error::State(format!(
+                    "failed to inspect ssh-agent socket parent directory '{}': {error}",
+                    parent.display()
+                ))
+            })?;
+            if parent_metadata.uid() != current_uid {
+                return Err(Error::Validation(format!(
+                    "ssh-add requires socket parent directory '{}' to be owned by the current user",
+                    parent.display()
+                )));
+            }
+            if parent_metadata.permissions().mode() & 0o002 != 0 {
+                return Err(Error::Validation(format!(
+                    "ssh-add requires socket parent directory '{}' to not be world-writable",
+                    parent.display()
+                )));
+            }
         }
     }
 
@@ -518,6 +554,19 @@ mod tests {
             format!("objects/{}/prf-root.ctx", identity.name),
         );
         identity
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_socket_rejects_symlink_paths() {
+        let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let symlink_path = temp.path().join("agent-link.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        std::os::unix::fs::symlink(&socket_path, &symlink_path).expect("symlink");
+
+        let error = resolve_socket(Some(&symlink_path)).expect_err("symlink should be rejected");
+        assert!(matches!(error, Error::Validation(message) if message.contains("direct Unix-domain socket path")));
     }
 
     #[cfg(unix)]
