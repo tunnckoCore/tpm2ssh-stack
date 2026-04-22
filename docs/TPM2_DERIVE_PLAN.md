@@ -53,7 +53,7 @@ Typical uses:
 - WebAuthn-adjacent PRF/HMAC extension support
 
 ### 3) `seed`
-Keep one high-entropy seed sealed in the TPM, then derive child material in software/userland.
+Generates and keep high-entropy seed that gets sealed in the TPM on setup, then derive child material in software/userland.
 
 Target properties:
 - seed is TPM-protected at rest
