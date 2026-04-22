@@ -137,8 +137,9 @@ tpm2-derive derive \
 tpm2-derive export \
   --with app-prf \
   --kind public-key \
-  --format spki-pem \
+  --format pem \
   --output app-prf.pem
+
 
 tpm2-derive ssh-add --with app-prf --org com.example --context account=prod
 ```
@@ -169,7 +170,7 @@ tpm2-derive export \
 tpm2-derive export \
   --with backup-seed \
   --kind keypair \
-  --format base64 \
+  --format pem \
   --confirm \
   --reason "hardware migration" \
   --output backup-seed.keypair.json
@@ -180,5 +181,8 @@ tpm2-derive export \
 
 - `--use all` expands according to the resolved mode and the native capability matrix.
 - `ssh-add` is intentionally separate from `use=ssh` and rejects native identities.
+- `export --kind public-key --format hex|base64` emits raw public key bytes (Ed25519 raw key bytes; secp curves as uncompressed SEC1 bytes), not SPKI-wrapped bytes.
+- `export --format openssh` is currently wired for the SSH-capable key shapes in this project (ed25519 and p256), not secp256k1.
+- `export --kind keypair` always writes JSON with explicit `private_key` and `public_key` entries, and each entry declares its own emitted format.
 - The legacy `keygen` command is no longer part of the public ADR surface; use `export --kind ...` instead.
 - The accepted ADR for this CLI is in `decisions/2026-04-22-unify-cli-surface-across-native-prf-seed.md`.

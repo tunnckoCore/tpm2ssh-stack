@@ -44,16 +44,24 @@ impl DerivationOverrides {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum BinaryOutputFormat {
+pub enum Format {
+    Der,
+    Pem,
+    Openssh,
+    EthereumAddress,
     Hex,
     Base64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum BinaryInputFormat {
+pub enum InputFormat {
     Auto,
     Raw,
+    Der,
+    Pem,
+    Openssh,
+    EthereumAddress,
     Hex,
     Base64,
 }
@@ -63,7 +71,7 @@ pub struct DeriveRequest {
     pub identity: String,
     pub derivation: DerivationOverrides,
     pub length: u16,
-    pub format: BinaryOutputFormat,
+    pub format: Format,
     pub output: Option<PathBuf>,
 }
 
@@ -72,7 +80,7 @@ pub struct DeriveResult {
     pub identity: String,
     pub mode: Mode,
     pub length: u16,
-    pub format: BinaryOutputFormat,
+    pub format: Format,
     pub output_path: Option<PathBuf>,
     pub bytes_written: usize,
     pub material: Option<String>,
@@ -82,7 +90,7 @@ pub struct DeriveResult {
 pub struct SignRequest {
     pub identity: String,
     pub input: InputSource,
-    pub format: BinaryOutputFormat,
+    pub format: Format,
     pub output: Option<PathBuf>,
 }
 
@@ -91,7 +99,7 @@ pub struct VerifyRequest {
     pub identity: String,
     pub input: InputSource,
     pub signature: InputSource,
-    pub format: BinaryInputFormat,
+    pub format: InputFormat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -146,7 +154,7 @@ pub struct ExportRequest {
     pub identity: String,
     pub kind: ExportKind,
     pub output: Option<PathBuf>,
-    pub format: Option<ExportFormatRequest>,
+    pub format: Option<Format>,
     pub state_dir: Option<PathBuf>,
     pub reason: Option<String>,
     pub confirm: bool,
@@ -155,63 +163,18 @@ pub struct ExportRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum PublicKeyExportFormat {
-    SpkiDer,
-    SpkiPem,
-    SpkiHex,
-    Openssh,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ExportFormatRequest {
-    SpkiDer,
-    SpkiPem,
-    SpkiHex,
-    Openssh,
-    Hex,
-    Base64,
-    Json,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
 pub enum ExportFormat {
     SpkiDer,
     SpkiPem,
-    SpkiHex,
+    Sec1Der,
+    Sec1Pem,
+    Pkcs8Der,
+    Pkcs8Pem,
     Openssh,
+    EthereumAddress,
     Hex,
     Base64,
-    KeypairJsonHex,
-    KeypairJsonBase64,
-}
-
-impl From<PublicKeyExportFormat> for ExportFormat {
-    fn from(value: PublicKeyExportFormat) -> Self {
-        match value {
-            PublicKeyExportFormat::SpkiDer => Self::SpkiDer,
-            PublicKeyExportFormat::SpkiPem => Self::SpkiPem,
-            PublicKeyExportFormat::SpkiHex => Self::SpkiHex,
-            PublicKeyExportFormat::Openssh => Self::Openssh,
-        }
-    }
-}
-
-impl TryFrom<ExportFormatRequest> for PublicKeyExportFormat {
-    type Error = crate::error::Error;
-
-    fn try_from(value: ExportFormatRequest) -> Result<Self, Self::Error> {
-        match value {
-            ExportFormatRequest::SpkiDer => Ok(Self::SpkiDer),
-            ExportFormatRequest::SpkiPem => Ok(Self::SpkiPem),
-            ExportFormatRequest::SpkiHex => Ok(Self::SpkiHex),
-            ExportFormatRequest::Openssh => Ok(Self::Openssh),
-            other => Err(crate::error::Error::Validation(format!(
-                "export format '{other:?}' is not valid for --kind public-key"
-            ))),
-        }
-    }
+    Json,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

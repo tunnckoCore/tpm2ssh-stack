@@ -13,7 +13,7 @@ use super::seed::{
     seed_profile_from_profile,
 };
 use super::shared::{
-    derive_command_spec, encode_output_bytes, execute_prf_derivation_with_runner,
+    derive_command_spec, encode_textual_output_bytes, execute_prf_derivation_with_runner,
     resolve_effective_derivation_inputs, write_output_file,
 };
 
@@ -125,11 +125,20 @@ fn build_result(
     identity: &Identity,
     mode: Mode,
     length: u16,
-    format: crate::model::BinaryOutputFormat,
+    format: crate::model::Format,
     output: Option<&Path>,
     material: &[u8],
 ) -> Result<DeriveResult> {
-    let encoded = encode_output_bytes(format, material);
+    if !matches!(
+        format,
+        crate::model::Format::Hex | crate::model::Format::Base64
+    ) {
+        return Err(Error::Validation(
+            "derive formats are: hex, base64".to_string(),
+        ));
+    }
+
+    let encoded = encode_textual_output_bytes(format, material)?;
 
     match output {
         Some(path) => {
@@ -210,7 +219,7 @@ mod tests {
 
     use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
     use crate::model::{
-        Algorithm, BinaryOutputFormat, DerivationOverrides, Identity, IdentityModeResolution, Mode,
+        Algorithm, DerivationOverrides, Format, Identity, IdentityModeResolution, Mode,
         ModePreference, StateLayout, UseCase,
     };
     use crate::ops::prf::{PRF_CONTEXT_PATH_METADATA_KEY, PrfRequest, RawPrfOutput, finalize};
@@ -279,7 +288,7 @@ mod tests {
             identity: identity.name.clone(),
             derivation: DerivationOverrides::default(),
             length: 32,
-            format: BinaryOutputFormat::Hex,
+            format: Format::Hex,
             output: None,
         };
 

@@ -276,6 +276,33 @@ fn derive_p256_private_key(
     })
 }
 
+pub(crate) fn openssh_private_key_from_material(
+    identity: &Identity,
+    material: &[u8],
+    comment: &str,
+) -> Result<String> {
+    let private_key = match identity.algorithm {
+        Algorithm::Ed25519 => derive_ed25519_private_key(identity, material, comment)?,
+        Algorithm::P256 => derive_p256_private_key(identity, material, comment)?,
+        Algorithm::Secp256k1 => {
+            return Err(Error::Unsupported(
+                "OpenSSH private-key rendering is not supported for secp256k1 identities"
+                    .to_string(),
+            ));
+        }
+    };
+
+    private_key
+        .to_openssh(LineEnding::LF)
+        .map(|value| value.to_string())
+        .map_err(|error| {
+            Error::Internal(format!(
+                "failed to render OpenSSH private key for identity '{}': {error}",
+                identity.name
+            ))
+        })
+}
+
 pub(crate) fn openssh_public_key_from_material(
     identity: &Identity,
     material: &[u8],
@@ -366,7 +393,7 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
                 return Err(Error::State(
                     "ssh-add requires --socket or SSH_AUTH_SOCK to point at a running agent"
                         .to_string(),
-                ))
+                ));
             }
         }
     };
@@ -430,9 +457,9 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
 
     use secrecy::SecretBox;
     use tempfile::tempdir;
@@ -566,7 +593,9 @@ mod tests {
         std::os::unix::fs::symlink(&socket_path, &symlink_path).expect("symlink");
 
         let error = resolve_socket(Some(&symlink_path)).expect_err("symlink should be rejected");
-        assert!(matches!(error, Error::Validation(message) if message.contains("direct Unix-domain socket path")));
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("direct Unix-domain socket path"))
+        );
     }
 
     #[cfg(unix)]
@@ -577,7 +606,9 @@ mod tests {
         std::fs::write(&file_path, b"nope").expect("file");
 
         let error = resolve_socket(Some(&file_path)).expect_err("non-socket should be rejected");
-        assert!(matches!(error, Error::Validation(message) if message.contains("Unix-domain socket")));
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("Unix-domain socket"))
+        );
     }
 
     #[cfg(unix)]
@@ -646,7 +677,11 @@ mod tests {
         .expect("prf ssh-add");
 
         assert_eq!(result.mode, Mode::Prf);
-        assert!(result.public_key_openssh.starts_with("ecdsa-sha2-nistp256 "));
+        assert!(
+            result
+                .public_key_openssh
+                .starts_with("ecdsa-sha2-nistp256 ")
+        );
         assert_eq!(client.keys().len(), 1);
     }
 

@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     version,
     about = "TPM-backed identity operations with native, PRF, and seed modes",
     long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind secret-key --format base64 --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format base64 --confirm --reason \"hardware migration\" --output app-prf.json"
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind secret-key --format der --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format pem --confirm --reason \"hardware migration\" --output app-prf.json"
 )]
 pub struct Cli {
     #[arg(
@@ -113,10 +113,10 @@ pub struct DeriveArgs {
     #[arg(
         long = "format",
         value_enum,
-        default_value_t = BinaryOutputFormatArg::Hex,
+        default_value_t = DeriveFormatArg::Hex,
         help = "Output format for derived bytes"
     )]
-    pub format: BinaryOutputFormatArg,
+    pub format: DeriveFormatArg,
     #[arg(
         long,
         help = "Write derived output to a file instead of returning it inline"
@@ -145,10 +145,10 @@ pub struct SignArgs {
     #[arg(
         long = "format",
         value_enum,
-        default_value_t = BinaryOutputFormatArg::Hex,
-        help = "Output format for the emitted signature"
+        default_value_t = SignFormatArg::Hex,
+        help = "Output format for the emitted signature (der is for ECDSA signatures; ed25519 uses hex/base64)"
     )]
-    pub format: BinaryOutputFormatArg,
+    pub format: SignFormatArg,
     #[arg(
         long,
         help = "Write the signature to a file instead of returning it inline"
@@ -179,10 +179,10 @@ pub struct VerifyArgs {
     #[arg(
         long = "format",
         value_enum,
-        default_value_t = BinaryInputFormatArg::Auto,
-        help = "Input format for the signature data"
+        default_value_t = VerifyFormatArg::Auto,
+        help = "Input format for the signature data (der is for ECDSA signatures; ed25519 uses hex/base64 or auto)"
     )]
-    pub format: BinaryInputFormatArg,
+    pub format: VerifyFormatArg,
     #[arg(
         long,
         help = "Override the state root directory instead of the default local state path"
@@ -248,7 +248,7 @@ pub struct ExportArgs {
     #[arg(
         long = "format",
         value_enum,
-        help = "Artifact format; valid values depend on --kind (public-key: spki-der|spki-pem|spki-hex|openssh, secret-key: hex|base64, keypair: hex|base64 inside JSON)"
+        help = "Artifact format; valid values depend on --kind (public-key: der|pem|openssh [ed25519/p256 only]|ethereum-address [secp256k1 only]|hex|base64, secret-key: der|pem|openssh [ed25519/p256 only]|hex|base64, keypair: der|pem|openssh [ed25519/p256 only]|hex|base64 inside JSON; public-key hex/base64 use raw public bytes)"
     )]
     pub format: Option<ExportFormatArg>,
     #[arg(long, help = "Destination file path")]
@@ -345,7 +345,7 @@ pub enum ExportKindArg {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum BinaryOutputFormatArg {
+pub enum DeriveFormatArg {
     /// Write lowercase hexadecimal text.
     Hex,
     /// Write base64 text.
@@ -353,12 +353,22 @@ pub enum BinaryOutputFormatArg {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-pub enum BinaryInputFormatArg {
+pub enum SignFormatArg {
+    /// Write binary DER when that signature has a DER representation.
+    Der,
+    /// Write lowercase hexadecimal text.
+    Hex,
+    /// Write base64 text.
+    Base64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum VerifyFormatArg {
     /// Auto-detect hex/base64 text and otherwise treat the signature as raw bytes.
     Auto,
-    /// Treat the signature input as raw bytes.
-    Raw,
-    /// Treat the signature input as lowercase or uppercase hexadecimal text.
+    /// Treat the signature as DER when supported.
+    Der,
+    /// Treat the signature input as hexadecimal text.
     Hex,
     /// Treat the signature input as base64 text.
     Base64,
@@ -366,20 +376,18 @@ pub enum BinaryInputFormatArg {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 pub enum ExportFormatArg {
-    /// Write binary SubjectPublicKeyInfo DER.
-    SpkiDer,
-    /// Write PEM-armored SubjectPublicKeyInfo.
-    SpkiPem,
-    /// Write lowercase hexadecimal SubjectPublicKeyInfo DER.
-    SpkiHex,
-    /// Write an OpenSSH public key line.
+    /// Write DER.
+    Der,
+    /// Write PEM.
+    Pem,
+    /// Write an OpenSSH-formatted key.
     Openssh,
+    /// Write an Ethereum address for a secp256k1 public key.
+    EthereumAddress,
     /// Write lowercase hexadecimal text.
     Hex,
     /// Write base64 text.
     Base64,
-    /// Write JSON.
-    Json,
 }
 
 pub fn parse_key_value(value: &str) -> Result<(String, String), String> {
@@ -457,7 +465,7 @@ mod tests {
                     args.derivation.context,
                     vec![("tenant".to_string(), "alpha".to_string())]
                 );
-                assert_eq!(args.format, BinaryOutputFormatArg::Base64);
+                assert_eq!(args.format, DeriveFormatArg::Base64);
                 assert_eq!(args.output, Some(PathBuf::from("derived.txt")));
             }
             other => panic!("expected derive command, found {other:?}"),
@@ -492,7 +500,7 @@ mod tests {
         match sign.command {
             Command::Sign(args) => {
                 assert_eq!(args.identity, "prod-signer");
-                assert_eq!(args.format, BinaryOutputFormatArg::Base64);
+                assert_eq!(args.format, SignFormatArg::Base64);
                 assert_eq!(args.output, Some(PathBuf::from("sig.txt")));
             }
             other => panic!("expected sign command, found {other:?}"),
@@ -513,7 +521,7 @@ mod tests {
         match verify.command {
             Command::Verify(args) => {
                 assert_eq!(args.identity, "prod-signer");
-                assert_eq!(args.format, BinaryInputFormatArg::Base64);
+                assert_eq!(args.format, VerifyFormatArg::Base64);
             }
             other => panic!("expected verify command, found {other:?}"),
         }

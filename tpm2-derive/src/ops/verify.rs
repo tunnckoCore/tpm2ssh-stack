@@ -12,8 +12,8 @@ use tempfile::Builder as TempfileBuilder;
 use crate::backend::{CommandInvocation, CommandRunner, ProcessCommandRunner};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, BinaryInputFormat, DerivationOverrides, Diagnostic, Identity, InputSource, Mode,
-    UseCase, VerifyRequest,
+    Algorithm, DerivationOverrides, Diagnostic, Identity, InputFormat, InputSource, Mode, UseCase,
+    VerifyRequest,
 };
 use crate::ops::keygen::{derive_identity_key_material_with_defaults, hex_encode};
 use crate::ops::native::{NativeKeyRef, NativePublicKeyEncoding, NativePublicKeyExportRequest};
@@ -52,7 +52,7 @@ pub struct VerifyOperationResult {
     pub digest_algorithm: crate::ops::native::DigestAlgorithm,
     pub digest_hex: String,
     pub input_bytes: usize,
-    pub signature_input_format: BinaryInputFormat,
+    pub signature_input_format: InputFormat,
     pub signature_bytes: usize,
     pub signature_format: VerifySignatureFormat,
 }
@@ -208,7 +208,11 @@ where
     let digest = Sha256::digest(&input_bytes).to_vec();
     let public_key_der = export_native_public_key_der_with_runner(identity, runner)?;
     let verifying_key = load_p256_verifying_key(&public_key_der)?;
-    let (signature, signature_format) = parse_p256_verify_signature(&signature_bytes)?;
+    let (signature, signature_format) = if request.format == InputFormat::Der {
+        parse_p256_verify_signature_der_only(&signature_bytes)?
+    } else {
+        parse_p256_verify_signature(&signature_bytes)?
+    };
     let verified = verifying_key.verify(&input_bytes, &signature).is_ok();
 
     Ok((
@@ -319,7 +323,7 @@ fn verify_seed_ed25519(
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
-    signature_input_format: BinaryInputFormat,
+    signature_input_format: InputFormat,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let seed_bytes: [u8; 32] = derived_seed.try_into().map_err(|_| {
@@ -328,7 +332,13 @@ fn verify_seed_ed25519(
         )
     })?;
     let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
-    let (signature, signature_format) = parse_ed25519_verify_signature(signature_bytes)?;
+    let (signature, signature_format) = match request.format {
+        InputFormat::Der => return Err(Error::Validation(
+            "verify --format der is not supported for ed25519 signatures; use hex, base64, or auto"
+                .to_string(),
+        )),
+        _ => parse_ed25519_verify_signature(signature_bytes)?,
+    };
     let verified = signing_key
         .verifying_key()
         .verify_strict(input_bytes, &signature)
@@ -358,7 +368,7 @@ fn verify_seed_p256(
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
-    signature_input_format: BinaryInputFormat,
+    signature_input_format: InputFormat,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let scalar_bytes =
@@ -370,7 +380,11 @@ fn verify_seed_p256(
         ))
     })?;
     let verifying_key = signing_key.verifying_key();
-    let (signature, signature_format) = parse_p256_verify_signature(signature_bytes)?;
+    let (signature, signature_format) = if request.format == InputFormat::Der {
+        parse_p256_verify_signature_der_only(signature_bytes)?
+    } else {
+        parse_p256_verify_signature(signature_bytes)?
+    };
     let verified = verifying_key.verify(input_bytes, &signature).is_ok();
 
     Ok((
@@ -397,7 +411,7 @@ fn verify_seed_secp256k1(
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
-    signature_input_format: BinaryInputFormat,
+    signature_input_format: InputFormat,
     diagnostics: Vec<Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let scalar_bytes =
@@ -409,7 +423,11 @@ fn verify_seed_secp256k1(
         ))
     })?;
     let verifying_key = signing_key.verifying_key();
-    let (signature, signature_format) = parse_k256_verify_signature(signature_bytes)?;
+    let (signature, signature_format) = if request.format == InputFormat::Der {
+        parse_k256_verify_signature_der_only(signature_bytes)?
+    } else {
+        parse_k256_verify_signature(signature_bytes)?
+    };
     let verified =
         k256::ecdsa::signature::Verifier::verify(verifying_key, input_bytes, &signature).is_ok();
 
@@ -570,6 +588,18 @@ fn parse_p256_verify_signature(
     ))
 }
 
+fn parse_p256_verify_signature_der_only(
+    signature_bytes: &[u8],
+) -> Result<(P256Signature, VerifySignatureFormat)> {
+    P256Signature::from_der(signature_bytes)
+        .map(|signature| (signature, VerifySignatureFormat::Der))
+        .map_err(|_| {
+            Error::Validation(
+                "verify --format der requires an ASN.1 DER ECDSA signature for p256".to_string(),
+            )
+        })
+}
+
 fn parse_k256_verify_signature(
     signature_bytes: &[u8],
 ) -> Result<(K256Signature, VerifySignatureFormat)> {
@@ -585,6 +615,19 @@ fn parse_k256_verify_signature(
         "verify signature must be either ASN.1 DER ECDSA or 64-byte P1363 for secp256k1"
             .to_string(),
     ))
+}
+
+fn parse_k256_verify_signature_der_only(
+    signature_bytes: &[u8],
+) -> Result<(K256Signature, VerifySignatureFormat)> {
+    K256Signature::from_der(signature_bytes)
+        .map(|signature| (signature, VerifySignatureFormat::Der))
+        .map_err(|_| {
+            Error::Validation(
+                "verify --format der requires an ASN.1 DER ECDSA signature for secp256k1"
+                    .to_string(),
+            )
+        })
 }
 
 fn parse_ed25519_verify_signature(
@@ -635,7 +678,7 @@ mod tests {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path { path: sig_path },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &DerivationOverrides {
                 org: Some("com.example".to_string()),

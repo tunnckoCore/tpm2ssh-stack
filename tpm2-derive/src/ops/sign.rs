@@ -12,8 +12,7 @@ use crate::backend::{CommandInvocation, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, BinaryOutputFormat, DerivationOverrides, Diagnostic, Identity, Mode, SignRequest,
-    UseCase,
+    Algorithm, DerivationOverrides, Diagnostic, Format, Identity, Mode, SignRequest, UseCase,
 };
 use crate::ops::keygen::{derive_identity_key_material_with_defaults, hex_encode};
 use crate::ops::native::subprocess::{
@@ -33,8 +32,8 @@ use crate::ops::seed::{
 use secrecy::ExposeSecret;
 
 use super::shared::{
-    classify_native_command_failure, encode_output_bytes, ensure_derivation_overrides_allowed,
-    ensure_dir, load_input_bytes, write_output_file,
+    classify_native_command_failure, encode_textual_output_bytes,
+    ensure_derivation_overrides_allowed, ensure_dir, load_input_bytes, write_output_file,
 };
 
 #[cfg(test)]
@@ -51,7 +50,7 @@ pub struct NativeSignOperationResult {
     pub digest_algorithm: DigestAlgorithm,
     pub input_bytes: usize,
     pub digest_path: PathBuf,
-    pub output_format: BinaryOutputFormat,
+    pub output_format: Format,
     pub output_path: Option<PathBuf>,
     pub signature_bytes: Option<usize>,
     pub signature: Option<String>,
@@ -67,7 +66,7 @@ pub struct DerivedSignOperationResult {
     pub digest_algorithm: DigestAlgorithm,
     pub digest_hex: String,
     pub input_bytes: usize,
-    pub output_format: BinaryOutputFormat,
+    pub output_format: Format,
     pub output_path: Option<PathBuf>,
     pub signature_bytes: usize,
     pub signature: Option<String>,
@@ -117,6 +116,7 @@ where
     R: CommandRunner,
 {
     ensure_derivation_overrides_allowed(identity, derivation)?;
+    validate_sign_output_format(identity, request.format, request.output.as_deref())?;
 
     match identity.mode.resolved {
         Mode::Native => {
@@ -193,6 +193,8 @@ where
         ));
     }
 
+    validate_sign_output_format(identity, request.format, request.output.as_deref())?;
+
     let derived = derive_identity_key_material_with_defaults(identity, derivation, runner)?;
     let digest = Sha256::digest(&input_bytes).to_vec();
     let diagnostics = vec![Diagnostic::info(
@@ -256,6 +258,8 @@ where
             "sign input must not be empty".to_string(),
         ));
     }
+
+    validate_sign_output_format(identity, request.format, request.output.as_deref())?;
 
     let seed_request = seed_sign_open_request(identity)?;
     let seed_plan = plan_open(&seed_request)?;
@@ -635,17 +639,35 @@ fn persist_formatted_signature(
     signature_bytes: &[u8],
     cleanup_path: Option<&std::path::Path>,
 ) -> Result<(Option<PathBuf>, Option<String>)> {
-    let encoded = encode_output_bytes(request.format, signature_bytes);
-    let result = match request.output.as_deref() {
-        Some(path) => write_output_file(path, &encoded).map(|()| (Some(path.to_path_buf()), None)),
-        None => String::from_utf8(encoded)
-            .map(|text| (None, Some(text)))
-            .map_err(|error| {
-                Error::State(format!(
-                    "formatted sign output for identity '{}' could not be rendered as text: {error}",
-                    identity.name
-                ))
-            }),
+    let result = match request.format {
+        Format::Der => match request.output.as_deref() {
+            Some(path) => {
+                write_output_file(path, signature_bytes).map(|()| (Some(path.to_path_buf()), None))
+            }
+            None => Err(Error::Validation(
+                "sign --format der requires --output because DER signature output is binary"
+                    .to_string(),
+            )),
+        },
+        Format::Hex | Format::Base64 => {
+            let encoded = encode_textual_output_bytes(request.format, signature_bytes)?;
+            match request.output.as_deref() {
+                Some(path) => {
+                    write_output_file(path, &encoded).map(|()| (Some(path.to_path_buf()), None))
+                }
+                None => String::from_utf8(encoded)
+                    .map(|text| (None, Some(text)))
+                    .map_err(|error| {
+                        Error::State(format!(
+                            "formatted sign output for identity '{}' could not be rendered as text: {error}",
+                            identity.name
+                        ))
+                    }),
+            }
+        }
+        Format::Pem | Format::Openssh | Format::EthereumAddress => Err(Error::Validation(
+            "sign formats are: der, hex, base64".to_string(),
+        )),
     };
 
     if let Some(path) = cleanup_path {
@@ -653,6 +675,34 @@ fn persist_formatted_signature(
     }
 
     result
+}
+
+fn validate_sign_output_format(
+    identity: &Identity,
+    format: Format,
+    output: Option<&std::path::Path>,
+) -> Result<()> {
+    match format {
+        Format::Hex | Format::Base64 => Ok(()),
+        Format::Der => {
+            if identity.algorithm == Algorithm::Ed25519 {
+                return Err(Error::Validation(
+                    "sign --format der is not supported for ed25519 signatures; use hex or base64"
+                        .to_string(),
+                ));
+            }
+            if output.is_none() {
+                return Err(Error::Validation(
+                    "sign --format der requires --output because DER signature output is binary"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+        Format::Pem | Format::Openssh | Format::EthereumAddress => Err(Error::Validation(
+            "sign formats are: der, hex, base64".to_string(),
+        )),
+    }
 }
 
 fn load_sign_input(input: &crate::model::InputSource) -> Result<Vec<u8>> {
@@ -691,7 +741,7 @@ mod tests {
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &DerivationOverrides {

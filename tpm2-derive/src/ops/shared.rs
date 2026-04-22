@@ -11,8 +11,7 @@ use crate::crypto::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, BinaryInputFormat, BinaryOutputFormat, DerivationOverrides, Identity, InputSource,
-    Mode,
+    Algorithm, DerivationOverrides, Format, Identity, InputFormat, InputSource, Mode,
 };
 
 use super::prf::{
@@ -283,40 +282,50 @@ pub(crate) fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u
     }
 }
 
-pub(crate) fn encode_output_bytes(format: BinaryOutputFormat, bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_textual_output_bytes(format: Format, bytes: &[u8]) -> Result<Vec<u8>> {
     match format {
-        BinaryOutputFormat::Hex => hex_encode(bytes).into_bytes(),
-        BinaryOutputFormat::Base64 => base64_encode(bytes).into_bytes(),
+        Format::Hex => Ok(hex_encode(bytes).into_bytes()),
+        Format::Base64 => Ok(base64_encode(bytes).into_bytes()),
+        Format::Der => Ok(bytes.to_vec()),
+        Format::Pem | Format::Openssh | Format::EthereumAddress => Err(Error::Validation(format!(
+            "format '{format:?}' is not valid for this output"
+        ))),
     }
 }
 
 pub(crate) fn decode_input_bytes(
-    format: BinaryInputFormat,
+    format: InputFormat,
     bytes: &[u8],
     label: &str,
-) -> Result<(Vec<u8>, BinaryInputFormat)> {
+) -> Result<(Vec<u8>, InputFormat)> {
     match format {
-        BinaryInputFormat::Raw => Ok((bytes.to_vec(), BinaryInputFormat::Raw)),
-        BinaryInputFormat::Hex => Ok((decode_hex_text(bytes, label)?, BinaryInputFormat::Hex)),
-        BinaryInputFormat::Base64 => {
-            Ok((decode_base64_text(bytes, label)?, BinaryInputFormat::Base64))
-        }
-        BinaryInputFormat::Auto => {
+        InputFormat::Raw => Ok((bytes.to_vec(), InputFormat::Raw)),
+        InputFormat::Der => Ok((bytes.to_vec(), InputFormat::Der)),
+        InputFormat::Hex => Ok((decode_hex_text(bytes, label)?, InputFormat::Hex)),
+        InputFormat::Base64 => Ok((decode_base64_text(bytes, label)?, InputFormat::Base64)),
+        InputFormat::Auto => {
             if let Ok(decoded) = decode_hex_text(bytes, label) {
-                return Ok((decoded, BinaryInputFormat::Hex));
+                return Ok((decoded, InputFormat::Hex));
             }
             if let Ok(decoded) = decode_base64_text(bytes, label) {
-                return Ok((decoded, BinaryInputFormat::Base64));
+                return Ok((decoded, InputFormat::Base64));
             }
-            Ok((bytes.to_vec(), BinaryInputFormat::Raw))
+            Ok((bytes.to_vec(), InputFormat::Raw))
         }
+        InputFormat::Pem | InputFormat::Openssh | InputFormat::EthereumAddress => Err(
+            Error::Validation(format!("format '{format:?}' is not valid for {label}")),
+        ),
     }
 }
 
-pub(crate) fn output_format_extension(format: BinaryOutputFormat) -> &'static str {
+pub(crate) fn output_format_extension(format: Format) -> &'static str {
     match format {
-        BinaryOutputFormat::Hex => "hex",
-        BinaryOutputFormat::Base64 => "base64",
+        Format::Der => "der",
+        Format::Pem => "pem",
+        Format::Openssh => "openssh",
+        Format::EthereumAddress => "ethaddr",
+        Format::Hex => "hex",
+        Format::Base64 => "base64",
     }
 }
 

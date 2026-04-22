@@ -7,9 +7,9 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use args::{
-    AlgorithmArg, BinaryInputFormatArg, BinaryOutputFormatArg, DecryptArgs, DeriveArgs,
-    EncryptArgs, ExportArgs, ExportFormatArg, ExportKindArg, IdentityArgs, InspectArgs, ModeArg,
-    SignArgs, SshAddArgs, UseArg, VerifyArgs,
+    AlgorithmArg, DecryptArgs, DeriveArgs, DeriveFormatArg, EncryptArgs, ExportArgs,
+    ExportFormatArg, ExportKindArg, IdentityArgs, InspectArgs, ModeArg, SignArgs, SignFormatArg,
+    SshAddArgs, UseArg, VerifyArgs, VerifyFormatArg,
 };
 pub use args::{Cli, Command};
 use render::{failure, success, success_with_diagnostics};
@@ -17,10 +17,10 @@ use render::{failure, success, success_with_diagnostics};
 use crate::backend::{CapabilityProbe, CommandRunner, ProcessCommandRunner, default_probe};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, BinaryInputFormat, BinaryOutputFormat, CommandPath, DecryptRequest,
-    DerivationOverrides, DeriveRequest, EncryptRequest, ErrorEnvelope, ExportFormatRequest,
-    ExportKind, ExportRequest, IdentityCreateRequest, InputSource, InspectRequest, ModePreference,
-    PendingOperation, PublicKeyExportFormat, SignRequest, SshAddRequest, UseCase, VerifyRequest,
+    Algorithm, CommandPath, DecryptRequest, DerivationOverrides, DeriveRequest, EncryptRequest,
+    ErrorEnvelope, ExportKind, ExportRequest, Format, IdentityCreateRequest, InputFormat,
+    InputSource, InspectRequest, ModePreference, PendingOperation, SignRequest, SshAddRequest,
+    UseCase, VerifyRequest,
 };
 use crate::ops;
 use crate::ops::sign::SignOperationResult;
@@ -85,48 +85,45 @@ impl From<ExportKindArg> for ExportKind {
     }
 }
 
-impl From<BinaryOutputFormatArg> for BinaryOutputFormat {
-    fn from(value: BinaryOutputFormatArg) -> Self {
+impl From<DeriveFormatArg> for Format {
+    fn from(value: DeriveFormatArg) -> Self {
         match value {
-            BinaryOutputFormatArg::Hex => Self::Hex,
-            BinaryOutputFormatArg::Base64 => Self::Base64,
+            DeriveFormatArg::Hex => Self::Hex,
+            DeriveFormatArg::Base64 => Self::Base64,
         }
     }
 }
 
-impl From<BinaryInputFormatArg> for BinaryInputFormat {
-    fn from(value: BinaryInputFormatArg) -> Self {
+impl From<SignFormatArg> for Format {
+    fn from(value: SignFormatArg) -> Self {
         match value {
-            BinaryInputFormatArg::Auto => Self::Auto,
-            BinaryInputFormatArg::Raw => Self::Raw,
-            BinaryInputFormatArg::Hex => Self::Hex,
-            BinaryInputFormatArg::Base64 => Self::Base64,
+            SignFormatArg::Der => Self::Der,
+            SignFormatArg::Hex => Self::Hex,
+            SignFormatArg::Base64 => Self::Base64,
         }
     }
 }
 
-impl From<ExportFormatArg> for ExportFormatRequest {
+impl From<VerifyFormatArg> for InputFormat {
+    fn from(value: VerifyFormatArg) -> Self {
+        match value {
+            VerifyFormatArg::Auto => Self::Auto,
+            VerifyFormatArg::Der => Self::Der,
+            VerifyFormatArg::Hex => Self::Hex,
+            VerifyFormatArg::Base64 => Self::Base64,
+        }
+    }
+}
+
+impl From<ExportFormatArg> for Format {
     fn from(value: ExportFormatArg) -> Self {
         match value {
-            ExportFormatArg::SpkiDer => Self::SpkiDer,
-            ExportFormatArg::SpkiPem => Self::SpkiPem,
-            ExportFormatArg::SpkiHex => Self::SpkiHex,
+            ExportFormatArg::Der => Self::Der,
+            ExportFormatArg::Pem => Self::Pem,
             ExportFormatArg::Openssh => Self::Openssh,
+            ExportFormatArg::EthereumAddress => Self::EthereumAddress,
             ExportFormatArg::Hex => Self::Hex,
             ExportFormatArg::Base64 => Self::Base64,
-            ExportFormatArg::Json => Self::Json,
-        }
-    }
-}
-
-impl From<ExportFormatArg> for PublicKeyExportFormat {
-    fn from(value: ExportFormatArg) -> Self {
-        match value {
-            ExportFormatArg::SpkiDer => Self::SpkiDer,
-            ExportFormatArg::SpkiPem => Self::SpkiPem,
-            ExportFormatArg::SpkiHex => Self::SpkiHex,
-            ExportFormatArg::Openssh => Self::Openssh,
-            ExportFormatArg::Hex | ExportFormatArg::Base64 | ExportFormatArg::Json => Self::SpkiDer,
         }
     }
 }
@@ -704,14 +701,14 @@ fn build_placeholder_request(operation: &str, identity: String) -> serde_json::V
                 context: BTreeMap::new(),
             },
             length: 32,
-            format: BinaryOutputFormat::Hex,
+            format: Format::Hex,
             output: None,
         })
         .unwrap_or_default(),
         "sign" => serde_json::to_value(SignRequest {
             identity,
             input: InputSource::Stdin,
-            format: BinaryOutputFormat::Hex,
+            format: Format::Hex,
             output: None,
         })
         .unwrap_or_default(),
@@ -719,7 +716,7 @@ fn build_placeholder_request(operation: &str, identity: String) -> serde_json::V
             identity,
             input: InputSource::Stdin,
             signature: InputSource::Stdin,
-            format: BinaryInputFormat::Auto,
+            format: InputFormat::Auto,
         })
         .unwrap_or_default(),
         "encrypt" => serde_json::to_value(EncryptRequest {
@@ -977,7 +974,7 @@ mod tests {
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1026,7 +1023,7 @@ mod tests {
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1075,7 +1072,7 @@ mod tests {
                 input: input_path.display().to_string(),
                 signature: signature_path.display().to_string(),
                 state_dir: Some(state_root.path().to_path_buf()),
-                format: BinaryInputFormatArg::Auto,
+                format: VerifyFormatArg::Auto,
             },
             &RecordingNativePublicKeyRunner::success(public_key_der),
         )
@@ -1123,7 +1120,7 @@ mod tests {
                 input: input_path.display().to_string(),
                 signature: signature_path.display().to_string(),
                 state_dir: Some(state_root.path().to_path_buf()),
-                format: BinaryInputFormatArg::Auto,
+                format: VerifyFormatArg::Auto,
             },
             &runner,
         )
@@ -1145,7 +1142,7 @@ mod tests {
                 identity: identity.name.clone(),
                 input: InputSource::Stdin,
                 signature: InputSource::Stdin,
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &RecordingNativePublicKeyRunner::success(Vec::new()),
@@ -1191,7 +1188,7 @@ mod tests {
                 signature: InputSource::Path {
                     path: signature_path,
                 },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &backend,
@@ -1247,7 +1244,7 @@ mod tests {
                 signature: InputSource::Path {
                     path: signature_path,
                 },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &backend,
@@ -1278,7 +1275,7 @@ mod tests {
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1310,7 +1307,7 @@ mod tests {
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1338,7 +1335,7 @@ mod tests {
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1365,7 +1362,7 @@ mod tests {
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1397,7 +1394,7 @@ mod tests {
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1419,7 +1416,7 @@ mod tests {
                 signature: InputSource::Path {
                     path: signature_path,
                 },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &backend,
@@ -1449,7 +1446,7 @@ mod tests {
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1469,7 +1466,7 @@ mod tests {
                 signature: InputSource::Path {
                     path: signature_path,
                 },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &backend,
@@ -1499,7 +1496,7 @@ mod tests {
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1519,7 +1516,7 @@ mod tests {
                 signature: InputSource::Path {
                     path: signature_path,
                 },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &backend,
@@ -1548,7 +1545,7 @@ mod tests {
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
-                format: BinaryOutputFormat::Hex,
+                format: Format::Hex,
                 output: None,
             },
             &identity,
@@ -1571,7 +1568,7 @@ mod tests {
                 signature: InputSource::Path {
                     path: signature_path,
                 },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &backend,
@@ -1617,7 +1614,7 @@ mod tests {
                 signature: InputSource::Path {
                     path: signature_path,
                 },
-                format: BinaryInputFormat::Auto,
+                format: InputFormat::Auto,
             },
             &identity,
             &backend,
