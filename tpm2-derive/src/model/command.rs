@@ -139,7 +139,6 @@ pub enum ExportKind {
     PublicKey,
     SecretKey,
     Keypair,
-    RecoveryBundle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -151,7 +150,6 @@ pub struct ExportRequest {
     pub state_dir: Option<PathBuf>,
     pub reason: Option<String>,
     pub confirm: bool,
-    pub confirm_phrase: Option<String>,
     pub derivation: DerivationOverrides,
 }
 
@@ -187,7 +185,6 @@ pub enum ExportFormat {
     Base64,
     KeypairJsonHex,
     KeypairJsonBase64,
-    RecoveryBundleJson,
 }
 
 impl From<PublicKeyExportFormat> for ExportFormat {
@@ -230,21 +227,6 @@ pub struct ExportResult {
     pub mode: Mode,
     pub kind: ExportKind,
     pub artifact: ExportArtifact,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct RecoveryImportRequest {
-    pub bundle_path: PathBuf,
-    pub identity: Option<String>,
-    pub state_dir: Option<PathBuf>,
-    pub overwrite_existing: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct RecoveryImportResult {
-    pub identity: Identity,
-    pub restored_from_identity: String,
-    pub seed_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

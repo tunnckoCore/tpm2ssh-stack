@@ -7,8 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "tpm2-derive",
     version,
     about = "TPM-backed identity operations with native, PRF, and seed modes",
-    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, 'import' to reseal an exported seed bundle into fresh TPM-backed state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind secret-key --format base64 --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format base64 --confirm --reason \"hardware migration\" --output app-prf.json\n  tpm2-derive import --bundle backup.json --identity restored-user --confirm"
+    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha --format base64 --output session.key\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind secret-key --format base64 --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format base64 --confirm --reason \"hardware migration\" --output app-prf.json"
 )]
 pub struct Cli {
     #[arg(
@@ -39,8 +39,6 @@ pub enum Command {
     Decrypt(DecryptArgs),
     /// Export public material or gated secret-bearing artifacts from a persisted identity.
     Export(ExportArgs),
-    /// Import a break-glass recovery bundle and reseal it into TPM-backed state.
-    Import(ImportArgs),
     /// Add a PRF- or seed-derived private key to ssh-agent.
     #[command(name = "ssh-add")]
     SshAdd(SshAddArgs),
@@ -250,13 +248,10 @@ pub struct ExportArgs {
     #[arg(
         long = "format",
         value_enum,
-        help = "Artifact format; valid values depend on --kind (public-key: spki-der|spki-pem|spki-hex|openssh, secret-key: hex|base64, keypair: hex|base64 inside JSON, recovery-bundle: json)"
+        help = "Artifact format; valid values depend on --kind (public-key: spki-der|spki-pem|spki-hex|openssh, secret-key: hex|base64, keypair: hex|base64 inside JSON)"
     )]
     pub format: Option<ExportFormatArg>,
-    #[arg(
-        long,
-        help = "Destination file path; recovery-bundle export requires this"
-    )]
+    #[arg(long, help = "Destination file path")]
     pub output: Option<PathBuf>,
     #[arg(
         long,
@@ -265,44 +260,12 @@ pub struct ExportArgs {
     pub state_dir: Option<PathBuf>,
     #[arg(
         long,
-        help = "Operator-provided reason required for secret-bearing or recovery-bundle export"
+        help = "Operator-provided reason required for secret-bearing export"
     )]
     pub reason: Option<String>,
     #[arg(
         long,
         help = "Acknowledge this export removes TPM-only protection from secret-bearing material"
-    )]
-    pub confirm: bool,
-    #[arg(
-        long,
-        help = "Exact confirmation phrase required for recovery-bundle export"
-    )]
-    pub confirm_phrase: Option<String>,
-}
-
-#[derive(Debug, Args)]
-#[command(about = "Import a recovery-bundle JSON file and reseal its seed into TPM-backed state")]
-pub struct ImportArgs {
-    #[arg(
-        long,
-        help = "Recovery-bundle JSON file to import; stdin is intentionally not supported"
-    )]
-    pub bundle: PathBuf,
-    #[arg(
-        long,
-        help = "Optional destination identity name; defaults to the identity recorded in the bundle"
-    )]
-    pub identity: Option<String>,
-    #[arg(
-        long,
-        help = "Override the state root directory instead of the default local state path"
-    )]
-    pub state_dir: Option<PathBuf>,
-    #[arg(long, help = "Replace existing identity/object state if present")]
-    pub overwrite_existing: bool,
-    #[arg(
-        long,
-        help = "Acknowledge that the bundle contains exported seed material"
     )]
     pub confirm: bool,
 }
@@ -379,8 +342,6 @@ pub enum ExportKindArg {
     SecretKey,
     /// Export both derived secret and public key material together as JSON; --format applies to both embedded key values.
     Keypair,
-    /// Export a break-glass seed recovery bundle.
-    RecoveryBundle,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -622,6 +583,7 @@ mod tests {
         );
 
         assert!(Cli::try_parse_from(["tpm2-derive", "keygen", "--with", "seed-user"]).is_err());
+        assert!(Cli::try_parse_from(["tpm2-derive", "import", "--bundle", "backup.json"]).is_err());
     }
 
     #[test]
@@ -636,5 +598,7 @@ mod tests {
         assert!(help.contains("supports PRF- and seed-backed identities"));
         assert!(!help.contains("seed-backed slice"));
         assert!(!help.contains("\n  keygen\n"));
+        assert!(!help.contains("\n  import\n"));
+        assert!(!help.contains("recovery-bundle"));
     }
 }

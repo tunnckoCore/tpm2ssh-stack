@@ -43,8 +43,7 @@ use crate::model::{
     Algorithm, CapabilityReport, DerivationOverrides, ExportArtifact, ExportFormat,
     ExportFormatRequest, ExportKind, ExportRequest, ExportResult, Identity, IdentityCreateRequest,
     IdentityCreateResult, IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode,
-    ModePreference, PublicKeyExportFormat, RecoveryImportRequest, RecoveryImportResult,
-    StateLayout, UseCase, expand_mode_requested_uses,
+    ModePreference, PublicKeyExportFormat, StateLayout, UseCase, expand_mode_requested_uses,
 };
 use crate::ops::native::subprocess::{
     NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
@@ -64,13 +63,9 @@ use crate::ops::seed::{
     SEED_DERIVATION_KDF_METADATA_KEY, SEED_OBJECT_LABEL_METADATA_KEY,
     SEED_PRIVATE_BLOB_PATH_METADATA_KEY, SEED_PUBLIC_BLOB_PATH_METADATA_KEY,
     SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY, SEED_STORAGE_KIND_METADATA_KEY, SeedBackend,
-    SeedCreateRequest, SeedCreateSource, SeedExportDestination, SeedExportFormat,
-    SeedExportRequest, SeedIdentity, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
-    SeedRecoveryBundleV1, SeedRecoveryImportRequest, SeedSoftwareDeriver, SeedStorageKind,
-    SoftwareSeedDerivationRequest, SubprocessSeedBackend,
-    export_recovery_bundle as export_seed_recovery_bundle, open_and_derive,
-    parse_recovery_bundle_json, restore_recovery_bundle as restore_seed_recovery_bundle,
-    seed_profile_from_profile,
+    SeedCreateRequest, SeedCreateSource, SeedIdentity, SeedOpenAuthSource, SeedOpenOutput,
+    SeedOpenRequest, SeedSoftwareDeriver, SeedStorageKind, SoftwareSeedDerivationRequest,
+    SubprocessSeedBackend, open_and_derive, seed_profile_from_profile,
 };
 
 const DEFAULT_SETUP_SEED_BYTES: usize = MIN_SEED_BYTES;
@@ -319,113 +314,6 @@ pub fn load_identity(identity: &str, state_dir: Option<PathBuf>) -> Result<Ident
     Identity::load_named(identity, state_dir)
 }
 
-pub fn import_recovery_bundle(request: &RecoveryImportRequest) -> Result<RecoveryImportResult> {
-    validate_recovery_bundle_input_path(&request.bundle_path)?;
-
-    let payload = fs::read(&request.bundle_path).map_err(|error| {
-        Error::State(format!(
-            "failed to read recovery bundle '{}': {error}",
-            request.bundle_path.display()
-        ))
-    })?;
-    let bundle = parse_recovery_bundle_json(&payload)?;
-    let state_layout = StateLayout::from_optional_root(request.state_dir.clone());
-    let backend = SubprocessSeedBackend::new(state_layout.objects_dir.clone());
-
-    import_recovery_bundle_with_backend(request, bundle, state_layout, &backend)
-}
-
-fn import_recovery_bundle_with_backend<B>(
-    request: &RecoveryImportRequest,
-    bundle: SeedRecoveryBundleV1,
-    state_layout: StateLayout,
-    backend: &B,
-) -> Result<RecoveryImportResult>
-where
-    B: SeedBackend,
-{
-    let target_profile = request
-        .identity
-        .clone()
-        .unwrap_or_else(|| bundle.identity.name.clone());
-    validate_profile_name(&target_profile)?;
-    ensure_recovery_import_target_available(
-        &target_profile,
-        &state_layout,
-        request.overwrite_existing,
-    )?;
-
-    let restored = restore_seed_recovery_bundle(
-        backend,
-        &SeedRecoveryImportRequest {
-            bundle,
-            target_profile: Some(target_profile),
-            overwrite_existing: request.overwrite_existing,
-        },
-    )?;
-    let mut identity = Identity::new(
-        restored.identity.identity.clone(),
-        restored.identity.algorithm,
-        restored.identity.uses.clone(),
-        IdentityModeResolution {
-            requested: ModePreference::Seed,
-            resolved: Mode::Seed,
-            reasons: vec![format!(
-                "restored from seed recovery bundle for identity '{}'",
-                restored.restored_from_identity
-            )],
-        },
-        state_layout,
-    );
-    apply_seed_profile_metadata(&mut identity, &restored.identity);
-    identity.persist()?;
-
-    Ok(RecoveryImportResult {
-        identity,
-        restored_from_identity: restored.restored_from_identity,
-        seed_bytes: restored.seed_bytes,
-    })
-}
-
-fn validate_recovery_bundle_input_path(path: &Path) -> Result<()> {
-    if path == Path::new("-") {
-        return Err(Error::Validation(
-            "recovery import requires --bundle to be a file path; stdin is intentionally unsupported for secret-bearing recovery material"
-                .to_string(),
-        ));
-    }
-
-    if path.is_dir() {
-        return Err(Error::Validation(format!(
-            "recovery import bundle '{}' must be a file path, not a directory",
-            path.display()
-        )));
-    }
-
-    Ok(())
-}
-
-fn ensure_recovery_import_target_available(
-    target_profile: &str,
-    state_layout: &StateLayout,
-    overwrite_existing: bool,
-) -> Result<()> {
-    if overwrite_existing {
-        return Ok(());
-    }
-
-    let identity_path = state_layout.identity_path(target_profile);
-    let object_dir = state_layout.objects_dir.join(target_profile);
-    if identity_path.exists() || object_dir.exists() {
-        return Err(Error::State(format!(
-            "recovery import target '{}' already exists; pass --overwrite-existing to replace the persisted identity and sealed seed state",
-            target_profile
-        )));
-    }
-
-    Ok(())
-}
-
 fn apply_prf_root_metadata(identity: &mut Identity, layout: &PrfRootLayout) -> Result<()> {
     identity.metadata.insert(
         PRF_PARENT_CONTEXT_PATH_METADATA_KEY.to_string(),
@@ -482,7 +370,6 @@ pub fn export(request: &ExportRequest) -> Result<ExportResult> {
         ExportKind::PublicKey => export_public_key(&identity, request),
         ExportKind::SecretKey => export_secret_key(&identity, request),
         ExportKind::Keypair => export_keypair(&identity, request),
-        ExportKind::RecoveryBundle => export_recovery_bundle(&identity, request),
     }
 }
 
@@ -750,63 +637,6 @@ fn enforce_secret_export_policy(
     }
 
     Ok(())
-}
-
-fn export_recovery_bundle(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
-    let backend = SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
-    export_recovery_bundle_with_backend(identity, request, &backend)
-}
-
-fn export_recovery_bundle_with_backend<B>(
-    identity: &Identity,
-    request: &ExportRequest,
-    backend: &B,
-) -> Result<ExportResult>
-where
-    B: crate::ops::seed::SeedBackend,
-{
-    if !identity.export_policy.recovery_export {
-        return Err(Error::PolicyRefusal(format!(
-            "identity '{}' resolved to {:?} mode, which does not allow recovery-bundle export",
-            identity.name, identity.mode.resolved
-        )));
-    }
-
-    if identity.mode.resolved != Mode::Seed {
-        return Err(Error::PolicyRefusal(format!(
-            "identity '{}' resolved to {:?} mode; recovery-bundle export is only available for seed-mode identities",
-            identity.name, identity.mode.resolved
-        )));
-    }
-
-    resolve_recovery_bundle_export_format(request.format)?;
-    let destination = resolve_recovery_bundle_output_path(request.output.as_deref())?;
-    let seed_profile = seed_profile_from_profile(identity)?;
-    let bundle = export_seed_recovery_bundle(
-        backend,
-        &SeedExportRequest {
-            identity: seed_profile,
-            auth_source: SeedOpenAuthSource::None,
-            destination: SeedExportDestination::ExplicitPath(destination.display().to_string()),
-            format: SeedExportFormat::RecoveryBundleV1,
-            reason: request.reason.clone().unwrap_or_default(),
-            confirm: request.confirm,
-            confirm_phrase: request.confirm_phrase.clone(),
-        },
-    )?;
-
-    let bytes_written = write_recovery_bundle_output(&destination, &bundle)?;
-
-    Ok(ExportResult {
-        identity: identity.name.clone(),
-        mode: identity.mode.resolved,
-        kind: ExportKind::RecoveryBundle,
-        artifact: ExportArtifact {
-            format: ExportFormat::RecoveryBundleJson,
-            path: destination,
-            bytes_written,
-        },
-    })
 }
 
 fn render_derived_public_key_export(
@@ -1526,15 +1356,6 @@ fn resolve_keypair_export_format(
     }
 }
 
-fn resolve_recovery_bundle_export_format(format: Option<ExportFormatRequest>) -> Result<()> {
-    match format.unwrap_or(ExportFormatRequest::Json) {
-        ExportFormatRequest::Json => Ok(()),
-        _ => Err(Error::Validation(
-            "recovery-bundle export format is: json".to_string(),
-        )),
-    }
-}
-
 fn render_secret_key_export(format: ExportFormatRequest, secret_key_bytes: &[u8]) -> Vec<u8> {
     match format {
         ExportFormatRequest::Hex => crate::ops::keygen::hex_encode(secret_key_bytes).into_bytes(),
@@ -1684,18 +1505,6 @@ fn secret_key_export_default_suffix(format: ExportFormatRequest) -> &'static str
     }
 }
 
-fn resolve_recovery_bundle_output_path(requested_output: Option<&Path>) -> Result<PathBuf> {
-    let path = requested_output.ok_or_else(|| {
-        Error::Validation(
-            "recovery-bundle export requires --output so the operator chooses an explicit destination"
-                .to_string(),
-        )
-    })?;
-
-    validate_secret_bearing_output_path(path)?;
-    Ok(path.to_path_buf())
-}
-
 fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
     if let Some(parent) = path
         .parent()
@@ -1725,15 +1534,6 @@ fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
     })?;
 
     Ok(())
-}
-
-fn write_recovery_bundle_output(path: &Path, bundle: &SeedRecoveryBundleV1) -> Result<usize> {
-    let payload = format!(
-        "{}\n",
-        serde_json::to_string_pretty(bundle).map_err(crate::error::Error::from)?
-    );
-    write_secret_output(path, payload.as_bytes())?;
-    Ok(payload.len())
 }
 
 fn remove_path_if_present(path: &Path) {
@@ -2167,7 +1967,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: None,
                 confirm: false,
-                confirm_phrase: None,
                 derivation: DerivationOverrides {
                     org: Some("com.example".to_string()),
                     purpose: None,
@@ -2480,7 +2279,6 @@ mod tests {
             state_dir: Some(root_dir.clone()),
             reason: None,
             confirm: false,
-            confirm_phrase: None,
             derivation: DerivationOverrides::default(),
         })
         .expect_err("prf export still needs provisioned PRF root material in tests");
@@ -2510,7 +2308,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: None,
                 confirm: false,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"tpm-prf-material"),
@@ -2551,7 +2348,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &runner,
@@ -2571,7 +2367,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: false,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &runner,
@@ -2591,7 +2386,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: None,
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &runner,
@@ -2624,7 +2418,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &runner,
@@ -2648,7 +2441,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &runner,
@@ -2695,7 +2487,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"unused"),
@@ -2730,7 +2521,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"unused"),
@@ -2756,7 +2546,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("hardware migration".to_string()),
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"unused"),
@@ -2788,7 +2577,6 @@ mod tests {
                 state_dir: Some(root_dir.clone()),
                 reason: Some("backup".to_string()),
                 confirm: true,
-                confirm_phrase: None,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"unused"),
@@ -3062,264 +2850,6 @@ mod tests {
             .unwrap_or_else(|| panic!("missing {flag} argument"))
     }
 
-    #[test]
-    fn export_writes_seed_recovery_bundle_when_confirmed() {
-        let root_dir = unique_temp_path("export-seed-recovery-bundle");
-        let state_layout = StateLayout::new(root_dir.clone());
-        state_layout.ensure_dirs().expect("state dirs");
-
-        let identity = Identity::new(
-            "seed-default".to_string(),
-            Algorithm::Ed25519,
-            vec![UseCase::Sign, UseCase::Derive, UseCase::Ssh],
-            IdentityModeResolution {
-                requested: ModePreference::Seed,
-                resolved: Mode::Seed,
-                reasons: vec!["seed requested".to_string()],
-            },
-            state_layout.clone(),
-        );
-
-        let output_path = root_dir.join("backup").join("seed-default.recovery.json");
-        let result = export_recovery_bundle_with_backend(
-            &identity,
-            &ExportRequest {
-                identity: identity.name.clone(),
-                kind: ExportKind::RecoveryBundle,
-                output: Some(output_path.clone()),
-                format: None,
-                state_dir: Some(root_dir.clone()),
-                reason: Some("hardware migration".to_string()),
-                confirm: true,
-                confirm_phrase: Some(
-                    crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
-                ),
-                derivation: DerivationOverrides::default(),
-            },
-            &FakeSeedExportBackend::new(vec![0x7a; 32]),
-        )
-        .expect("seed recovery export should succeed");
-
-        assert_eq!(result.identity, "seed-default");
-        assert_eq!(result.mode, Mode::Seed);
-        assert_eq!(result.kind, ExportKind::RecoveryBundle);
-        assert_eq!(result.artifact.format, ExportFormat::RecoveryBundleJson);
-        assert_eq!(result.artifact.path, output_path);
-
-        let payload = fs::read_to_string(&result.artifact.path).expect("recovery bundle output");
-        assert!(payload.contains("seed-recovery-bundle-v1"));
-        assert!(payload.contains("hardware migration"));
-        assert!(payload.contains("7a7a7a7a"));
-
-        fs::remove_dir_all(root_dir).expect("temporary recovery export state should be removed");
-    }
-
-    #[test]
-    fn export_recovery_bundle_requires_explicit_output_path() {
-        let root_dir = unique_temp_path("export-seed-recovery-missing-output");
-        let identity = Identity::new(
-            "seed-default".to_string(),
-            Algorithm::Ed25519,
-            vec![UseCase::Derive],
-            IdentityModeResolution {
-                requested: ModePreference::Seed,
-                resolved: Mode::Seed,
-                reasons: vec!["seed requested".to_string()],
-            },
-            StateLayout::new(root_dir.clone()),
-        );
-
-        let error = export_recovery_bundle_with_backend(
-            &identity,
-            &ExportRequest {
-                identity: identity.name.clone(),
-                kind: ExportKind::RecoveryBundle,
-                output: None,
-                format: None,
-                state_dir: Some(root_dir.clone()),
-                reason: Some("hardware migration".to_string()),
-                confirm: true,
-                confirm_phrase: Some(
-                    crate::ops::seed::DEFAULT_EXPORT_CONFIRMATION_PHRASE.to_string(),
-                ),
-                derivation: DerivationOverrides::default(),
-            },
-            &FakeSeedExportBackend::new(vec![0x7a; 32]),
-        )
-        .expect_err("missing output should fail");
-
-        assert!(
-            matches!(error, Error::Validation(message) if message.contains("requires --output"))
-        );
-    }
-
-    #[test]
-    fn recovery_import_requires_overwrite_when_target_profile_state_exists() {
-        let root_dir = unique_temp_path("import-seed-recovery-existing-target");
-        let state_layout = StateLayout::new(root_dir.clone());
-        state_layout.ensure_dirs().expect("state dirs");
-
-        let existing = Identity::new(
-            "restored-identity".to_string(),
-            Algorithm::Ed25519,
-            vec![UseCase::Derive],
-            IdentityModeResolution {
-                requested: ModePreference::Seed,
-                resolved: Mode::Seed,
-                reasons: vec!["seed requested".to_string()],
-            },
-            state_layout.clone(),
-        );
-        existing.persist().expect("persist existing identity");
-
-        let seed = vec![0x24; 32];
-        let backend = FakeSeedImportBackend::default();
-        let error = import_recovery_bundle_with_backend(
-            &RecoveryImportRequest {
-                bundle_path: root_dir.join("backup").join("seed.recovery.json"),
-                identity: Some("restored-identity".to_string()),
-                state_dir: Some(root_dir.clone()),
-                overwrite_existing: false,
-            },
-            sample_recovery_bundle("old-identity", &seed),
-            state_layout,
-            &backend,
-        )
-        .expect_err("existing target should require overwrite");
-
-        assert!(matches!(error, Error::State(message) if message.contains("--overwrite-existing")));
-        assert!(backend.last_request_opt().is_none());
-
-        fs::remove_dir_all(root_dir).expect("temporary import state should be removed");
-    }
-
-    #[test]
-    fn recovery_import_persists_restored_seed_profile_metadata() {
-        let root_dir = unique_temp_path("import-seed-recovery-bundle");
-        let state_layout = StateLayout::new(root_dir.clone());
-        state_layout.ensure_dirs().expect("state dirs");
-
-        let seed = vec![0x42; 32];
-        let bundle = sample_recovery_bundle("old-identity", &seed);
-        let backend = FakeSeedImportBackend::default();
-
-        let result = import_recovery_bundle_with_backend(
-            &RecoveryImportRequest {
-                bundle_path: root_dir.join("backup").join("seed.recovery.json"),
-                identity: Some("restored-identity".to_string()),
-                state_dir: Some(root_dir.clone()),
-                overwrite_existing: true,
-            },
-            bundle,
-            state_layout.clone(),
-            &backend,
-        )
-        .expect("recovery import should succeed");
-
-        assert_eq!(result.identity.name, "restored-identity");
-        assert_eq!(result.identity.mode.resolved, Mode::Seed);
-        assert_eq!(result.restored_from_identity, "old-identity");
-        assert_eq!(result.seed_bytes, seed.len());
-        assert_eq!(
-            result.identity.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY),
-            Some(&"restored-identity".to_string())
-        );
-        assert_eq!(
-            result
-                .identity
-                .metadata
-                .get(SEED_PUBLIC_BLOB_PATH_METADATA_KEY),
-            Some(&"objects/restored-identity/sealed.pub".to_string())
-        );
-        assert_eq!(
-            result
-                .identity
-                .metadata
-                .get(SEED_PRIVATE_BLOB_PATH_METADATA_KEY),
-            Some(&"objects/restored-identity/sealed.priv".to_string())
-        );
-
-        let persisted = Identity::load_named("restored-identity", Some(root_dir.clone()))
-            .expect("persisted restored identity");
-        assert_eq!(persisted.mode.resolved, Mode::Seed);
-        assert!(
-            persisted
-                .mode
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("old-identity"))
-        );
-
-        let sealed = backend.last_request();
-        assert_eq!(sealed.profile_name, "restored-identity");
-        assert_eq!(sealed.object_label, "restored-identity");
-        assert!(sealed.overwrite_existing);
-        assert_eq!(sealed.seed, seed);
-
-        fs::remove_dir_all(root_dir).expect("temporary import state should be removed");
-    }
-
-    #[derive(Clone, Default)]
-    struct FakeSeedImportBackend {
-        last_request: Arc<Mutex<Option<RecordedSeedImport>>>,
-    }
-
-    impl FakeSeedImportBackend {
-        fn last_request(&self) -> RecordedSeedImport {
-            self.last_request
-                .lock()
-                .expect("last request")
-                .clone()
-                .expect("recorded seed import")
-        }
-
-        fn last_request_opt(&self) -> Option<RecordedSeedImport> {
-            self.last_request.lock().expect("last request").clone()
-        }
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct RecordedSeedImport {
-        profile_name: String,
-        object_label: String,
-        overwrite_existing: bool,
-        seed: Vec<u8>,
-    }
-
-    impl crate::ops::seed::SeedBackend for FakeSeedImportBackend {
-        fn seal_seed(&self, request: &crate::ops::seed::SeedCreateRequest) -> Result<()> {
-            let seed = match &request.source {
-                crate::ops::seed::SeedCreateSource::Import {
-                    ingress,
-                    material: Some(material),
-                } => {
-                    assert_eq!(*ingress, crate::ops::seed::SeedImportIngress::InMemory);
-                    material.expose_secret().clone()
-                }
-                other => panic!("expected imported seed source, found {other:?}"),
-            };
-
-            self.last_request
-                .lock()
-                .expect("last request")
-                .replace(RecordedSeedImport {
-                    profile_name: request.identity.identity.clone(),
-                    object_label: request.identity.storage.object_label.clone(),
-                    overwrite_existing: request.overwrite_existing,
-                    seed,
-                });
-            Ok(())
-        }
-
-        fn unseal_seed(
-            &self,
-            _profile: &crate::ops::seed::SeedIdentity,
-            _auth_source: &crate::ops::seed::SeedOpenAuthSource,
-        ) -> Result<crate::ops::seed::SeedMaterial> {
-            unreachable!("recovery import should only seal imported seeds")
-        }
-    }
-
     #[derive(Clone)]
     struct FakeSeedExportBackend {
         seed: Vec<u8>,
@@ -3333,7 +2863,7 @@ mod tests {
 
     impl crate::ops::seed::SeedBackend for FakeSeedExportBackend {
         fn seal_seed(&self, _request: &crate::ops::seed::SeedCreateRequest) -> Result<()> {
-            unreachable!("seed sealing is not used in recovery export tests")
+            unreachable!("seed sealing is not used in secret export tests")
         }
 
         fn unseal_seed(
@@ -3522,36 +3052,6 @@ mod tests {
                 .as_bytes()
                 .to_vec(),
         }
-    }
-
-    fn sample_recovery_bundle(profile_name: &str, seed: &[u8]) -> SeedRecoveryBundleV1 {
-        SeedRecoveryBundleV1 {
-            schema_version: crate::ops::seed::SEED_RECOVERY_BUNDLE_SCHEMA_VERSION,
-            kind: crate::ops::seed::SEED_RECOVERY_BUNDLE_KIND.to_string(),
-            exported_at_unix_seconds: 1,
-            reason: "hardware migration".to_string(),
-            identity: crate::ops::seed::SeedRecoveryBundleIdentity {
-                name: profile_name.to_string(),
-                algorithm: Algorithm::Ed25519,
-                uses: vec![UseCase::Sign, UseCase::Derive, UseCase::Ssh],
-                derivation: crate::ops::seed::SeedDerivation::hkdf_sha256_v1(),
-            },
-            seed: crate::ops::seed::SeedRecoveryBundleSecret {
-                encoding: "hex".to_string(),
-                bytes: seed.len(),
-                sha256: seed_sha256_hex(seed),
-                material: seed_hex_encode(seed),
-            },
-        }
-    }
-
-    fn seed_hex_encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    fn seed_sha256_hex(bytes: &[u8]) -> String {
-        let digest = sha2::Sha256::digest(bytes);
-        seed_hex_encode(&digest)
     }
 
     fn write_output_flag(invocation: &CommandInvocation, flag: &str, bytes: &[u8]) {

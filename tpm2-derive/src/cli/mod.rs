@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use args::{
     AlgorithmArg, BinaryInputFormatArg, BinaryOutputFormatArg, DecryptArgs, DeriveArgs,
-    EncryptArgs, ExportArgs, ExportFormatArg, ExportKindArg, IdentityArgs, ImportArgs, InspectArgs,
-    ModeArg, SignArgs, SshAddArgs, UseArg, VerifyArgs,
+    EncryptArgs, ExportArgs, ExportFormatArg, ExportKindArg, IdentityArgs, InspectArgs, ModeArg,
+    SignArgs, SshAddArgs, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
 use render::{failure, success, success_with_diagnostics};
@@ -20,8 +20,7 @@ use crate::model::{
     Algorithm, BinaryInputFormat, BinaryOutputFormat, CommandPath, DecryptRequest,
     DerivationOverrides, DeriveRequest, EncryptRequest, ErrorEnvelope, ExportFormatRequest,
     ExportKind, ExportRequest, IdentityCreateRequest, InputSource, InspectRequest, ModePreference,
-    PendingOperation, PublicKeyExportFormat, RecoveryImportRequest, SignRequest, SshAddRequest,
-    UseCase, VerifyRequest,
+    PendingOperation, PublicKeyExportFormat, SignRequest, SshAddRequest, UseCase, VerifyRequest,
 };
 use crate::ops;
 use crate::ops::sign::SignOperationResult;
@@ -82,7 +81,6 @@ impl From<ExportKindArg> for ExportKind {
             ExportKindArg::PublicKey => Self::PublicKey,
             ExportKindArg::SecretKey => Self::SecretKey,
             ExportKindArg::Keypair => Self::Keypair,
-            ExportKindArg::RecoveryBundle => Self::RecoveryBundle,
         }
     }
 }
@@ -160,7 +158,6 @@ pub fn run(cli: Cli) -> Result<String> {
         Command::Encrypt(args) => run_encrypt(cli.json, args),
         Command::Decrypt(args) => run_decrypt(cli.json, args),
         Command::Export(args) => run_export(cli.json, args),
-        Command::Import(args) => run_import(cli.json, args),
         Command::SshAdd(args) => run_ssh_add(cli.json, args),
     }
 }
@@ -248,51 +245,10 @@ fn run_export(json: bool, args: ExportArgs) -> Result<String> {
         state_dir: args.state_dir,
         reason: args.reason,
         confirm: args.confirm,
-        confirm_phrase: args.confirm_phrase,
         derivation: derivation_overrides(args.derivation),
     };
 
     match ops::export(&request) {
-        Ok(result) => success(json, command, result),
-        Err(error) => failure(
-            json,
-            command,
-            ErrorEnvelope {
-                code: error.code().as_str().to_string(),
-                message: error.to_string(),
-            },
-            Vec::new(),
-        ),
-    }
-}
-
-fn run_import(json: bool, args: ImportArgs) -> Result<String> {
-    let command = CommandPath::from_segments(["import"]);
-
-    if !args.confirm {
-        let error = Error::Validation(
-            "import requires --confirm because the bundle contains exported seed material until it is resealed into TPM-backed state"
-                .to_string(),
-        );
-        return failure(
-            json,
-            command,
-            ErrorEnvelope {
-                code: error.code().as_str().to_string(),
-                message: error.to_string(),
-            },
-            Vec::new(),
-        );
-    }
-
-    let request = RecoveryImportRequest {
-        bundle_path: args.bundle,
-        identity: args.identity,
-        state_dir: args.state_dir,
-        overwrite_existing: args.overwrite_existing,
-    };
-
-    match ops::import_recovery_bundle(&request) {
         Ok(result) => success(json, command, result),
         Err(error) => failure(
             json,
@@ -578,7 +534,6 @@ fn export_command_path(kind: ExportKind) -> CommandPath {
         ExportKind::PublicKey => CommandPath::from_segments(["export", "public-key"]),
         ExportKind::SecretKey => CommandPath::from_segments(["export", "secret-key"]),
         ExportKind::Keypair => CommandPath::from_segments(["export", "keypair"]),
-        ExportKind::RecoveryBundle => CommandPath::from_segments(["export", "recovery-bundle"]),
     }
 }
 
@@ -787,7 +742,6 @@ fn build_placeholder_request(operation: &str, identity: String) -> serde_json::V
             state_dir: None,
             reason: None,
             confirm: false,
-            confirm_phrase: None,
             derivation: DerivationOverrides::default(),
         })
         .unwrap_or_default(),
@@ -993,57 +947,6 @@ mod tests {
         let uses = identity_create_uses(vec![UseArg::All, UseArg::Sign]);
         assert!(uses.contains(&UseCase::All));
         assert!(uses.contains(&UseCase::Sign));
-    }
-
-    #[test]
-    fn import_requires_explicit_confirmation() {
-        let output = run(Cli {
-            json: false,
-            command: Command::Import(ImportArgs {
-                bundle: PathBuf::from("backup.json"),
-                identity: Some("restored-user".to_string()),
-                state_dir: None,
-                overwrite_existing: false,
-                confirm: false,
-            }),
-        })
-        .expect("cli output");
-        let value: Value = serde_json::from_str(&output).expect("json output");
-
-        assert_eq!(value["ok"], Value::Bool(false));
-        assert_eq!(
-            value["command"]["segments"],
-            Value::Array(vec![Value::String("import".to_string()),])
-        );
-        assert_eq!(
-            value["error"]["code"],
-            Value::String("validation".to_string())
-        );
-        assert!(
-            value["error"]["message"]
-                .as_str()
-                .expect("error message")
-                .contains("--confirm")
-        );
-    }
-
-    #[test]
-    fn import_parses_confirm_flag() {
-        let cli = Cli::try_parse_from([
-            "tpm2-derive",
-            "import",
-            "--bundle",
-            "backup.json",
-            "--confirm",
-        ])
-        .expect("import should parse");
-
-        let Command::Import(args) = cli.command else {
-            panic!("expected import command");
-        };
-        assert_eq!(args.bundle, PathBuf::from("backup.json"));
-        assert!(args.confirm);
-        assert!(!args.overwrite_existing);
     }
 
     #[test]

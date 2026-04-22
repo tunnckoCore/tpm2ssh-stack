@@ -18,7 +18,7 @@ tpm2-derive verify --with <name> ...
 tpm2-derive encrypt --with <name> ...
 tpm2-derive decrypt --with <name> ...
 tpm2-derive derive --with <name> ...
-tpm2-derive export --with <name> --kind <public-key|secret-key|keypair|recovery-bundle> ...
+tpm2-derive export --with <name> --kind <public-key|secret-key|keypair> ...
 tpm2-derive ssh-add --with <name> ...
 ```
 
@@ -79,7 +79,6 @@ Supported:
 - `ssh-add`
 - public-key export
 - secret-key and keypair export when the identity was created with `--use export-secret`
-- recovery-bundle export/import
 
 ## Examples
 
@@ -176,11 +175,6 @@ tpm2-derive export \
   --output backup-seed.keypair.json
 ```
 
-Recovery-bundle import:
-
-```bash
-tpm2-derive import --bundle backup.json --identity restored-user --confirm
-```
 
 ## Notes
 

@@ -320,7 +320,6 @@ Some workstreams can run in parallel. Some have hard dependencies.
   - [x] `public-key`
   - [x] `secret-key`
   - [x] `keypair`
-- [x] Keep or consciously isolate `recovery-bundle` if still needed for `import`
 - [x] Implement PRF public-key export for effective derived identity key
 - [x] Implement PRF secret-key export gated on `export-secret`
 - [x] Implement PRF keypair export gated on `export-secret`
