@@ -24,14 +24,14 @@ pub enum PrfProtocolVersion {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PrfRequest {
-    pub profile: String,
+    pub identity: String,
     pub derivation: DerivationSpec,
 }
 
 impl PrfRequest {
-    pub fn new(profile: impl Into<String>, derivation: DerivationSpec) -> Result<Self> {
+    pub fn new(identity: impl Into<String>, derivation: DerivationSpec) -> Result<Self> {
         let request = Self {
-            profile: profile.into(),
+            identity: identity.into(),
             derivation,
         };
         request.validate()?;
@@ -39,9 +39,9 @@ impl PrfRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.profile.trim().is_empty() {
+        if self.identity.trim().is_empty() {
             return Err(Error::Validation(
-                "profile must not be empty for PRF operations".to_string(),
+                "identity must not be empty for PRF operations".to_string(),
             ));
         }
 
@@ -206,8 +206,8 @@ pub struct PrfRootLayout {
 }
 
 impl PrfRootLayout {
-    pub fn for_profile(objects_dir: &Path, profile: &str) -> Self {
-        Self::for_object_dir(objects_dir.join(profile))
+    pub fn for_profile(objects_dir: &Path, identity: &str) -> Self {
+        Self::for_object_dir(objects_dir.join(identity))
     }
 
     fn for_object_dir(object_dir: PathBuf) -> Self {
@@ -245,8 +245,8 @@ impl<R> SubprocessPrfBackend<R> {
         &self.objects_dir
     }
 
-    pub fn root_layout(&self, profile: &str) -> PrfRootLayout {
-        PrfRootLayout::for_profile(&self.objects_dir, profile)
+    pub fn root_layout(&self, identity: &str) -> PrfRootLayout {
+        PrfRootLayout::for_profile(&self.objects_dir, identity)
     }
 }
 
@@ -254,7 +254,7 @@ impl<R> SubprocessPrfBackend<R>
 where
     R: CommandRunner,
 {
-    pub fn provision_root(&self, profile: &str) -> Result<PrfRootLayout> {
+    pub fn provision_root(&self, identity: &str) -> Result<PrfRootLayout> {
         fs::create_dir_all(&self.objects_dir).map_err(|error| {
             Error::State(format!(
                 "failed to create PRF objects directory '{}': {error}",
@@ -262,11 +262,11 @@ where
             ))
         })?;
 
-        let final_layout = self.root_layout(profile);
+        let final_layout = self.root_layout(identity);
         if final_layout.object_dir.exists() {
             return Err(Error::State(format!(
-                "PRF root material already exists for profile '{}' at '{}'",
-                profile,
+                "PRF root material already exists for identity '{}' at '{}'",
+                identity,
                 final_layout.object_dir.display()
             )));
         }
@@ -488,7 +488,7 @@ pub fn execute_tpm_prf(
     request: PrfRequest,
     executor: TpmPrfExecutor,
 ) -> Result<TpmPrfExecutionResult> {
-    let workspace_root = temp_workspace_root(&request.profile)?;
+    let workspace_root = temp_workspace_root(&request.identity)?;
     let plan = plan_tpm_prf_in(request, executor, &workspace_root)?;
     let runner = ProcessCommandRunner;
     let execution = execute_tpm_prf_plan_with_runner(&plan, &runner);
@@ -610,7 +610,7 @@ fn ensure_matching_execution_version(
     Ok(())
 }
 
-fn temp_workspace_root(profile: &str) -> Result<PathBuf> {
+fn temp_workspace_root(identity: &str) -> Result<PathBuf> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| {
@@ -619,7 +619,7 @@ fn temp_workspace_root(profile: &str) -> Result<PathBuf> {
             ))
         })?;
 
-    let sanitized_profile = profile
+    let sanitized_profile = identity
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>();

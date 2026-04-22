@@ -6,8 +6,8 @@ use crate::error::{Error, Result};
 use crate::model::Diagnostic;
 
 use super::{
-    DigestAlgorithm, NativeEcPoint, NativeKeyRef, NativeKeySemantics, NativeKeyUse,
-    NativePublicKeyEncoding, NativePublicKeyExportRequest, NativeSetupRequest, NativeSignRequest,
+    DigestAlgorithm, NativeEcPoint, NativeIdentityCreateRequest, NativeKeyRef, NativeKeySemantics,
+    NativeKeyUse, NativePublicKeyEncoding, NativePublicKeyExportRequest, NativeSignRequest,
     NativeSignatureFormat, NativeSignatureScheme, Validate,
 };
 
@@ -96,13 +96,13 @@ pub struct NativeSetupArtifacts {
 }
 
 impl NativeSetupArtifacts {
-    pub fn key_ref(&self, profile: &str) -> Result<NativeKeyRef> {
-        validate_identifier("profile", profile)?;
+    pub fn key_ref(&self, identity: &str) -> Result<NativeKeyRef> {
+        validate_identifier("identity", identity)?;
         validate_identifier("key_id", &self.key_id)?;
         validate_non_empty_path(&self.scratch_dir)?;
 
         Ok(NativeKeyRef {
-            profile: profile.to_string(),
+            identity: identity.to_string(),
             key_id: self.key_id.clone(),
         })
     }
@@ -218,13 +218,13 @@ impl NativePostProcessAction {
 }
 
 pub fn plan_setup(
-    request: &NativeSetupRequest,
+    request: &NativeIdentityCreateRequest,
     artifacts: &NativeSetupArtifacts,
 ) -> Result<NativeSetupPlan> {
     request.validate()?;
     ensure_signing_setup(request)?;
 
-    let key = artifacts.key_ref(&request.profile)?;
+    let key = artifacts.key_ref(&request.identity)?;
     let persistent_handle = artifacts.persistent.validated_handle()?;
     let primary_context = artifacts.primary_context_path();
     let public_blob = artifacts.public_blob_path();
@@ -601,7 +601,7 @@ pub fn decode_p256_spki_der(der: &[u8]) -> Result<NativeEcPoint> {
     })
 }
 
-fn ensure_signing_setup(request: &NativeSetupRequest) -> Result<()> {
+fn ensure_signing_setup(request: &NativeIdentityCreateRequest) -> Result<()> {
     if !request.allowed_uses.contains(&NativeKeyUse::Sign) {
         return Err(Error::Unsupported(
             "native subprocess setup currently requires sign capability; verify-only native keys are not wired in this vertical slice"
@@ -829,13 +829,13 @@ impl<'a> DerCursor<'a> {
 mod tests {
     use super::*;
     use crate::ops::native::{
-        NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativePrivateKeyPolicy,
-        NativeSetupRequest, NativeSignRequest,
+        NativeAlgorithm, NativeCurve, NativeHardwareBinding, NativeIdentityCreateRequest,
+        NativePrivateKeyPolicy, NativeSignRequest,
     };
 
-    fn setup_request(allowed_uses: Vec<NativeKeyUse>) -> NativeSetupRequest {
-        NativeSetupRequest {
-            profile: "prod-signer".to_string(),
+    fn setup_request(allowed_uses: Vec<NativeKeyUse>) -> NativeIdentityCreateRequest {
+        NativeIdentityCreateRequest {
+            identity: "prod-signer".to_string(),
             key_label: Some("API signing key".to_string()),
             algorithm: NativeAlgorithm::P256,
             curve: NativeCurve::NistP256,
@@ -859,7 +859,7 @@ mod tests {
     fn sign_request(format: NativeSignatureFormat) -> NativeSignRequest {
         NativeSignRequest {
             key: NativeKeyRef {
-                profile: "prod-signer".to_string(),
+                identity: "prod-signer".to_string(),
                 key_id: "p256-signing-key".to_string(),
             },
             scheme: NativeSignatureScheme::Ecdsa,
@@ -981,7 +981,7 @@ mod tests {
         let plan = plan_export_public_key(
             &NativePublicKeyExportRequest {
                 key: NativeKeyRef {
-                    profile: "prod-signer".to_string(),
+                    identity: "prod-signer".to_string(),
                     key_id: "p256-signing-key".to_string(),
                 },
                 encodings: vec![

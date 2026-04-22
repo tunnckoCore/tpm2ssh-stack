@@ -78,31 +78,31 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Checklist
 
-- [ ] Replace `setup` with `identity`
-- [ ] Replace nested `ssh agent add` with flat `ssh-add`
-- [ ] Replace `--profile` / `--from-profile` with `--with`
-- [ ] Replace `--namespace` with `--org`
-- [ ] Remove public `--label`
-- [ ] Keep `--purpose`
-- [ ] Keep repeated `--context key=value`
-- [ ] Add `--mode <auto|native|prf|seed>` to identity creation
-- [ ] Make `--use` required on identity creation
-- [ ] Add `export-secret` to CLI use enum
-- [ ] Add `all` handling at the CLI level only if it cleanly delegates to mode-aware expansion later
-- [ ] Apply derivation override flags to all identity-bound commands:
-  - [ ] `sign`
-  - [ ] `verify`
-  - [ ] `encrypt`
-  - [ ] `decrypt`
-  - [ ] `derive`
-  - [ ] `export`
-  - [ ] `ssh-add`
-- [ ] Remove derive-specific ssh-agent flags:
-  - [ ] `--ssh-agent-add`
-  - [ ] `--ssh-agent-comment`
-  - [ ] `--ssh-agent-socket`
-- [ ] Update help text and examples to the ADR vocabulary
-- [ ] Update command paths / renderer expectations for `identity` and `ssh-add`
+- [x] Replace `setup` with `identity`
+- [x] Replace nested `ssh agent add` with flat `ssh-add`
+- [x] Replace `--profile` / `--from-profile` with `--with`
+- [x] Replace `--namespace` with `--org`
+- [x] Remove public `--label`
+- [x] Keep `--purpose`
+- [x] Keep repeated `--context key=value`
+- [x] Add `--mode <auto|native|prf|seed>` to identity creation
+- [x] Make `--use` required on identity creation
+- [x] Add `export-secret` to CLI use enum
+- [x] Add `all` handling at the CLI level only if it cleanly delegates to mode-aware expansion later
+- [x] Apply derivation override flags to all identity-bound commands:
+  - [x] `sign`
+  - [x] `verify`
+  - [x] `encrypt`
+  - [x] `decrypt`
+  - [x] `derive`
+  - [x] `export`
+  - [x] `ssh-add`
+- [x] Remove derive-specific ssh-agent flags:
+  - [x] `--ssh-agent-add`
+  - [x] `--ssh-agent-comment`
+  - [x] `--ssh-agent-socket`
+- [x] Update help text and examples to the ADR vocabulary
+- [x] Update command paths / renderer expectations for `identity` and `ssh-add`
 
 ### Deliverables
 
@@ -111,13 +111,13 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Acceptance checks
 
-- [ ] `tpm2-derive identity wgw --mode native --algorithm p256 --use sign --use verify` parses
-- [ ] `tpm2-derive sign --with wgw --input msg.txt` parses
-- [ ] `tpm2-derive ssh-add --with wgwprf` parses
-- [ ] `tpm2-derive derive --with wgwprf --org com.example --purpose session --context tenant=alpha --length 32` parses
-- [ ] old `setup` no longer parses
-- [ ] old `ssh agent add` no longer parses
-- [ ] old `--namespace` no longer parses
+- [x] `tpm2-derive identity wgw --mode native --algorithm p256 --use sign --use verify` parses
+- [x] `tpm2-derive sign --with wgw --input msg.txt` parses
+- [x] `tpm2-derive ssh-add --with wgwprf` parses
+- [x] `tpm2-derive derive --with wgwprf --org com.example --purpose session --context tenant=alpha --length 32` parses
+- [x] old `setup` no longer parses
+- [x] old `ssh agent add` no longer parses
+- [x] old `--namespace` no longer parses
 
 ---
 
@@ -143,26 +143,26 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Checklist
 
-- [ ] Rename `Profile` to `Identity`
-- [ ] Rename `ModeResolution` references where needed to identity-oriented naming
-- [ ] Rename `SetupRequest` / `SetupResult` to identity-creation naming
-- [ ] Rename command request fields from `profile` to `identity` or `with` where appropriate
-- [ ] Rename persisted state helpers from profile-oriented naming to identity-oriented naming
-- [ ] Rename storage path helpers from `profile_path` to `identity_path`
-- [ ] Rename profile-loading APIs to identity-loading APIs
-- [ ] Rename comments/docs/tests to use `identity`
-- [ ] Remove leftover public/internal “setup profile” wording
+- [x] Rename `Profile` to `Identity`
+- [x] Rename `ModeResolution` references where needed to identity-oriented naming
+- [x] Rename `SetupRequest` / `SetupResult` to identity-creation naming
+- [x] Rename command request fields from `profile` to `identity` or `with` where appropriate
+- [x] Rename persisted state helpers from profile-oriented naming to identity-oriented naming
+- [x] Rename storage path helpers from `profile_path` to `identity_path`
+- [x] Rename profile-loading APIs to identity-loading APIs
+- [x] Rename comments/docs/tests to use `identity`
+- [x] Remove leftover public/internal “setup profile” wording
 
 ### Schema checklist
 
-- [ ] Add typed identity defaults for:
-  - [ ] `org`
-  - [ ] `purpose`
-  - [ ] `context`
-- [ ] Add `export-secret` to persisted uses
-- [ ] Remove persisted policy assumptions that contradict the new mode/use matrix
-- [ ] Decide whether old export-policy struct remains, is reduced, or is deleted
-- [ ] Bump schema version if schema remains versioned
+- [x] Add typed identity defaults for:
+  - [x] `org`
+  - [x] `purpose`
+  - [x] `context`
+- [x] Add `export-secret` to persisted uses
+- [x] Remove persisted policy assumptions that contradict the new mode/use matrix
+- [x] Decide whether old export-policy struct remains, is reduced, or is deleted
+- [x] Bump schema version if schema remains versioned
 
 ### Deliverables
 
@@ -171,9 +171,9 @@ Some workstreams can run in parallel. Some have hard dependencies.
 
 ### Acceptance checks
 
-- [ ] no public-facing `profile` naming remains in CLI args/help/output where it should be `identity`
-- [ ] core model types and request objects are identity-oriented
-- [ ] stored identity data includes derivation defaults
+- [x] no public-facing `profile` naming remains in CLI args/help/output where it should be `identity`
+- [x] core model types and request objects are identity-oriented
+- [x] stored identity data includes derivation defaults
 
 ---
 

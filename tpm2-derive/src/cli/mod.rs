@@ -9,10 +9,9 @@ use std::path::{Path, PathBuf};
 use tempfile::Builder as TempfileBuilder;
 
 use args::{
-    AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, InspectArgs,
-    ImportArgs, KeygenArgs, KeygenFormatArg, KeygenKindArg,
-    ModeArg, PublicKeyExportFormatArg, SetupArgs,
-    SignArgs, SshAgentAddArgs, SshAgentCommand, SshCommand, UseArg, VerifyArgs,
+    AlgorithmArg, DecryptArgs, DeriveArgs, EncryptArgs, ExportArgs, ExportKindArg, IdentityArgs,
+    ImportArgs, InspectArgs, KeygenArgs, KeygenFormatArg, KeygenKindArg, ModeArg,
+    PublicKeyExportFormatArg, SignArgs, SshAddArgs, UseArg, VerifyArgs,
 };
 pub use args::{Cli, Command};
 use ed25519_dalek::{Signature as Ed25519Signature, Signer as _, SigningKey as Ed25519SigningKey};
@@ -26,30 +25,30 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 use crate::backend::{
-    default_probe, CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner,
-    ProcessCommandRunner,
+    CapabilityProbe, CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner,
+    default_probe,
 };
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::{
-    Algorithm, CommandPath, DecryptRequest, DerivationContext, DeriveRequest, EncryptRequest,
-    ErrorEnvelope, ExportKind, ExportRequest, InputSource, InspectRequest, KeygenFormat,
-    KeygenKind, Mode, ModePreference, PendingOperation, Profile,
-    PublicKeyExportFormat, RecoveryImportRequest, SetupRequest, SignRequest, SshAgentAddRequest,
-    UseCase, VerifyRequest,
+    Algorithm, CommandPath, DecryptRequest, DerivationOverrides, DeriveRequest, EncryptRequest,
+    ErrorEnvelope, ExportKind, ExportRequest, Identity, IdentityCreateRequest, InputSource,
+    InspectRequest, KeygenFormat, KeygenKind, Mode, ModePreference, PendingOperation,
+    PublicKeyExportFormat, RecoveryImportRequest, SignRequest, SshAddRequest, UseCase,
+    VerifyRequest,
 };
 use crate::ops;
 use crate::ops::native::subprocess::{
-    plan_sign, NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
-    NativeSignOptions, NativeSignPlan,
+    NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
+    NativeSignOptions, NativeSignPlan, plan_sign,
 };
 use crate::ops::native::{
     DigestAlgorithm, NativeKeyRef, NativeSignRequest, NativeSignatureFormat, NativeSignatureScheme,
 };
 use crate::ops::seed::{
-    HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
-    SeedProfile, SoftwareSeedDerivationRequest, SubprocessSeedBackend, open_and_derive, plan_open,
-    seed_profile_from_profile,
+    HkdfSha256SeedDeriver, SeedBackend, SeedIdentity, SeedOpenAuthSource, SeedOpenOutput,
+    SeedOpenRequest, SoftwareSeedDerivationRequest, SubprocessSeedBackend, open_and_derive,
+    plan_open, seed_profile_from_profile,
 };
 
 const SEED_SIGNING_KEY_NAMESPACE: &str = "tpm2-derive.sign";
@@ -71,9 +70,11 @@ impl From<UseArg> for UseCase {
             UseArg::Sign => Self::Sign,
             UseArg::Verify => Self::Verify,
             UseArg::Derive => Self::Derive,
-            UseArg::SshAgent => Self::SshAgent,
+            UseArg::Ssh => Self::Ssh,
             UseArg::Encrypt => Self::Encrypt,
             UseArg::Decrypt => Self::Decrypt,
+            UseArg::ExportSecret => Self::ExportSecret,
+            UseArg::All => unreachable!("use=all must be expanded before conversion"),
         }
     }
 }
@@ -128,12 +129,44 @@ impl From<KeygenFormatArg> for KeygenFormat {
     }
 }
 
+fn derivation_overrides(args: args::DerivationInputArgs) -> DerivationOverrides {
+    DerivationOverrides {
+        org: args.org,
+        purpose: args.purpose,
+        context: args.context.into_iter().collect(),
+    }
+}
+
+fn identity_create_uses(uses: Vec<UseArg>) -> Vec<UseCase> {
+    let has_all = uses.iter().any(|use_arg| matches!(use_arg, UseArg::All));
+    let mut resolved: Vec<_> = uses
+        .into_iter()
+        .filter(|use_arg| !matches!(use_arg, UseArg::All))
+        .map(Into::into)
+        .collect();
+
+    if has_all {
+        resolved.extend([
+            UseCase::Sign,
+            UseCase::Verify,
+            UseCase::Encrypt,
+            UseCase::Decrypt,
+            UseCase::Derive,
+            UseCase::Ssh,
+        ]);
+    }
+
+    resolved.sort();
+    resolved.dedup();
+    resolved
+}
+
 pub fn run(cli: Cli) -> Result<String> {
     let probe = default_probe();
 
     match cli.command {
         Command::Inspect(args) => run_inspect(cli.json, &probe, args),
-        Command::Setup(args) => run_setup(cli.json, &probe, args),
+        Command::Identity(args) => run_identity(cli.json, &probe, args),
         Command::Derive(args) => run_derive(cli.json, args),
         Command::Sign(args) => run_sign(cli.json, args),
         Command::Verify(args) => run_verify(cli.json, args),
@@ -142,9 +175,7 @@ pub fn run(cli: Cli) -> Result<String> {
         Command::Keygen(args) => run_keygen(cli.json, args),
         Command::Export(args) => run_export(cli.json, args),
         Command::Import(args) => run_import(cli.json, args),
-        Command::Ssh(SshCommand::Agent(SshAgentCommand::Add(args))) => {
-            run_ssh_agent_add(cli.json, args)
-        }
+        Command::SshAdd(args) => run_ssh_add(cli.json, args),
     }
 }
 
@@ -158,21 +189,22 @@ fn run_inspect(json: bool, probe: &dyn CapabilityProbe, args: InspectArgs) -> Re
     success(json, CommandPath::from_segments(["inspect"]), report)
 }
 
-fn run_setup(json: bool, probe: &dyn CapabilityProbe, args: SetupArgs) -> Result<String> {
-    let request = SetupRequest {
-        profile: args.profile,
+fn run_identity(json: bool, probe: &dyn CapabilityProbe, args: IdentityArgs) -> Result<String> {
+    let request = IdentityCreateRequest {
+        identity: args.identity,
         algorithm: args.algorithm.into(),
-        uses: args.uses.into_iter().map(Into::into).collect(),
+        uses: identity_create_uses(args.uses),
         requested_mode: args.mode.into(),
+        defaults: derivation_overrides(args.defaults),
         state_dir: args.state_dir,
         dry_run: args.dry_run,
     };
 
-    match ops::resolve_profile(probe, &request) {
-        Ok(result) => success(json, CommandPath::from_segments(["setup"]), result),
+    match ops::resolve_identity(probe, &request) {
+        Ok(result) => success(json, CommandPath::from_segments(["identity"]), result),
         Err(error) => failure(
             json,
-            CommandPath::from_segments(["setup"]),
+            CommandPath::from_segments(["identity"]),
             ErrorEnvelope {
                 code: error.code().as_str().to_string(),
                 message: error.to_string(),
@@ -184,47 +216,17 @@ fn run_setup(json: bool, probe: &dyn CapabilityProbe, args: SetupArgs) -> Result
 
 fn run_derive(json: bool, args: DeriveArgs) -> Result<String> {
     let command = CommandPath::from_segments(["derive"]);
-    let ssh_agent_add = args.ssh_agent_add;
-    let ssh_agent_comment = args.ssh_agent_comment.clone();
-    let ssh_agent_socket = args.ssh_agent_socket.clone();
     let request = DeriveRequest {
-        profile: args.profile.clone(),
-        context: DerivationContext {
-            version: 1,
-            purpose: args.purpose,
-            namespace: args.namespace,
-            label: args.label,
-            context: args.context.into_iter().collect(),
-        },
+        identity: args.identity.clone(),
+        derivation: derivation_overrides(args.derivation),
         length: args.length,
     };
 
-    match ops::load_profile(&request.profile, args.state_dir.clone()) {
-        Ok(profile) => {
+    match ops::load_identity(&request.identity, args.state_dir.clone()) {
+        Ok(identity) => {
             let runner = ProcessCommandRunner;
-            match ops::derive::execute_with_defaults(&profile, &request, &runner) {
-                Ok(result) => {
-                    if ssh_agent_add {
-                        let agent_request = crate::model::SshAgentAddRequest {
-                            profile: profile.name.clone(),
-                            comment: ssh_agent_comment,
-                            socket: ssh_agent_socket,
-                            state_dir: args.state_dir,
-                        };
-                        if let Err(error) = ops::ssh::add_with_defaults(&profile, &agent_request) {
-                            return failure(
-                                json,
-                                command,
-                                ErrorEnvelope {
-                                    code: error.code().as_str().to_string(),
-                                    message: format!("derive succeeded but ssh-agent add failed: {error}"),
-                                },
-                                Vec::new(),
-                            );
-                        }
-                    }
-                    success(json, command, result)
-                }
+            match ops::derive::execute_with_defaults(&identity, &request, &runner) {
+                Ok(result) => success(json, command, result),
                 Err(error) => failure(
                     json,
                     command,
@@ -251,7 +253,7 @@ fn run_derive(json: bool, args: DeriveArgs) -> Result<String> {
 fn run_export(json: bool, args: ExportArgs) -> Result<String> {
     let command = export_command_path(args.kind.into());
     let request = ExportRequest {
-        profile: args.profile,
+        identity: args.identity,
         kind: args.kind.into(),
         output: args.output,
         public_key_format: args.public_key_format.map(Into::into),
@@ -296,7 +298,7 @@ fn run_import(json: bool, args: ImportArgs) -> Result<String> {
 
     let request = RecoveryImportRequest {
         bundle_path: args.bundle,
-        profile: args.profile,
+        identity: args.identity,
         state_dir: args.state_dir,
         overwrite_existing: args.overwrite_existing,
     };
@@ -315,17 +317,17 @@ fn run_import(json: bool, args: ImportArgs) -> Result<String> {
     }
 }
 
-fn run_ssh_agent_add(json: bool, args: SshAgentAddArgs) -> Result<String> {
-    let command = CommandPath::from_segments(["ssh-agent", "add"]);
-    let request = SshAgentAddRequest {
-        profile: args.profile.clone(),
+fn run_ssh_add(json: bool, args: SshAddArgs) -> Result<String> {
+    let command = CommandPath::from_segments(["ssh-add"]);
+    let request = SshAddRequest {
+        identity: args.identity.clone(),
         comment: args.comment.clone(),
         socket: args.socket.clone(),
         state_dir: args.state_dir.clone(),
     };
 
-    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
-        Ok(profile) => profile,
+    let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
+        Ok(identity) => identity,
         Err(error) => {
             return failure(
                 json,
@@ -339,7 +341,7 @@ fn run_ssh_agent_add(json: bool, args: SshAgentAddArgs) -> Result<String> {
         }
     };
 
-    match ops::ssh::add_with_defaults(&profile, &request) {
+    match ops::ssh::add_with_defaults(&identity, &request) {
         Ok(result) => success(json, command, result),
         Err(error) => failure(
             json,
@@ -355,8 +357,8 @@ fn run_ssh_agent_add(json: bool, args: SshAgentAddArgs) -> Result<String> {
 
 fn run_encrypt(json: bool, args: EncryptArgs) -> Result<String> {
     let command = CommandPath::from_segments(["encrypt"]);
-    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
-        Ok(profile) => profile,
+    let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
+        Ok(identity) => identity,
         Err(error) => {
             return failure(
                 json,
@@ -372,10 +374,14 @@ fn run_encrypt(json: bool, args: EncryptArgs) -> Result<String> {
 
     let input_bytes = load_input_bytes(&parse_input_source(&args.input), "encrypt input")?;
     let runner = ProcessCommandRunner;
-    match ops::encrypt::encrypt_with_defaults(&profile, &input_bytes, &runner) {
+    match ops::encrypt::encrypt_with_defaults(&identity, &input_bytes, &runner) {
         Ok(mut result) => {
             if let Some(ref output) = args.output {
-                let ct = result.ciphertext.as_ref().map(|h| hex_decode_bytes(h)).unwrap_or_default();
+                let ct = result
+                    .ciphertext
+                    .as_ref()
+                    .map(|h| hex_decode_bytes(h))
+                    .unwrap_or_default();
                 write_output_file(output, &ct)?;
                 result.output_path = Some(output.clone());
                 result.ciphertext = None;
@@ -396,8 +402,8 @@ fn run_encrypt(json: bool, args: EncryptArgs) -> Result<String> {
 
 fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
     let command = CommandPath::from_segments(["decrypt"]);
-    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
-        Ok(profile) => profile,
+    let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
+        Ok(identity) => identity,
         Err(error) => {
             return failure(
                 json,
@@ -415,10 +421,14 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
     // Try to interpret as hex first (the format we emit), otherwise use raw bytes.
     let ciphertext = try_hex_decode(&raw_input).unwrap_or(raw_input);
     let runner = ProcessCommandRunner;
-    match ops::encrypt::decrypt_with_defaults(&profile, &ciphertext, &runner) {
+    match ops::encrypt::decrypt_with_defaults(&identity, &ciphertext, &runner) {
         Ok(mut result) => {
             if let Some(ref output) = args.output {
-                let pt = result.plaintext.as_ref().map(|h| hex_decode_bytes(h)).unwrap_or_default();
+                let pt = result
+                    .plaintext
+                    .as_ref()
+                    .map(|h| hex_decode_bytes(h))
+                    .unwrap_or_default();
                 write_output_file(output, &pt)?;
                 result.output_path = Some(output.clone());
                 result.plaintext = None;
@@ -439,8 +449,8 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
 
 fn run_keygen(json: bool, args: KeygenArgs) -> Result<String> {
     let command = CommandPath::from_segments(["keygen"]);
-    let profile = match ops::load_profile(&args.from_profile, args.state_dir.clone()) {
-        Ok(profile) => profile,
+    let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
+        Ok(identity) => identity,
         Err(error) => {
             return failure(
                 json,
@@ -457,30 +467,30 @@ fn run_keygen(json: bool, args: KeygenArgs) -> Result<String> {
     // Validate kind constraint against resolved mode
     let kind: KeygenKind = args.kind.into();
     match kind {
-        KeygenKind::Auto => {} // accept whatever mode the profile resolved to
-        KeygenKind::Prf if profile.mode.resolved != Mode::Prf => {
+        KeygenKind::Auto => {} // accept whatever mode the identity resolved to
+        KeygenKind::Prf if identity.mode.resolved != Mode::Prf => {
             return failure(
                 json,
                 command,
                 ErrorEnvelope {
                     code: "validation".to_string(),
                     message: format!(
-                        "--kind prf requested but profile '{}' resolved to {:?}",
-                        profile.name, profile.mode.resolved
+                        "--kind prf requested but identity '{}' resolved to {:?}",
+                        identity.name, identity.mode.resolved
                     ),
                 },
                 Vec::new(),
             );
         }
-        KeygenKind::Seed if profile.mode.resolved != Mode::Seed => {
+        KeygenKind::Seed if identity.mode.resolved != Mode::Seed => {
             return failure(
                 json,
                 command,
                 ErrorEnvelope {
                     code: "validation".to_string(),
                     message: format!(
-                        "--kind seed requested but profile '{}' resolved to {:?}",
-                        profile.name, profile.mode.resolved
+                        "--kind seed requested but identity '{}' resolved to {:?}",
+                        identity.name, identity.mode.resolved
                     ),
                 },
                 Vec::new(),
@@ -490,7 +500,7 @@ fn run_keygen(json: bool, args: KeygenArgs) -> Result<String> {
     }
 
     let runner = ProcessCommandRunner;
-    match ops::keygen::execute_with_defaults(&profile, &runner) {
+    match ops::keygen::execute_with_defaults(&identity, &runner) {
         Ok(mut result) => {
             let format: KeygenFormat = args.format.into();
             if let Some(ref output) = args.output {
@@ -520,21 +530,19 @@ fn render_keygen_output(format: KeygenFormat, result: &crate::model::KeygenResul
                 result.secret_key_hex, result.public_key_hex
             )
         }
-        KeygenFormat::Json => {
-            serde_json::to_string_pretty(result).unwrap_or_default()
-        }
+        KeygenFormat::Json => serde_json::to_string_pretty(result).unwrap_or_default(),
     }
 }
 
 fn run_sign(json: bool, args: SignArgs) -> Result<String> {
     let request = SignRequest {
-        profile: args.profile.clone(),
+        identity: args.identity.clone(),
         input: parse_input_source(&args.input),
     };
     let command = CommandPath::from_segments(["sign"]);
 
-    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
-        Ok(profile) => profile,
+    let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
+        Ok(identity) => identity,
         Err(error) => {
             return failure(
                 json,
@@ -550,24 +558,24 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
 
     let mut diagnostics = vec![
         crate::model::Diagnostic::info(
-            "loaded-profile",
+            "loaded-identity",
             format!(
-                "loaded profile '{}' from '{}'",
-                profile.name,
-                profile.storage.profile_path.display()
+                "loaded identity '{}' from '{}'",
+                identity.name,
+                identity.storage.identity_path.display()
             ),
         ),
         crate::model::Diagnostic::info(
-            "profile-mode",
+            "identity-mode",
             format!(
                 "sign request is bound to resolved mode {:?}",
-                profile.mode.resolved
+                identity.mode.resolved
             ),
         ),
     ];
 
-    match profile.mode.resolved {
-        Mode::Native => match stage_native_sign(&request, &profile) {
+    match identity.mode.resolved {
+        Mode::Native => match stage_native_sign(&request, &identity) {
             Ok(staged) => {
                 diagnostics.extend(staged.diagnostics.clone());
 
@@ -605,7 +613,7 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
                     json,
                     command,
                     SignOperationResult {
-                        profile,
+                        identity,
                         request,
                         mode: Mode::Native,
                         state: if signature_bytes_written.is_some() {
@@ -636,14 +644,14 @@ fn run_sign(json: bool, args: SignArgs) -> Result<String> {
         Mode::Prf => unsupported_mode_operation(
             json,
             command,
-            profile.mode.resolved,
+            identity.mode.resolved,
             diagnostics,
-            "sign is not wired for PRF-mode profiles yet",
+            "sign is not wired for PRF-mode identities yet",
         ),
         Mode::Seed => {
             let backend =
-                SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
-            match sign_seed_with_backend(&request, &profile, &backend, &HkdfSha256SeedDeriver) {
+                SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+            match sign_seed_with_backend(&request, &identity, &backend, &HkdfSha256SeedDeriver) {
                 Ok((result, sign_diagnostics)) => {
                     diagnostics.extend(sign_diagnostics);
                     success_with_diagnostics(json, command, result, diagnostics)
@@ -671,14 +679,14 @@ where
     R: CommandRunner,
 {
     let request = VerifyRequest {
-        profile: args.profile.clone(),
+        identity: args.identity.clone(),
         input: parse_input_source(&args.input),
         signature: parse_input_source(&args.signature),
     };
     let command = CommandPath::from_segments(["verify"]);
 
-    let profile = match ops::load_profile(&args.profile, args.state_dir.clone()) {
-        Ok(profile) => profile,
+    let identity = match ops::load_identity(&args.identity, args.state_dir.clone()) {
+        Ok(identity) => identity,
         Err(error) => {
             return failure(
                 json,
@@ -694,36 +702,36 @@ where
 
     let mut diagnostics = vec![
         crate::model::Diagnostic::info(
-            "loaded-profile",
+            "loaded-identity",
             format!(
-                "loaded profile '{}' from '{}'",
-                profile.name,
-                profile.storage.profile_path.display()
+                "loaded identity '{}' from '{}'",
+                identity.name,
+                identity.storage.identity_path.display()
             ),
         ),
         crate::model::Diagnostic::info(
-            "profile-mode",
+            "identity-mode",
             format!(
                 "verify request is bound to resolved mode {:?}",
-                profile.mode.resolved
+                identity.mode.resolved
             ),
         ),
     ];
 
-    let verification = match profile.mode.resolved {
-        Mode::Native => verify_native_with_runner(&request, &profile, runner),
+    let verification = match identity.mode.resolved {
+        Mode::Native => verify_native_with_runner(&request, &identity, runner),
         Mode::Seed => {
             let backend =
-                SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
-            verify_seed_with_backend(&request, &profile, &backend, &HkdfSha256SeedDeriver)
+                SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+            verify_seed_with_backend(&request, &identity, &backend, &HkdfSha256SeedDeriver)
         }
         Mode::Prf => {
             return unsupported_mode_operation(
                 json,
                 command,
-                profile.mode.resolved,
+                identity.mode.resolved,
                 diagnostics,
-                "verify is not wired for PRF-mode profiles yet; PRF roots can derive child key material, but the CLI verify flow does not yet derive and use a profile-bound public key",
+                "verify is not wired for PRF-mode identities yet; PRF roots can derive child key material, but the CLI verify flow does not yet derive and use a identity-bound public key",
             );
         }
     };
@@ -747,23 +755,23 @@ where
 
 fn verify_native_with_runner<R>(
     request: &VerifyRequest,
-    profile: &Profile,
+    identity: &Identity,
     runner: &R,
 ) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)>
 where
     R: CommandRunner,
 {
-    if profile.algorithm != Algorithm::P256 {
+    if identity.algorithm != Algorithm::P256 {
         return Err(Error::Unsupported(format!(
-            "native verify is currently wired only for p256 profiles, found {:?}",
-            profile.algorithm
+            "native verify is currently wired only for p256 identities, found {:?}",
+            identity.algorithm
         )));
     }
 
-    if !profile.uses.contains(&UseCase::Verify) {
+    if !identity.uses.contains(&UseCase::Verify) {
         return Err(Error::Unsupported(format!(
-            "profile '{}' is not configured with verify use",
-            profile.name
+            "identity '{}' is not configured with verify use",
+            identity.name
         )));
     }
 
@@ -785,14 +793,14 @@ where
     }
 
     let digest = Sha256::digest(&input_bytes).to_vec();
-    let public_key_der = export_native_public_key_der_with_runner(profile, runner)?;
+    let public_key_der = export_native_public_key_der_with_runner(identity, runner)?;
     let verifying_key = load_p256_verifying_key(&public_key_der)?;
     let (signature, signature_format) = parse_p256_verify_signature(&signature_bytes)?;
     let verified = verifying_key.verify(&input_bytes, &signature).is_ok();
 
     Ok((
         VerifyOperationResult {
-            profile: profile.clone(),
+            identity: identity.clone(),
             request: request.clone(),
             mode: Mode::Native,
             verified,
@@ -814,7 +822,7 @@ where
 
 fn sign_seed_with_backend<B, D>(
     request: &SignRequest,
-    profile: &Profile,
+    identity: &Identity,
     backend: &B,
     deriver: &D,
 ) -> Result<(SeedSignOperationResult, Vec<crate::model::Diagnostic>)>
@@ -822,10 +830,10 @@ where
     B: SeedBackend,
     D: crate::ops::seed::SeedSoftwareDeriver,
 {
-    if !profile.uses.contains(&UseCase::Sign) {
+    if !identity.uses.contains(&UseCase::Sign) {
         return Err(Error::Unsupported(format!(
-            "profile '{}' is not configured with sign use",
-            profile.name
+            "identity '{}' is not configured with sign use",
+            identity.name
         )));
     }
 
@@ -836,22 +844,24 @@ where
         ));
     }
 
-    let seed_request = seed_sign_open_request(profile)?;
+    let seed_request = seed_sign_open_request(identity)?;
     let seed_plan = plan_open(&seed_request)?;
     let digest = Sha256::digest(&input_bytes).to_vec();
     let derived = open_and_derive(backend, deriver, &seed_request)?;
     let diagnostics =
-        seed_sign_diagnostics(profile, &seed_plan.warnings, derived.expose_secret().len());
+        seed_sign_diagnostics(identity, &seed_plan.warnings, derived.expose_secret().len());
 
-    let (signature_bytes, signature_format) = match profile.algorithm {
+    let (signature_bytes, signature_format) = match identity.algorithm {
         Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, derived.expose_secret())?,
-        Algorithm::P256 => sign_seed_p256(&input_bytes, derived.expose_secret(), profile)?,
-        Algorithm::Secp256k1 => sign_seed_secp256k1(&input_bytes, derived.expose_secret(), profile)?,
+        Algorithm::P256 => sign_seed_p256(&input_bytes, derived.expose_secret(), identity)?,
+        Algorithm::Secp256k1 => {
+            sign_seed_secp256k1(&input_bytes, derived.expose_secret(), identity)?
+        }
     };
 
     Ok((
         SeedSignOperationResult {
-            profile: profile.clone(),
+            identity: identity.clone(),
             request: request.clone(),
             mode: Mode::Seed,
             digest_algorithm: DigestAlgorithm::Sha256,
@@ -882,41 +892,53 @@ fn sign_seed_ed25519(
 fn sign_seed_p256(
     input_bytes: &[u8],
     derived_seed: &[u8],
-    profile: &Profile,
+    identity: &Identity,
 ) -> Result<(Vec<u8>, SeedSignatureFormat)> {
-    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let scalar_bytes =
+        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
     let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
-            "failed to materialize p256 seed signing key for profile '{}': {error}",
-            profile.name
+            "failed to materialize p256 seed signing key for identity '{}': {error}",
+            identity.name
         ))
     })?;
-    let signature: P256Signature = <P256SigningKey as p256::ecdsa::signature::Signer<P256Signature>>::sign(&signing_key, input_bytes);
-    Ok((signature.to_der().as_bytes().to_vec(), SeedSignatureFormat::Der))
+    let signature: P256Signature = <P256SigningKey as p256::ecdsa::signature::Signer<
+        P256Signature,
+    >>::sign(&signing_key, input_bytes);
+    Ok((
+        signature.to_der().as_bytes().to_vec(),
+        SeedSignatureFormat::Der,
+    ))
 }
 
 fn sign_seed_secp256k1(
     input_bytes: &[u8],
     derived_seed: &[u8],
-    profile: &Profile,
+    identity: &Identity,
 ) -> Result<(Vec<u8>, SeedSignatureFormat)> {
-    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let scalar_bytes =
+        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
     let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
-            "failed to materialize secp256k1 seed signing key for profile '{}': {error}",
-            profile.name
+            "failed to materialize secp256k1 seed signing key for identity '{}': {error}",
+            identity.name
         ))
     })?;
-    let signature: K256Signature = <K256SigningKey as k256::ecdsa::signature::Signer<K256Signature>>::sign(&signing_key, input_bytes);
-    Ok((signature.to_der().as_bytes().to_vec(), SeedSignatureFormat::Der))
+    let signature: K256Signature = <K256SigningKey as k256::ecdsa::signature::Signer<
+        K256Signature,
+    >>::sign(&signing_key, input_bytes);
+    Ok((
+        signature.to_der().as_bytes().to_vec(),
+        SeedSignatureFormat::Der,
+    ))
 }
 
-fn seed_sign_open_request(profile: &Profile) -> Result<SeedOpenRequest> {
+fn seed_sign_open_request(identity: &Identity) -> Result<SeedOpenRequest> {
     Ok(SeedOpenRequest {
-        profile: seed_sign_profile(profile)?,
+        identity: seed_sign_profile(identity)?,
         auth_source: SeedOpenAuthSource::None,
         output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
-            spec: seed_sign_derivation_spec(profile.algorithm)?,
+            spec: seed_sign_derivation_spec(identity.algorithm)?,
             output_bytes: 32,
         }),
         require_fresh_unseal: true,
@@ -924,15 +946,15 @@ fn seed_sign_open_request(profile: &Profile) -> Result<SeedOpenRequest> {
     })
 }
 
-fn seed_sign_profile(profile: &Profile) -> Result<SeedProfile> {
-    if profile.mode.resolved != Mode::Seed {
+fn seed_sign_profile(identity: &Identity) -> Result<SeedIdentity> {
+    if identity.mode.resolved != Mode::Seed {
         return Err(Error::Unsupported(format!(
-            "profile '{}' did not resolve to seed mode",
-            profile.name
+            "identity '{}' did not resolve to seed mode",
+            identity.name
         )));
     }
 
-    seed_profile_from_profile(profile)
+    seed_profile_from_profile(identity)
 }
 
 fn seed_sign_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
@@ -940,7 +962,7 @@ fn seed_sign_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
 }
 
 fn seed_sign_diagnostics(
-    profile: &Profile,
+    identity: &Identity,
     warnings: &[crate::model::Diagnostic],
     derived_bytes: usize,
 ) -> Vec<crate::model::Diagnostic> {
@@ -949,10 +971,7 @@ fn seed_sign_diagnostics(
         "seed-signer-derived",
         format!(
             "derived {} bytes of {:?} signer material from sealed seed using {} {}",
-            derived_bytes,
-            profile.algorithm,
-            SEED_SIGNING_KEY_NAMESPACE,
-            SEED_SIGNING_KEY_PATH,
+            derived_bytes, identity.algorithm, SEED_SIGNING_KEY_NAMESPACE, SEED_SIGNING_KEY_PATH,
         ),
     ));
     diagnostics
@@ -960,7 +979,7 @@ fn seed_sign_diagnostics(
 
 fn verify_seed_with_backend<B, D>(
     request: &VerifyRequest,
-    profile: &Profile,
+    identity: &Identity,
     backend: &B,
     deriver: &D,
 ) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)>
@@ -968,10 +987,10 @@ where
     B: SeedBackend,
     D: crate::ops::seed::SeedSoftwareDeriver,
 {
-    if !profile.uses.contains(&UseCase::Verify) {
+    if !identity.uses.contains(&UseCase::Verify) {
         return Err(Error::Unsupported(format!(
-            "profile '{}' is not configured with verify use",
-            profile.name
+            "identity '{}' is not configured with verify use",
+            identity.name
         )));
     }
 
@@ -992,17 +1011,17 @@ where
         ));
     }
 
-    let seed_request = seed_verify_open_request(profile)?;
+    let seed_request = seed_verify_open_request(identity)?;
     let seed_plan = plan_open(&seed_request)?;
     let digest = Sha256::digest(&input_bytes).to_vec();
     let derived = open_and_derive(backend, deriver, &seed_request)?;
     let diagnostics =
-        seed_verify_diagnostics(profile, &seed_plan.warnings, derived.expose_secret().len());
+        seed_verify_diagnostics(identity, &seed_plan.warnings, derived.expose_secret().len());
 
-    match profile.algorithm {
+    match identity.algorithm {
         Algorithm::Ed25519 => verify_seed_ed25519(
             request,
-            profile,
+            identity,
             &input_bytes,
             &signature_bytes,
             &digest,
@@ -1011,7 +1030,7 @@ where
         ),
         Algorithm::P256 => verify_seed_p256(
             request,
-            profile,
+            identity,
             &input_bytes,
             &signature_bytes,
             &digest,
@@ -1020,7 +1039,7 @@ where
         ),
         Algorithm::Secp256k1 => verify_seed_secp256k1(
             request,
-            profile,
+            identity,
             &input_bytes,
             &signature_bytes,
             &digest,
@@ -1032,7 +1051,7 @@ where
 
 fn verify_seed_ed25519(
     request: &VerifyRequest,
-    profile: &Profile,
+    identity: &Identity,
     input_bytes: &[u8],
     signature_bytes: &[u8],
     digest: &[u8],
@@ -1053,7 +1072,7 @@ fn verify_seed_ed25519(
 
     Ok((
         VerifyOperationResult {
-            profile: profile.clone(),
+            identity: identity.clone(),
             request: request.clone(),
             mode: Mode::Seed,
             verified,
@@ -1069,18 +1088,19 @@ fn verify_seed_ed25519(
 
 fn verify_seed_p256(
     request: &VerifyRequest,
-    profile: &Profile,
+    identity: &Identity,
     input_bytes: &[u8],
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
     diagnostics: Vec<crate::model::Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
-    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let scalar_bytes =
+        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
     let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
-            "failed to materialize p256 seed verifying key for profile '{}': {error}",
-            profile.name
+            "failed to materialize p256 seed verifying key for identity '{}': {error}",
+            identity.name
         ))
     })?;
     let verifying_key = signing_key.verifying_key();
@@ -1089,7 +1109,7 @@ fn verify_seed_p256(
 
     Ok((
         VerifyOperationResult {
-            profile: profile.clone(),
+            identity: identity.clone(),
             request: request.clone(),
             mode: Mode::Seed,
             verified,
@@ -1105,27 +1125,29 @@ fn verify_seed_p256(
 
 fn verify_seed_secp256k1(
     request: &VerifyRequest,
-    profile: &Profile,
+    identity: &Identity,
     input_bytes: &[u8],
     signature_bytes: &[u8],
     digest: &[u8],
     derived_seed: &[u8],
     diagnostics: Vec<crate::model::Diagnostic>,
 ) -> Result<(VerifyOperationResult, Vec<crate::model::Diagnostic>)> {
-    let scalar_bytes = crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, profile.algorithm)?;
+    let scalar_bytes =
+        crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
     let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
-            "failed to materialize secp256k1 seed verifying key for profile '{}': {error}",
-            profile.name
+            "failed to materialize secp256k1 seed verifying key for identity '{}': {error}",
+            identity.name
         ))
     })?;
     let verifying_key = signing_key.verifying_key();
     let (signature, signature_format) = parse_k256_verify_signature(signature_bytes)?;
-    let verified = k256::ecdsa::signature::Verifier::verify(verifying_key, input_bytes, &signature).is_ok();
+    let verified =
+        k256::ecdsa::signature::Verifier::verify(verifying_key, input_bytes, &signature).is_ok();
 
     Ok((
         VerifyOperationResult {
-            profile: profile.clone(),
+            identity: identity.clone(),
             request: request.clone(),
             mode: Mode::Seed,
             verified,
@@ -1139,12 +1161,12 @@ fn verify_seed_secp256k1(
     ))
 }
 
-fn seed_verify_open_request(profile: &Profile) -> Result<SeedOpenRequest> {
+fn seed_verify_open_request(identity: &Identity) -> Result<SeedOpenRequest> {
     Ok(SeedOpenRequest {
-        profile: seed_verify_profile(profile)?,
+        identity: seed_verify_profile(identity)?,
         auth_source: SeedOpenAuthSource::None,
         output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
-            spec: seed_verify_derivation_spec(profile.algorithm)?,
+            spec: seed_verify_derivation_spec(identity.algorithm)?,
             output_bytes: 32,
         }),
         require_fresh_unseal: true,
@@ -1152,15 +1174,15 @@ fn seed_verify_open_request(profile: &Profile) -> Result<SeedOpenRequest> {
     })
 }
 
-fn seed_verify_profile(profile: &Profile) -> Result<SeedProfile> {
-    if profile.mode.resolved != Mode::Seed {
+fn seed_verify_profile(identity: &Identity) -> Result<SeedIdentity> {
+    if identity.mode.resolved != Mode::Seed {
         return Err(Error::Unsupported(format!(
-            "profile '{}' did not resolve to seed mode",
-            profile.name
+            "identity '{}' did not resolve to seed mode",
+            identity.name
         )));
     }
 
-    seed_profile_from_profile(profile)
+    seed_profile_from_profile(identity)
 }
 
 fn seed_verify_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
@@ -1185,7 +1207,7 @@ fn seed_signing_key_derivation_spec(algorithm: Algorithm) -> Result<DerivationSp
 }
 
 fn seed_verify_diagnostics(
-    profile: &Profile,
+    identity: &Identity,
     warnings: &[crate::model::Diagnostic],
     derived_bytes: usize,
 ) -> Vec<crate::model::Diagnostic> {
@@ -1194,10 +1216,7 @@ fn seed_verify_diagnostics(
         "seed-verifier-derived",
         format!(
             "derived {} bytes of {:?} verifier material from sealed seed using {} {}",
-            derived_bytes,
-            profile.algorithm,
-            SEED_SIGNING_KEY_NAMESPACE,
-            SEED_SIGNING_KEY_PATH,
+            derived_bytes, identity.algorithm, SEED_SIGNING_KEY_NAMESPACE, SEED_SIGNING_KEY_PATH,
         ),
     ));
     diagnostics
@@ -1214,11 +1233,11 @@ fn export_command_path(kind: ExportKind) -> CommandPath {
 fn run_placeholder(
     json: bool,
     command: CommandPath,
-    profile: String,
+    identity: String,
     operation: &str,
     summary: String,
 ) -> Result<String> {
-    let _request_marker = build_placeholder_request(operation, profile);
+    let _request_marker = build_placeholder_request(operation, identity);
 
     failure(
         json,
@@ -1236,7 +1255,7 @@ fn run_placeholder(
 
 #[derive(Debug, Clone, Serialize)]
 struct SignOperationResult {
-    profile: Profile,
+    identity: Identity,
     request: SignRequest,
     mode: Mode,
     state: String,
@@ -1250,7 +1269,7 @@ struct SignOperationResult {
 
 #[derive(Debug, Clone, Serialize)]
 struct SeedSignOperationResult {
-    profile: Profile,
+    identity: Identity,
     request: SignRequest,
     mode: Mode,
     digest_algorithm: DigestAlgorithm,
@@ -1278,7 +1297,7 @@ enum VerifySignatureFormat {
 
 #[derive(Debug, Clone, Serialize)]
 struct VerifyOperationResult {
-    profile: Profile,
+    identity: Identity,
     request: VerifyRequest,
     mode: Mode,
     verified: bool,
@@ -1321,34 +1340,34 @@ fn unsupported_mode_operation(
     )
 }
 
-fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedNativeSign> {
-    if profile.algorithm != Algorithm::P256 {
+fn stage_native_sign(request: &SignRequest, identity: &Identity) -> Result<StagedNativeSign> {
+    if identity.algorithm != Algorithm::P256 {
         return Err(Error::Unsupported(format!(
-            "native sign is currently wired only for p256 profiles, found {:?}",
-            profile.algorithm
+            "native sign is currently wired only for p256 identities, found {:?}",
+            identity.algorithm
         )));
     }
 
-    if !profile.uses.contains(&UseCase::Sign) {
+    if !identity.uses.contains(&UseCase::Sign) {
         return Err(Error::Unsupported(format!(
-            "profile '{}' is not configured with sign use",
-            profile.name
+            "identity '{}' is not configured with sign use",
+            identity.name
         )));
     }
 
-    profile.storage.state_layout.ensure_dirs()?;
+    identity.storage.state_layout.ensure_dirs()?;
 
-    let runtime_dir = profile
+    let runtime_dir = identity
         .storage
         .state_layout
         .objects_dir
-        .join(&profile.name)
+        .join(&identity.name)
         .join("native-sign");
-    let output_dir = profile
+    let output_dir = identity
         .storage
         .state_layout
         .exports_dir
-        .join(&profile.name)
+        .join(&identity.name)
         .join("signatures");
 
     ensure_dir(&runtime_dir, "native sign runtime")?;
@@ -1372,12 +1391,12 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
         ))
     })?;
 
-    let (locator, ready_for_execution, locator_diagnostics) = resolve_native_sign_locator(profile);
+    let (locator, ready_for_execution, locator_diagnostics) = resolve_native_sign_locator(identity);
     let plan = plan_sign(
         &NativeSignRequest {
             key: NativeKeyRef {
-                profile: profile.name.clone(),
-                key_id: ops::native_key_id(profile),
+                identity: identity.name.clone(),
+                key_id: ops::native_key_id(identity),
             },
             scheme: NativeSignatureScheme::Ecdsa,
             format: NativeSignatureFormat::Der,
@@ -1410,10 +1429,10 @@ fn stage_native_sign(request: &SignRequest, profile: &Profile) -> Result<StagedN
 }
 
 fn resolve_native_sign_locator(
-    profile: &Profile,
+    identity: &Identity,
 ) -> (NativeKeyLocator, bool, Vec<crate::model::Diagnostic>) {
     if let Some(path) = ops::metadata_path(
-        profile,
+        identity,
         &[
             "native.serialized_handle_path",
             "native.serialized-handle-path",
@@ -1429,7 +1448,7 @@ fn resolve_native_sign_locator(
     }
 
     if let Some(handle) = ops::metadata_value(
-        profile,
+        identity,
         &["native.persistent_handle", "native.persistent-handle"],
     ) {
         return (
@@ -1439,7 +1458,7 @@ fn resolve_native_sign_locator(
         );
     }
 
-    for path in ops::native_handle_path_candidates(profile) {
+    for path in ops::native_handle_path_candidates(identity) {
         if path.is_file() {
             return (
                 NativeKeyLocator::SerializedHandle { path },
@@ -1450,23 +1469,23 @@ fn resolve_native_sign_locator(
     }
 
     let missing_handle_path = ops::metadata_path(
-        profile,
+        identity,
         &[
             "native.serialized_handle_path",
             "native.serialized-handle-path",
         ],
     )
     .or_else(|| {
-        ops::native_handle_path_candidates(profile)
+        ops::native_handle_path_candidates(identity)
             .into_iter()
             .next()
     })
     .unwrap_or_else(|| {
-        profile
+        identity
             .storage
             .state_layout
             .objects_dir
-            .join(format!("{}.handle", profile.name))
+            .join(format!("{}.handle", identity.name))
     });
 
     (
@@ -1635,42 +1654,42 @@ fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn export_native_public_key_der_with_runner<R>(profile: &Profile, runner: &R) -> Result<Vec<u8>>
+fn export_native_public_key_der_with_runner<R>(identity: &Identity, runner: &R) -> Result<Vec<u8>>
 where
     R: CommandRunner,
 {
-    if profile.algorithm != Algorithm::P256 {
+    if identity.algorithm != Algorithm::P256 {
         return Err(Error::Unsupported(format!(
-            "native public-key export is currently wired only for p256 profiles, got {:?}",
-            profile.algorithm
+            "native public-key export is currently wired only for p256 identities, got {:?}",
+            identity.algorithm
         )));
     }
 
-    profile.storage.state_layout.ensure_dirs()?;
+    identity.storage.state_layout.ensure_dirs()?;
 
-    let locator = ops::resolve_native_key_locator(profile)?;
+    let locator = ops::resolve_native_key_locator(identity)?;
     let tempdir = TempfileBuilder::new()
         .prefix("native-verify-public-key-")
-        .tempdir_in(&profile.storage.state_layout.exports_dir)
+        .tempdir_in(&identity.storage.state_layout.exports_dir)
         .map_err(|error| {
             Error::State(format!(
                 "failed to create native verify workspace in '{}': {error}",
-                profile.storage.state_layout.exports_dir.display()
+                identity.storage.state_layout.exports_dir.display()
             ))
         })?;
 
     let plan = crate::ops::native::subprocess::plan_export_public_key(
         &crate::ops::native::NativePublicKeyExportRequest {
             key: NativeKeyRef {
-                profile: profile.name.clone(),
-                key_id: ops::native_key_id(profile),
+                identity: identity.name.clone(),
+                key_id: ops::native_key_id(identity),
             },
             encodings: vec![crate::ops::native::NativePublicKeyEncoding::SpkiDer],
         },
         &crate::ops::native::subprocess::NativePublicKeyExportOptions {
             locator,
             output_dir: tempdir.path().to_path_buf(),
-            file_stem: profile.name.clone(),
+            file_stem: identity.name.clone(),
         },
     )?;
 
@@ -1768,7 +1787,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn hex_decode_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
-        .filter_map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .filter_map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
         .collect()
 }
 
@@ -1790,7 +1812,10 @@ fn write_output_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
         })?;
     }
     fs::write(path, data).map_err(|e| {
-        Error::State(format!("failed to write output to '{}': {e}", path.display()))
+        Error::State(format!(
+            "failed to write output to '{}': {e}",
+            path.display()
+        ))
     })
 }
 
@@ -1812,45 +1837,43 @@ fn mode_name(mode: Mode) -> &'static str {
 }
 
 #[allow(dead_code)]
-fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Value {
+fn build_placeholder_request(operation: &str, identity: String) -> serde_json::Value {
     match operation {
         "derive" => serde_json::to_value(DeriveRequest {
-            profile,
-            context: DerivationContext {
-                version: 1,
-                purpose: "planned".to_string(),
-                namespace: "planned".to_string(),
-                label: None,
+            identity,
+            derivation: DerivationOverrides {
+                org: Some("planned".to_string()),
+                purpose: Some("planned".to_string()),
                 context: BTreeMap::new(),
             },
             length: 32,
         })
         .unwrap_or_default(),
         "sign" => serde_json::to_value(SignRequest {
-            profile,
+            identity,
             input: InputSource::Stdin,
         })
         .unwrap_or_default(),
         "verify" => serde_json::to_value(VerifyRequest {
-            profile,
+            identity,
             input: InputSource::Stdin,
             signature: InputSource::Stdin,
         })
         .unwrap_or_default(),
         "encrypt" => serde_json::to_value(EncryptRequest {
-            profile,
+            identity,
             input: InputSource::Stdin,
             output: None,
         })
         .unwrap_or_default(),
         "decrypt" => serde_json::to_value(DecryptRequest {
-            profile,
+            identity,
             input: InputSource::Stdin,
             output: None,
         })
         .unwrap_or_default(),
         "export" => serde_json::to_value(ExportRequest {
-            profile,
+            identity,
             kind: ExportKind::PublicKey,
             output: None,
             public_key_format: None,
@@ -1860,8 +1883,8 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
             confirm_phrase: None,
         })
         .unwrap_or_default(),
-        "ssh-agent add" => serde_json::to_value(SshAgentAddRequest {
-            profile,
+        "ssh-add" => serde_json::to_value(SshAddRequest {
+            identity,
             comment: None,
             socket: None,
             state_dir: None,
@@ -1870,13 +1893,12 @@ fn build_placeholder_request(operation: &str, profile: String) -> serde_json::Va
         _ => serde_json::to_value(PendingOperation {
             implemented: false,
             operation: operation.to_string(),
-            profile: Some(profile),
+            identity: Some(identity),
             summary: "planned command".to_string(),
         })
         .unwrap_or_default(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1892,7 +1914,7 @@ mod tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use crate::model::{ModeResolution, StateLayout};
+    use crate::model::{IdentityModeResolution, StateLayout};
     use crate::ops::seed::{SeedCreateRequest, SeedMaterial, SeedSoftwareDeriver};
 
     struct RecordingNativeSignRunner {
@@ -1978,12 +2000,12 @@ mod tests {
         }
     }
 
-    fn native_profile(root: &Path, mode: Mode, uses: Vec<UseCase>) -> Profile {
-        Profile::new(
+    fn native_profile(root: &Path, mode: Mode, uses: Vec<UseCase>) -> Identity {
+        Identity::new(
             "prod-signer".to_string(),
             Algorithm::P256,
             uses,
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Native,
                 resolved: mode,
                 reasons: vec![format!("{mode:?} requested")],
@@ -2011,19 +2033,19 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.seed.clone())))
         }
     }
 
-    fn seed_profile(root: &Path, algorithm: Algorithm, uses: Vec<UseCase>) -> Profile {
-        Profile::new(
+    fn seed_profile(root: &Path, algorithm: Algorithm, uses: Vec<UseCase>) -> Identity {
+        Identity::new(
             "seed-verifier".to_string(),
             algorithm,
             uses,
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
@@ -2056,7 +2078,7 @@ mod tests {
             json: false,
             command: Command::Import(ImportArgs {
                 bundle: PathBuf::from("backup.json"),
-                profile: Some("restored-user".to_string()),
+                identity: Some("restored-user".to_string()),
                 state_dir: None,
                 overwrite_existing: false,
                 confirm: false,
@@ -2068,18 +2090,18 @@ mod tests {
         assert_eq!(value["ok"], Value::Bool(false));
         assert_eq!(
             value["command"]["segments"],
-            Value::Array(vec![
-                Value::String("import".to_string()),
-            ])
+            Value::Array(vec![Value::String("import".to_string()),])
         );
         assert_eq!(
             value["error"]["code"],
             Value::String("validation".to_string())
         );
-        assert!(value["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("--confirm"));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("--confirm")
+        );
     }
 
     #[test]
@@ -2104,14 +2126,14 @@ mod tests {
     #[test]
     fn native_sign_executes_when_serialized_handle_exists() {
         let state_root = tempdir().expect("state root");
-        let profile = native_profile(state_root.path(), Mode::Native, vec![UseCase::Sign]);
-        profile
+        let identity = native_profile(state_root.path(), Mode::Native, vec![UseCase::Sign]);
+        identity
             .storage
             .state_layout
             .ensure_dirs()
             .expect("state dirs should exist");
 
-        let handle_path = profile
+        let handle_path = identity
             .storage
             .state_layout
             .objects_dir
@@ -2125,12 +2147,12 @@ mod tests {
         let runner = RecordingNativeSignRunner::success(plain_signature.clone());
         let staged = stage_native_sign(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
             },
-            &profile,
+            &identity,
         )
         .expect("staged native sign");
 
@@ -2151,20 +2173,22 @@ mod tests {
         );
         assert!(!staged.digest_path.as_os_str().is_empty());
         assert_eq!(runner.invocations().len(), 1);
-        assert!(!profile
-            .storage
-            .state_layout
-            .objects_dir
-            .join(&profile.name)
-            .join("native-sign")
-            .join("signature.p1363.bin")
-            .exists());
+        assert!(
+            !identity
+                .storage
+                .state_layout
+                .objects_dir
+                .join(&identity.name)
+                .join("native-sign")
+                .join("signature.p1363.bin")
+                .exists()
+        );
     }
 
     #[test]
     fn native_sign_stays_planned_when_setup_material_is_missing() {
         let state_root = tempdir().expect("state root");
-        let profile = native_profile(state_root.path(), Mode::Native, vec![UseCase::Sign]);
+        let identity = native_profile(state_root.path(), Mode::Native, vec![UseCase::Sign]);
         let runner = RecordingNativeSignRunner::success(vec![0x22; 64]);
 
         let input_path = state_root.path().join("input.bin");
@@ -2172,10 +2196,10 @@ mod tests {
 
         let staged = stage_native_sign(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
             },
-            &profile,
+            &identity,
         )
         .expect("staged native sign");
 
@@ -2192,14 +2216,14 @@ mod tests {
     #[test]
     fn native_verify_succeeds_for_valid_signature() {
         let state_root = tempdir().expect("state root");
-        let profile = native_profile(
+        let identity = native_profile(
             state_root.path(),
             Mode::Native,
             vec![UseCase::Sign, UseCase::Verify],
         );
-        profile.persist().expect("persist profile");
+        identity.persist().expect("persist identity");
 
-        let handle_path = profile
+        let handle_path = identity
             .storage
             .state_layout
             .objects_dir
@@ -2216,7 +2240,8 @@ mod tests {
         let output = run_verify_with_runner(
             true,
             VerifyArgs {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
+                derivation: Default::default(),
                 input: input_path.display().to_string(),
                 signature: signature_path.display().to_string(),
                 state_dir: Some(state_root.path().to_path_buf()),
@@ -2237,14 +2262,14 @@ mod tests {
     #[test]
     fn native_verify_returns_false_for_signature_mismatch() {
         let state_root = tempdir().expect("state root");
-        let profile = native_profile(
+        let identity = native_profile(
             state_root.path(),
             Mode::Native,
             vec![UseCase::Sign, UseCase::Verify],
         );
-        profile.persist().expect("persist profile");
+        identity.persist().expect("persist identity");
 
-        let handle_path = profile
+        let handle_path = identity
             .storage
             .state_layout
             .objects_dir
@@ -2262,7 +2287,8 @@ mod tests {
         let output = run_verify_with_runner(
             true,
             VerifyArgs {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
+                derivation: Default::default(),
                 input: input_path.display().to_string(),
                 signature: signature_path.display().to_string(),
                 state_dir: Some(state_root.path().to_path_buf()),
@@ -2280,15 +2306,15 @@ mod tests {
     #[test]
     fn verify_rejects_double_stdin_before_reading() {
         let state_root = tempdir().expect("state root");
-        let profile = native_profile(state_root.path(), Mode::Native, vec![UseCase::Verify]);
+        let identity = native_profile(state_root.path(), Mode::Native, vec![UseCase::Verify]);
 
         let error = verify_native_with_runner(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Stdin,
                 signature: InputSource::Stdin,
             },
-            &profile,
+            &identity,
             &RecordingNativePublicKeyRunner::success(Vec::new()),
         )
         .expect_err("double stdin should fail");
@@ -2301,9 +2327,9 @@ mod tests {
     #[test]
     fn seed_verify_supports_ed25519_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Verify]);
+        let identity = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Verify]);
         let backend = FakeSeedBackend::new(&[0x42; 32]);
-        let seed_request = seed_verify_open_request(&profile).expect("seed verify request");
+        let seed_request = seed_verify_open_request(&identity).expect("seed verify request");
         let derivation = match &seed_request.output {
             SeedOpenOutput::DerivedBytes(request) => request.clone(),
             SeedOpenOutput::RawSeed => unreachable!("seed verify uses derived bytes"),
@@ -2327,13 +2353,13 @@ mod tests {
 
         let (result, diagnostics) = verify_seed_with_backend(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
                     path: signature_path,
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2355,12 +2381,16 @@ mod tests {
     #[test]
     fn seed_verify_supports_p256_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(state_root.path(), Algorithm::P256, vec![UseCase::Sign, UseCase::Verify]);
+        let identity = seed_profile(
+            state_root.path(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+        );
         let backend = FakeSeedBackend::new(&[0x55; 32]);
 
         // Sign a message first to get valid signature material
         let message = b"hello from seed p256 verify".to_vec();
-        let seed_request = seed_sign_open_request(&profile).expect("seed sign request");
+        let seed_request = seed_sign_open_request(&identity).expect("seed sign request");
         let derivation = match &seed_request.output {
             SeedOpenOutput::DerivedBytes(request) => request.clone(),
             SeedOpenOutput::RawSeed => unreachable!("seed sign uses derived bytes"),
@@ -2368,8 +2398,8 @@ mod tests {
         let derived = HkdfSha256SeedDeriver
             .derive(&SecretBox::new(Box::new(vec![0x55; 32])), &derivation)
             .expect("derived seed");
-        let (signature, _format) = sign_seed_p256(&message, derived.expose_secret(), &profile)
-            .expect("seed p256 sign");
+        let (signature, _format) =
+            sign_seed_p256(&message, derived.expose_secret(), &identity).expect("seed p256 sign");
 
         let input_path = state_root.path().join("input.bin");
         let signature_path = state_root.path().join("signature.der");
@@ -2378,13 +2408,13 @@ mod tests {
 
         let (result, diagnostics) = verify_seed_with_backend(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
                     path: signature_path,
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2402,7 +2432,7 @@ mod tests {
     #[test]
     fn seed_sign_succeeds_for_ed25519_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Sign]);
+        let identity = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Sign]);
         let backend = FakeSeedBackend::new(&[0x42; 32]);
 
         let message = b"hello from seed ed25519 sign".to_vec();
@@ -2411,10 +2441,10 @@ mod tests {
 
         let (result, diagnostics) = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2432,7 +2462,7 @@ mod tests {
     #[test]
     fn seed_sign_succeeds_for_p256_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(state_root.path(), Algorithm::P256, vec![UseCase::Sign]);
+        let identity = seed_profile(state_root.path(), Algorithm::P256, vec![UseCase::Sign]);
         let backend = FakeSeedBackend::new(&[0x42; 32]);
 
         let message = b"hello from seed p256 sign".to_vec();
@@ -2441,10 +2471,10 @@ mod tests {
 
         let (result, _diagnostics) = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2458,7 +2488,7 @@ mod tests {
     #[test]
     fn seed_sign_succeeds_for_secp256k1_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(state_root.path(), Algorithm::Secp256k1, vec![UseCase::Sign]);
+        let identity = seed_profile(state_root.path(), Algorithm::Secp256k1, vec![UseCase::Sign]);
         let backend = FakeSeedBackend::new(&[0x42; 32]);
 
         let message = b"hello from seed secp256k1 sign".to_vec();
@@ -2467,10 +2497,10 @@ mod tests {
 
         let (result, _diagnostics) = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2484,7 +2514,7 @@ mod tests {
     #[test]
     fn seed_sign_rejects_profiles_without_sign_use() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Verify]);
+        let identity = seed_profile(state_root.path(), Algorithm::Ed25519, vec![UseCase::Verify]);
         let backend = FakeSeedBackend::new(&[0x42; 32]);
 
         let input_path = state_root.path().join("input.bin");
@@ -2492,10 +2522,10 @@ mod tests {
 
         let error = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2507,7 +2537,7 @@ mod tests {
     #[test]
     fn seed_sign_then_verify_round_trip_ed25519() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Algorithm::Ed25519,
             vec![UseCase::Sign, UseCase::Verify],
@@ -2520,12 +2550,12 @@ mod tests {
         fs::write(&input_path, &message).expect("input file");
         let (sign_result, _) = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2539,13 +2569,13 @@ mod tests {
         // Verify
         let (verify_result, _) = verify_seed_with_backend(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
                     path: signature_path,
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2557,7 +2587,7 @@ mod tests {
     #[test]
     fn seed_sign_then_verify_round_trip_p256() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Algorithm::P256,
             vec![UseCase::Sign, UseCase::Verify],
@@ -2569,12 +2599,12 @@ mod tests {
         fs::write(&input_path, &message).expect("input file");
         let (sign_result, _) = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2586,13 +2616,13 @@ mod tests {
 
         let (verify_result, _) = verify_seed_with_backend(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
                     path: signature_path,
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2604,7 +2634,7 @@ mod tests {
     #[test]
     fn seed_sign_then_verify_round_trip_secp256k1() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Algorithm::Secp256k1,
             vec![UseCase::Sign, UseCase::Verify],
@@ -2616,12 +2646,12 @@ mod tests {
         fs::write(&input_path, &message).expect("input file");
         let (sign_result, _) = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2633,13 +2663,13 @@ mod tests {
 
         let (verify_result, _) = verify_seed_with_backend(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
                     path: signature_path,
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2651,7 +2681,7 @@ mod tests {
     #[test]
     fn seed_verify_rejects_wrong_message_p256() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Algorithm::P256,
             vec![UseCase::Sign, UseCase::Verify],
@@ -2662,12 +2692,12 @@ mod tests {
         fs::write(&input_path, b"original message").expect("input file");
         let (sign_result, _) = sign_seed_with_backend(
             &SignRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path {
                     path: input_path.clone(),
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2682,13 +2712,13 @@ mod tests {
 
         let (verify_result, _) = verify_seed_with_backend(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
                     path: signature_path,
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2700,7 +2730,7 @@ mod tests {
     #[test]
     fn seed_verify_supports_secp256k1_profiles() {
         let state_root = tempdir().expect("state root");
-        let profile = seed_profile(
+        let identity = seed_profile(
             state_root.path(),
             Algorithm::Secp256k1,
             vec![UseCase::Sign, UseCase::Verify],
@@ -2708,7 +2738,7 @@ mod tests {
         let backend = FakeSeedBackend::new(&[0x55; 32]);
 
         let message = b"hello from seed secp256k1 verify".to_vec();
-        let seed_request = seed_sign_open_request(&profile).expect("seed sign request");
+        let seed_request = seed_sign_open_request(&identity).expect("seed sign request");
         let derivation = match &seed_request.output {
             SeedOpenOutput::DerivedBytes(request) => request.clone(),
             SeedOpenOutput::RawSeed => unreachable!("seed sign uses derived bytes"),
@@ -2716,8 +2746,9 @@ mod tests {
         let derived = HkdfSha256SeedDeriver
             .derive(&SecretBox::new(Box::new(vec![0x55; 32])), &derivation)
             .expect("derived seed");
-        let (signature, _format) = sign_seed_secp256k1(&message, derived.expose_secret(), &profile)
-            .expect("seed secp256k1 sign");
+        let (signature, _format) =
+            sign_seed_secp256k1(&message, derived.expose_secret(), &identity)
+                .expect("seed secp256k1 sign");
 
         let input_path = state_root.path().join("input.bin");
         let signature_path = state_root.path().join("signature.der");
@@ -2726,13 +2757,13 @@ mod tests {
 
         let (result, diagnostics) = verify_seed_with_backend(
             &VerifyRequest {
-                profile: profile.name.clone(),
+                identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 signature: InputSource::Path {
                     path: signature_path,
                 },
             },
-            &profile,
+            &identity,
             &backend,
             &HkdfSha256SeedDeriver,
         )
@@ -2750,9 +2781,7 @@ mod tests {
     fn hex_decode_test(hex: &str) -> Vec<u8> {
         hex.as_bytes()
             .chunks_exact(2)
-            .map(|pair| {
-                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()
-            })
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
             .collect()
     }
 }

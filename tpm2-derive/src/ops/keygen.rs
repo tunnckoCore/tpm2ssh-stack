@@ -1,8 +1,8 @@
-//! Keygen: derive a keypair (secret key + public key) from a persisted profile.
+//! Keygen: derive a keypair (secret key + public key) from a persisted identity.
 //!
 //! This is architecture-specific keygen tied to our tpm2-derive system, NOT a
 //! general-purpose keygen. The command derives key material internally from the
-//! profile, then produces an algorithm-appropriate keypair.
+//! identity, then produces an algorithm-appropriate keypair.
 //!
 //! - **seed** mode: unseal seed, HKDF-derive a child key, produce keypair.
 //! - **prf** mode: invoke TPM PRF, HKDF-expand output, produce keypair.
@@ -15,12 +15,12 @@ use sha2::{Digest as _, Sha256};
 use crate::backend::CommandRunner;
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, KeygenResult, Mode, Profile};
+use crate::model::{Algorithm, Identity, KeygenResult, Mode};
 
 use super::prf::{
-    PrfRequest, TpmPrfExecutor, TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner,
-    plan_tpm_prf_in, PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
-    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY,
+    PRF_CONTEXT_PATH_METADATA_KEY, PRF_PARENT_CONTEXT_PATH_METADATA_KEY,
+    PRF_PRIVATE_PATH_METADATA_KEY, PRF_PUBLIC_PATH_METADATA_KEY, PrfRequest, TpmPrfExecutor,
+    TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, plan_tpm_prf_in,
 };
 use super::seed::{
     HkdfSha256SeedDeriver, SeedBackend, SeedOpenAuthSource, SeedOpenOutput, SeedOpenRequest,
@@ -37,20 +37,18 @@ const KEYGEN_SCALAR_RETRY_LIMIT: u32 = 16;
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn execute_with_defaults<R>(
-    profile: &Profile,
-    prf_runner: &R,
-) -> Result<KeygenResult>
+pub fn execute_with_defaults<R>(identity: &Identity, prf_runner: &R) -> Result<KeygenResult>
 where
     R: CommandRunner,
 {
-    let seed_backend = SubprocessSeedBackend::new(profile.storage.state_layout.objects_dir.clone());
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     let seed_deriver = HkdfSha256SeedDeriver;
-    execute(profile, prf_runner, &seed_backend, &seed_deriver)
+    execute(identity, prf_runner, &seed_backend, &seed_deriver)
 }
 
 pub fn execute<R, B, D>(
-    profile: &Profile,
+    identity: &Identity,
     prf_runner: &R,
     seed_backend: &B,
     seed_deriver: &D,
@@ -60,13 +58,13 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let derived_bytes = derive_keygen_material(profile, prf_runner, seed_backend, seed_deriver)?;
-    let (secret_key_hex, public_key_hex) = keypair_from_material(profile, &derived_bytes)?;
+    let derived_bytes = derive_keygen_material(identity, prf_runner, seed_backend, seed_deriver)?;
+    let (secret_key_hex, public_key_hex) = keypair_from_material(identity, &derived_bytes)?;
 
     Ok(KeygenResult {
-        profile: profile.name.clone(),
-        mode: profile.mode.resolved,
-        algorithm: profile.algorithm,
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
         secret_key_hex,
         public_key_hex,
         output_path: None,
@@ -78,7 +76,7 @@ where
 // ---------------------------------------------------------------------------
 
 fn derive_keygen_material<R, B, D>(
-    profile: &Profile,
+    identity: &Identity,
     prf_runner: &R,
     seed_backend: &B,
     seed_deriver: &D,
@@ -88,19 +86,19 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    match profile.mode.resolved {
+    match identity.mode.resolved {
         Mode::Native => Err(Error::Unsupported(
-            "keygen is not supported for native-mode profiles; native keys live inside the TPM \
-             and cannot be exported – use a seed or prf profile instead"
+            "keygen is not supported for native-mode identities; native keys live inside the TPM \
+             and cannot be exported – use a seed or prf identity instead"
                 .to_string(),
         )),
-        Mode::Seed => derive_seed_keygen_material(profile, seed_backend, seed_deriver),
-        Mode::Prf => derive_prf_keygen_material(profile, prf_runner),
+        Mode::Seed => derive_seed_keygen_material(identity, seed_backend, seed_deriver),
+        Mode::Prf => derive_prf_keygen_material(identity, prf_runner),
     }
 }
 
 fn derive_seed_keygen_material<B, D>(
-    profile: &Profile,
+    identity: &Identity,
     backend: &B,
     deriver: &D,
 ) -> Result<Vec<u8>>
@@ -108,10 +106,10 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
-    let seed_profile = seed_profile_from_profile(profile)?;
-    let spec = keygen_derivation_spec(profile.algorithm)?;
+    let seed_profile = seed_profile_from_profile(identity)?;
+    let spec = keygen_derivation_spec(identity.algorithm)?;
     let request = SeedOpenRequest {
-        profile: seed_profile,
+        identity: seed_profile,
         auth_source: SeedOpenAuthSource::None,
         output: SeedOpenOutput::DerivedBytes(SoftwareSeedDerivationRequest {
             spec,
@@ -125,14 +123,14 @@ where
     Ok(derived.expose_secret().to_vec())
 }
 
-fn derive_prf_keygen_material<R>(profile: &Profile, runner: &R) -> Result<Vec<u8>>
+fn derive_prf_keygen_material<R>(identity: &Identity, runner: &R) -> Result<Vec<u8>>
 where
     R: CommandRunner,
 {
-    let executor = resolve_prf_executor(profile)?;
-    let spec = keygen_derivation_spec(profile.algorithm)?;
-    let request = PrfRequest::new(profile.name.clone(), spec.clone())?;
-    let workspace_root = temporary_workspace_root("keygen", &profile.name)?;
+    let executor = resolve_prf_executor(identity)?;
+    let spec = keygen_derivation_spec(identity.algorithm)?;
+    let request = PrfRequest::new(identity.name.clone(), spec.clone())?;
+    let workspace_root = temporary_workspace_root("keygen", &identity.name)?;
     let plan = plan_tpm_prf_in(request, executor, &workspace_root)?;
     let execution = execute_tpm_prf_plan_with_runner(&plan, runner);
     let _ = std::fs::remove_dir_all(&workspace_root);
@@ -146,11 +144,11 @@ where
 // Keypair construction from derived material
 // ---------------------------------------------------------------------------
 
-fn keypair_from_material(profile: &Profile, derived: &[u8]) -> Result<(String, String)> {
-    match profile.algorithm {
+fn keypair_from_material(identity: &Identity, derived: &[u8]) -> Result<(String, String)> {
+    match identity.algorithm {
         Algorithm::Ed25519 => ed25519_keypair(derived),
-        Algorithm::P256 => p256_keypair(profile, derived),
-        Algorithm::Secp256k1 => secp256k1_keypair(profile, derived),
+        Algorithm::P256 => p256_keypair(identity, derived),
+        Algorithm::Secp256k1 => secp256k1_keypair(identity, derived),
     }
 }
 
@@ -167,11 +165,12 @@ fn ed25519_keypair(derived: &[u8]) -> Result<(String, String)> {
     Ok((hex_encode(&seed), hex_encode(public_key.as_bytes())))
 }
 
-fn p256_keypair(profile: &Profile, derived: &[u8]) -> Result<(String, String)> {
-    let scalar = valid_ec_scalar(profile, derived, |c| p256::SecretKey::from_slice(c).is_ok())?;
-    let sk = p256::SecretKey::from_slice(&scalar).map_err(|e| {
-        Error::Internal(format!("keygen p256 scalar materialization failed: {e}"))
+fn p256_keypair(identity: &Identity, derived: &[u8]) -> Result<(String, String)> {
+    let scalar = valid_ec_scalar(identity, derived, |c| {
+        p256::SecretKey::from_slice(c).is_ok()
     })?;
+    let sk = p256::SecretKey::from_slice(&scalar)
+        .map_err(|e| Error::Internal(format!("keygen p256 scalar materialization failed: {e}")))?;
     let pk = sk.public_key();
     let pk_bytes = p256::pkcs8::EncodePublicKey::to_public_key_der(&pk)
         .map_err(|e| Error::Internal(format!("keygen p256 public key encoding failed: {e}")))?;
@@ -179,19 +178,24 @@ fn p256_keypair(profile: &Profile, derived: &[u8]) -> Result<(String, String)> {
     Ok((hex_encode(&scalar), hex_encode(pk_bytes.as_bytes())))
 }
 
-fn secp256k1_keypair(profile: &Profile, derived: &[u8]) -> Result<(String, String)> {
-    let scalar = valid_ec_scalar(profile, derived, |c| k256::SecretKey::from_slice(c).is_ok())?;
+fn secp256k1_keypair(identity: &Identity, derived: &[u8]) -> Result<(String, String)> {
+    let scalar = valid_ec_scalar(identity, derived, |c| {
+        k256::SecretKey::from_slice(c).is_ok()
+    })?;
     let sk = k256::SecretKey::from_slice(&scalar).map_err(|e| {
-        Error::Internal(format!("keygen secp256k1 scalar materialization failed: {e}"))
+        Error::Internal(format!(
+            "keygen secp256k1 scalar materialization failed: {e}"
+        ))
     })?;
     let pk = sk.public_key();
-    let pk_bytes = k256::pkcs8::EncodePublicKey::to_public_key_der(&pk)
-        .map_err(|e| Error::Internal(format!("keygen secp256k1 public key encoding failed: {e}")))?;
+    let pk_bytes = k256::pkcs8::EncodePublicKey::to_public_key_der(&pk).map_err(|e| {
+        Error::Internal(format!("keygen secp256k1 public key encoding failed: {e}"))
+    })?;
 
     Ok((hex_encode(&scalar), hex_encode(pk_bytes.as_bytes())))
 }
 
-fn valid_ec_scalar<F>(profile: &Profile, derived: &[u8], is_valid: F) -> Result<[u8; 32]>
+fn valid_ec_scalar<F>(identity: &Identity, derived: &[u8], is_valid: F) -> Result<[u8; 32]>
 where
     F: Fn(&[u8]) -> bool,
 {
@@ -206,15 +210,15 @@ where
     }
 
     for counter in 1..=KEYGEN_SCALAR_RETRY_LIMIT {
-        let candidate = scalar_retry_bytes(&seed, profile.algorithm, counter);
+        let candidate = scalar_retry_bytes(&seed, identity.algorithm, counter);
         if is_valid(&candidate) {
             return Ok(candidate);
         }
     }
 
     Err(Error::Internal(format!(
-        "keygen could not produce a valid {:?} scalar for profile '{}' after {} retries",
-        profile.algorithm, profile.name, KEYGEN_SCALAR_RETRY_LIMIT
+        "keygen could not produce a valid {:?} scalar for identity '{}' after {} retries",
+        identity.algorithm, identity.name, KEYGEN_SCALAR_RETRY_LIMIT
     )))
 }
 
@@ -250,21 +254,25 @@ fn keygen_derivation_spec(algorithm: Algorithm) -> Result<DerivationSpec> {
     )?))
 }
 
-fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
-    let object_dir = profile.storage.state_layout.objects_dir.join(&profile.name);
+fn resolve_prf_executor(identity: &Identity) -> Result<TpmPrfExecutor> {
+    let object_dir = identity
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&identity.name);
 
-    let metadata_parent = profile
+    let metadata_parent = identity
         .metadata
         .get(PRF_PARENT_CONTEXT_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
-    let metadata_public = profile
+        .map(|path| resolve_state_path(identity, path));
+    let metadata_public = identity
         .metadata
         .get(PRF_PUBLIC_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
-    let metadata_private = profile
+        .map(|path| resolve_state_path(identity, path));
+    let metadata_private = identity
         .metadata
         .get(PRF_PRIVATE_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path));
+        .map(|path| resolve_state_path(identity, path));
 
     if let (Some(parent_context_path), Some(public_path), Some(private_path)) =
         (metadata_parent, metadata_public, metadata_private)
@@ -292,10 +300,10 @@ fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
         }
     }
 
-    if let Some(context_path) = profile
+    if let Some(context_path) = identity
         .metadata
         .get(PRF_CONTEXT_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(profile, path))
+        .map(|path| resolve_state_path(identity, path))
     {
         return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
             context_path,
@@ -312,26 +320,26 @@ fn resolve_prf_executor(profile: &Profile) -> Result<TpmPrfExecutor> {
     }
 
     Err(Error::Unsupported(format!(
-        "profile '{}' resolved to PRF mode but no PRF root material was found for keygen",
-        profile.name
+        "identity '{}' resolved to PRF mode but no PRF root material was found for keygen",
+        identity.name
     )))
 }
 
-fn resolve_state_path(profile: &Profile, value: &str) -> std::path::PathBuf {
+fn resolve_state_path(identity: &Identity, value: &str) -> std::path::PathBuf {
     let path = std::path::PathBuf::from(value);
     if path.is_absolute() {
         path
     } else {
-        profile.storage.state_layout.root_dir.join(path)
+        identity.storage.state_layout.root_dir.join(path)
     }
 }
 
-fn temporary_workspace_root(kind: &str, profile: &str) -> Result<std::path::PathBuf> {
+fn temporary_workspace_root(kind: &str, identity: &str) -> Result<std::path::PathBuf> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::State(format!("system clock error: {e}")))?;
-    let sanitized = profile
+    let sanitized = identity
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>();
@@ -360,10 +368,8 @@ mod tests {
 
     use super::*;
     use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
-    use crate::model::{
-        ModePreference, ModeResolution, StateLayout, UseCase,
-    };
-    use crate::ops::seed::{SeedCreateRequest, SeedMaterial, SeedProfile, SeedOpenAuthSource};
+    use crate::model::{IdentityModeResolution, ModePreference, StateLayout, UseCase};
+    use crate::ops::seed::{SeedCreateRequest, SeedIdentity, SeedMaterial, SeedOpenAuthSource};
 
     struct FakeSeedBackend {
         seed: Vec<u8>,
@@ -371,7 +377,9 @@ mod tests {
 
     impl FakeSeedBackend {
         fn new(seed: &[u8]) -> Self {
-            Self { seed: seed.to_vec() }
+            Self {
+                seed: seed.to_vec(),
+            }
         }
     }
 
@@ -381,7 +389,7 @@ mod tests {
         }
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.seed.clone())))
@@ -400,20 +408,21 @@ mod tests {
         }
     }
 
-    fn seed_profile_fixture(root: &std::path::Path, algorithm: Algorithm) -> Profile {
-        Profile {
-            schema_version: crate::model::PROFILE_SCHEMA_VERSION,
+    fn seed_profile_fixture(root: &std::path::Path, algorithm: Algorithm) -> Identity {
+        Identity {
+            schema_version: crate::model::IDENTITY_SCHEMA_VERSION,
             name: "keygen-seed".to_string(),
             algorithm,
             uses: vec![UseCase::Derive],
-            mode: ModeResolution {
+            mode: IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
                 reasons: vec!["seed".to_string()],
             },
-            storage: crate::model::ProfileStorage {
+            defaults: crate::model::IdentityDerivationDefaults::default(),
+            storage: crate::model::IdentityStorage {
                 state_layout: StateLayout::new(root.to_path_buf()),
-                profile_path: PathBuf::new(),
+                identity_path: PathBuf::new(),
                 root_material_kind: crate::model::RootMaterialKind::SealedSeed,
             },
             export_policy: crate::model::ExportPolicy::for_mode(Mode::Seed),
@@ -424,13 +433,13 @@ mod tests {
     #[test]
     fn keygen_ed25519_from_seed() {
         let root = tempfile::tempdir().unwrap();
-        let profile = seed_profile_fixture(root.path(), Algorithm::Ed25519);
+        let identity = seed_profile_fixture(root.path(), Algorithm::Ed25519);
         let backend = FakeSeedBackend::new(&[0x42; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let result = execute(&profile, &runner, &backend, &deriver)
-            .expect("ed25519 keygen should succeed");
+        let result =
+            execute(&identity, &runner, &backend, &deriver).expect("ed25519 keygen should succeed");
 
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.algorithm, Algorithm::Ed25519);
@@ -443,13 +452,13 @@ mod tests {
     #[test]
     fn keygen_p256_from_seed() {
         let root = tempfile::tempdir().unwrap();
-        let profile = seed_profile_fixture(root.path(), Algorithm::P256);
+        let identity = seed_profile_fixture(root.path(), Algorithm::P256);
         let backend = FakeSeedBackend::new(&[0x55; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let result = execute(&profile, &runner, &backend, &deriver)
-            .expect("p256 keygen should succeed");
+        let result =
+            execute(&identity, &runner, &backend, &deriver).expect("p256 keygen should succeed");
 
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.algorithm, Algorithm::P256);
@@ -461,12 +470,12 @@ mod tests {
     #[test]
     fn keygen_secp256k1_from_seed() {
         let root = tempfile::tempdir().unwrap();
-        let profile = seed_profile_fixture(root.path(), Algorithm::Secp256k1);
+        let identity = seed_profile_fixture(root.path(), Algorithm::Secp256k1);
         let backend = FakeSeedBackend::new(&[0x77; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let result = execute(&profile, &runner, &backend, &deriver)
+        let result = execute(&identity, &runner, &backend, &deriver)
             .expect("secp256k1 keygen should succeed");
 
         assert_eq!(result.mode, Mode::Seed);
@@ -478,14 +487,14 @@ mod tests {
     #[test]
     fn keygen_native_returns_unsupported() {
         let root = tempfile::tempdir().unwrap();
-        let mut profile = seed_profile_fixture(root.path(), Algorithm::P256);
-        profile.mode.resolved = Mode::Native;
+        let mut identity = seed_profile_fixture(root.path(), Algorithm::P256);
+        identity.mode.resolved = Mode::Native;
 
         let backend = FakeSeedBackend::new(&[0xDD; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let err = execute(&profile, &runner, &backend, &deriver)
+        let err = execute(&identity, &runner, &backend, &deriver)
             .expect_err("native should be unsupported");
         assert!(err.to_string().contains("not supported for native"));
     }
@@ -493,13 +502,13 @@ mod tests {
     #[test]
     fn keygen_deterministic_same_seed_same_result() {
         let root = tempfile::tempdir().unwrap();
-        let profile = seed_profile_fixture(root.path(), Algorithm::Ed25519);
+        let identity = seed_profile_fixture(root.path(), Algorithm::Ed25519);
         let backend = FakeSeedBackend::new(&[0x99; 32]);
         let deriver = HkdfSha256SeedDeriver;
         let runner = NullRunner;
 
-        let r1 = execute(&profile, &runner, &backend, &deriver).unwrap();
-        let r2 = execute(&profile, &runner, &backend, &deriver).unwrap();
+        let r1 = execute(&identity, &runner, &backend, &deriver).unwrap();
+        let r2 = execute(&identity, &runner, &backend, &deriver).unwrap();
 
         assert_eq!(r1.secret_key_hex, r2.secret_key_hex);
         assert_eq!(r1.public_key_hex, r2.public_key_hex);

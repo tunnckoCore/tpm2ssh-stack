@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub trait NativeBackend {
-    fn setup(&self, request: &NativeSetupRequest) -> Result<NativeSetupResponse>;
+    fn setup(&self, request: &NativeIdentityCreateRequest) -> Result<NativeSetupResponse>;
     fn sign(&self, request: &NativeSignRequest) -> Result<NativeSignResponse>;
     fn verify(&self, request: &NativeVerifyRequest) -> Result<NativeVerifyResponse>;
     fn export_public_key(
@@ -34,7 +34,7 @@ impl<B> ValidatingNativeBackend<B> {
 }
 
 impl<B: NativeBackend> NativeBackend for ValidatingNativeBackend<B> {
-    fn setup(&self, request: &NativeSetupRequest) -> Result<NativeSetupResponse> {
+    fn setup(&self, request: &NativeIdentityCreateRequest) -> Result<NativeSetupResponse> {
         request.validate()?;
         self.inner.setup(request)
     }
@@ -137,13 +137,13 @@ pub enum NativePublicKeyEncoding {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct NativeKeyRef {
-    pub profile: String,
+    pub identity: String,
     pub key_id: String,
 }
 
 impl Validate for NativeKeyRef {
     fn validate(&self) -> Result<()> {
-        validate_identifier("profile", &self.profile)?;
+        validate_identifier("identity", &self.identity)?;
         validate_identifier("key_id", &self.key_id)
     }
 }
@@ -166,8 +166,8 @@ impl NativeKeySemantics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct NativeSetupRequest {
-    pub profile: String,
+pub struct NativeIdentityCreateRequest {
+    pub identity: String,
     pub key_label: Option<String>,
     pub algorithm: NativeAlgorithm,
     pub curve: NativeCurve,
@@ -176,9 +176,9 @@ pub struct NativeSetupRequest {
     pub private_key_policy: NativePrivateKeyPolicy,
 }
 
-impl Validate for NativeSetupRequest {
+impl Validate for NativeIdentityCreateRequest {
     fn validate(&self) -> Result<()> {
-        validate_identifier("profile", &self.profile)?;
+        validate_identifier("identity", &self.identity)?;
         validate_optional_label("key_label", self.key_label.as_deref())?;
         validate_native_key_shape(self.algorithm, self.curve)?;
         validate_non_empty_unique_uses(&self.allowed_uses)?;
@@ -474,7 +474,10 @@ fn validate_unique_encodings(encodings: &[NativePublicKeyEncoding]) -> Result<()
 }
 
 fn validate_unique_encoded_public_keys(encodings: &[EncodedNativePublicKey]) -> Result<()> {
-    let distinct: BTreeSet<_> = encodings.iter().map(EncodedNativePublicKey::encoding).collect();
+    let distinct: BTreeSet<_> = encodings
+        .iter()
+        .map(EncodedNativePublicKey::encoding)
+        .collect();
     if distinct.len() != encodings.len() {
         return Err(Error::Validation(
             "native public key contains duplicate encodings".to_string(),
@@ -490,15 +493,15 @@ mod tests {
 
     fn key_ref() -> NativeKeyRef {
         NativeKeyRef {
-            profile: "prod-signer".to_string(),
+            identity: "prod-signer".to_string(),
             key_id: "p256-signing-key".to_string(),
         }
     }
 
     #[test]
     fn native_setup_requires_unique_uses() {
-        let request = NativeSetupRequest {
-            profile: "prod-signer".to_string(),
+        let request = NativeIdentityCreateRequest {
+            identity: "prod-signer".to_string(),
             key_label: Some("api signer".to_string()),
             algorithm: NativeAlgorithm::P256,
             curve: NativeCurve::NistP256,
@@ -522,7 +525,9 @@ mod tests {
         };
 
         let error = request.validate().unwrap_err();
-        assert!(matches!(error, Error::Validation(message) if message.contains("digest length mismatch")));
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("digest length mismatch"))
+        );
     }
 
     #[test]

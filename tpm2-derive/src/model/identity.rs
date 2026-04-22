@@ -12,15 +12,22 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::model::{Algorithm, Mode, ModePreference, StateLayout, UseCase};
 
-pub const PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const IDENTITY_SCHEMA_VERSION: u32 = 2;
 
-static NEXT_TEMP_PROFILE_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_TEMP_IDENTITY_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModeResolution {
+pub struct IdentityModeResolution {
     pub requested: ModePreference,
     pub resolved: Mode,
     pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Default)]
+pub struct IdentityDerivationDefaults {
+    pub org: Option<String>,
+    pub purpose: Option<String>,
+    pub context: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -39,7 +46,7 @@ impl ExportPolicy {
                 confirmation_required: true,
             },
             Mode::Prf => Self {
-                public_key_export: false,
+                public_key_export: true,
                 recovery_export: false,
                 confirmation_required: true,
             },
@@ -71,43 +78,63 @@ impl RootMaterialKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ProfileStorage {
+pub struct IdentityStorage {
     pub state_layout: StateLayout,
-    pub profile_path: PathBuf,
+    pub identity_path: PathBuf,
     pub root_material_kind: RootMaterialKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct Profile {
+pub struct Identity {
     pub schema_version: u32,
     pub name: String,
     pub algorithm: Algorithm,
     pub uses: Vec<UseCase>,
-    pub mode: ModeResolution,
-    pub storage: ProfileStorage,
+    pub mode: IdentityModeResolution,
+    pub defaults: IdentityDerivationDefaults,
+    pub storage: IdentityStorage,
     pub export_policy: ExportPolicy,
     pub metadata: BTreeMap<String, String>,
 }
 
-impl Profile {
+impl Identity {
     pub fn new(
         name: String,
         algorithm: Algorithm,
         uses: Vec<UseCase>,
-        mode: ModeResolution,
+        mode: IdentityModeResolution,
         state_layout: StateLayout,
     ) -> Self {
-        let profile_path = state_layout.profile_path(&name);
-        let resolved = mode.resolved;
-
-        Self {
-            schema_version: PROFILE_SCHEMA_VERSION,
+        Self::with_defaults(
             name,
             algorithm,
             uses,
             mode,
-            storage: ProfileStorage {
-                profile_path,
+            IdentityDerivationDefaults::default(),
+            state_layout,
+        )
+    }
+
+    pub fn with_defaults(
+        name: String,
+        algorithm: Algorithm,
+        uses: Vec<UseCase>,
+        mode: IdentityModeResolution,
+        defaults: IdentityDerivationDefaults,
+        state_layout: StateLayout,
+    ) -> Self {
+        let identity_path = state_layout.identity_path(&name);
+        let resolved = mode.resolved;
+
+        Self {
+            schema_version: IDENTITY_SCHEMA_VERSION,
+            name,
+            algorithm,
+            uses,
+            mode,
+            defaults,
+            storage: IdentityStorage {
+                identity_path,
                 state_layout,
                 root_material_kind: RootMaterialKind::for_mode(resolved),
             },
@@ -118,7 +145,7 @@ impl Profile {
 
     pub fn persist(&self) -> Result<()> {
         self.storage.state_layout.ensure_dirs()?;
-        write_json_atomically(&self.storage.profile_path, self)
+        write_json_atomically(&self.storage.identity_path, self)
     }
 
     pub fn load_named(name: &str, state_dir: Option<PathBuf>) -> Result<Self> {
@@ -126,33 +153,33 @@ impl Profile {
     }
 
     pub fn load_from_layout(name: &str, state_layout: StateLayout) -> Result<Self> {
-        let profile_path = state_layout.profile_path(name);
-        let contents = fs::read_to_string(&profile_path).map_err(|error| {
+        let identity_path = state_layout.identity_path(name);
+        let contents = fs::read_to_string(&identity_path).map_err(|error| {
             Error::State(format!(
-                "failed to read profile '{}' from '{}': {error}",
+                "failed to read identity '{}' from '{}': {error}",
                 name,
-                profile_path.display()
+                identity_path.display()
             ))
         })?;
 
-        let mut profile: Self = serde_json::from_str(&contents).map_err(|error| {
+        let mut identity: Self = serde_json::from_str(&contents).map_err(|error| {
             Error::State(format!(
-                "failed to parse profile '{}' from '{}': {error}",
+                "failed to parse identity '{}' from '{}': {error}",
                 name,
-                profile_path.display()
+                identity_path.display()
             ))
         })?;
 
-        profile.storage.state_layout = state_layout;
-        profile.storage.profile_path = profile_path;
+        identity.storage.state_layout = state_layout;
+        identity.storage.identity_path = identity_path;
 
-        Ok(profile)
+        Ok(identity)
     }
 }
 
-fn write_json_atomically(path: &Path, profile: &Profile) -> Result<()> {
-    let temp_path = temporary_profile_path(path);
-    let payload = format!("{}\n", serde_json::to_string_pretty(profile)?);
+fn write_json_atomically(path: &Path, identity: &Identity) -> Result<()> {
+    let temp_path = temporary_identity_path(path);
+    let payload = format!("{}\n", serde_json::to_string_pretty(identity)?);
 
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -161,7 +188,7 @@ fn write_json_atomically(path: &Path, profile: &Profile) -> Result<()> {
 
     let mut file = options.open(&temp_path).map_err(|error| {
         Error::State(format!(
-            "failed to create temporary profile file '{}': {error}",
+            "failed to create temporary identity file '{}': {error}",
             temp_path.display()
         ))
     })?;
@@ -169,7 +196,7 @@ fn write_json_atomically(path: &Path, profile: &Profile) -> Result<()> {
     if let Err(error) = file.write_all(payload.as_bytes()) {
         let _ = fs::remove_file(&temp_path);
         return Err(Error::State(format!(
-            "failed to write temporary profile file '{}': {error}",
+            "failed to write temporary identity file '{}': {error}",
             temp_path.display()
         )));
     }
@@ -177,7 +204,7 @@ fn write_json_atomically(path: &Path, profile: &Profile) -> Result<()> {
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(Error::State(format!(
-            "failed to persist profile to '{}': {error}",
+            "failed to persist identity to '{}': {error}",
             path.display()
         )));
     }
@@ -185,7 +212,7 @@ fn write_json_atomically(path: &Path, profile: &Profile) -> Result<()> {
     Ok(())
 }
 
-fn temporary_profile_path(path: &Path) -> PathBuf {
+fn temporary_identity_path(path: &Path) -> PathBuf {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -194,7 +221,7 @@ fn temporary_profile_path(path: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    let sequence = NEXT_TEMP_PROFILE_ID.fetch_add(1, Ordering::Relaxed);
+    let sequence = NEXT_TEMP_IDENTITY_ID.fetch_add(1, Ordering::Relaxed);
 
     path.with_extension(format!(
         "{extension}.tmp-{}-{now}-{sequence}",
@@ -221,41 +248,46 @@ mod tests {
 
     #[test]
     fn persist_and_load_round_trip() {
-        let root_dir = unique_temp_path("profile");
+        let root_dir = unique_temp_path("identity");
         let state_layout = StateLayout::new(root_dir.clone());
-        let profile = Profile::new(
+        let identity = Identity::with_defaults(
             "prod-signer".to_string(),
             Algorithm::P256,
             vec![UseCase::Sign, UseCase::Verify],
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Auto,
                 resolved: Mode::Native,
                 reasons: vec!["native supported".to_string()],
             },
+            IdentityDerivationDefaults {
+                org: Some("com.example".to_string()),
+                purpose: Some("default".to_string()),
+                context: BTreeMap::from([("tenant".to_string(), "alpha".to_string())]),
+            },
             state_layout.clone(),
         );
 
-        profile.persist().expect("profile should persist");
+        identity.persist().expect("identity should persist");
         let loaded =
-            Profile::load_named("prod-signer", Some(root_dir.clone())).expect("profile loads");
+            Identity::load_named("prod-signer", Some(root_dir.clone())).expect("identity loads");
 
-        assert_eq!(loaded, profile);
+        assert_eq!(loaded, identity);
 
-        fs::remove_dir_all(root_dir).expect("temporary profile state should be removed");
+        fs::remove_dir_all(root_dir).expect("temporary identity state should be removed");
     }
 
     #[cfg(unix)]
     #[test]
-    fn persist_creates_profile_file_with_mode_0600() {
+    fn persist_creates_identity_file_with_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root_dir = unique_temp_path("profile-perms");
+        let root_dir = unique_temp_path("identity-perms");
         let state_layout = StateLayout::new(root_dir.clone());
-        let profile = Profile::new(
+        let identity = Identity::new(
             "perm-test".to_string(),
             Algorithm::P256,
             vec![UseCase::Sign],
-            ModeResolution {
+            IdentityModeResolution {
                 requested: ModePreference::Auto,
                 resolved: Mode::Native,
                 reasons: vec!["test".to_string()],
@@ -263,14 +295,14 @@ mod tests {
             state_layout,
         );
 
-        profile.persist().expect("persist");
+        identity.persist().expect("persist");
 
-        let mode = fs::metadata(&profile.storage.profile_path)
+        let mode = fs::metadata(&identity.storage.identity_path)
             .expect("metadata")
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "profile file should be 0600");
+        assert_eq!(mode, 0o600, "identity file should be 0600");
 
         fs::remove_dir_all(root_dir).expect("cleanup");
     }

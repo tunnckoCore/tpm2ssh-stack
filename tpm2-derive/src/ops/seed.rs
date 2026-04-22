@@ -13,7 +13,7 @@ use tempfile::{Builder as TempfileBuilder, NamedTempFile, TempDir};
 use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::DerivationSpec;
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, Profile, UseCase};
+use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, Identity, UseCase};
 
 pub const SEED_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const SEED_RECOVERY_BUNDLE_SCHEMA_VERSION: u32 = 1;
@@ -35,9 +35,9 @@ pub const SEED_SOFTWARE_DERIVED_AT_USE_TIME_METADATA_KEY: &str =
 pub type SeedMaterial = SecretBox<Vec<u8>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SeedProfile {
+pub struct SeedIdentity {
     pub schema_version: u32,
-    pub profile: String,
+    pub identity: String,
     pub algorithm: Algorithm,
     pub uses: Vec<UseCase>,
     pub storage: SeedStorage,
@@ -45,14 +45,14 @@ pub struct SeedProfile {
     pub export_policy: SeedExportPolicy,
 }
 
-impl SeedProfile {
-    pub fn scaffold(profile: String, algorithm: Algorithm, uses: Vec<UseCase>) -> Result<Self> {
+impl SeedIdentity {
+    pub fn scaffold(identity: String, algorithm: Algorithm, uses: Vec<UseCase>) -> Result<Self> {
         let candidate = Self {
             schema_version: SEED_PROFILE_SCHEMA_VERSION,
-            storage: SeedStorage::tpm_sealed(profile.clone()),
+            storage: SeedStorage::tpm_sealed(identity.clone()),
             derivation: SeedDerivation::hkdf_sha256_v1(),
             export_policy: SeedExportPolicy::high_friction_recovery_only(),
-            profile,
+            identity,
             algorithm,
             uses: normalize_uses(uses),
         };
@@ -146,7 +146,7 @@ pub enum SeedExportAccess {
 
 #[derive(Debug)]
 pub struct SeedCreateRequest {
-    pub profile: SeedProfile,
+    pub identity: SeedIdentity,
     pub source: SeedCreateSource,
     pub overwrite_existing: bool,
 }
@@ -175,7 +175,7 @@ pub enum SeedImportIngress {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SeedCreatePlan {
-    pub profile: SeedProfile,
+    pub identity: SeedIdentity,
     pub source: SeedCreateSourceSummary,
     pub overwrite_existing: bool,
     pub warnings: Vec<Diagnostic>,
@@ -195,7 +195,7 @@ pub enum SeedCreateSourceSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SeedOpenRequest {
-    pub profile: SeedProfile,
+    pub identity: SeedIdentity,
     pub auth_source: SeedOpenAuthSource,
     pub output: SeedOpenOutput,
     pub require_fresh_unseal: bool,
@@ -243,7 +243,7 @@ pub struct SoftwareSeedDerivationPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SeedExportRequest {
-    pub profile: SeedProfile,
+    pub identity: SeedIdentity,
     pub auth_source: SeedOpenAuthSource,
     pub destination: SeedExportDestination,
     pub format: SeedExportFormat,
@@ -282,8 +282,8 @@ pub struct SeedRecoveryImportRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SeedRecoveryImportPlan {
-    pub profile: SeedProfile,
-    pub restored_from_profile: String,
+    pub identity: SeedIdentity,
+    pub restored_from_identity: String,
     pub seed_bytes: usize,
     pub warnings: Vec<Diagnostic>,
     pub next_backend_action: SeedBackendAction,
@@ -291,8 +291,8 @@ pub struct SeedRecoveryImportPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SeedRecoveryImportResult {
-    pub profile: SeedProfile,
-    pub restored_from_profile: String,
+    pub identity: SeedIdentity,
+    pub restored_from_identity: String,
     pub seed_bytes: usize,
 }
 
@@ -302,12 +302,12 @@ pub struct SeedRecoveryBundleV1 {
     pub kind: String,
     pub exported_at_unix_seconds: u64,
     pub reason: String,
-    pub profile: SeedRecoveryBundleProfile,
+    pub identity: SeedRecoveryBundleIdentity,
     pub seed: SeedRecoveryBundleSecret,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SeedRecoveryBundleProfile {
+pub struct SeedRecoveryBundleIdentity {
     pub name: String,
     pub algorithm: Algorithm,
     pub uses: Vec<UseCase>,
@@ -332,9 +332,9 @@ pub enum SeedBackendAction {
 }
 
 pub fn plan_create(request: &SeedCreateRequest) -> Result<SeedCreatePlan> {
-    validate_seed_profile(&request.profile)?;
+    validate_seed_profile(&request.identity)?;
 
-    let mut warnings = seed_mode_usage_warnings(&request.profile);
+    let mut warnings = seed_mode_usage_warnings(&request.identity);
 
     let (source, next_backend_action) = match &request.source {
         SeedCreateSource::GenerateRandom { bytes } => {
@@ -378,7 +378,7 @@ pub fn plan_create(request: &SeedCreateRequest) -> Result<SeedCreatePlan> {
     };
 
     Ok(SeedCreatePlan {
-        profile: request.profile.clone(),
+        identity: request.identity.clone(),
         source,
         overwrite_existing: request.overwrite_existing,
         warnings,
@@ -387,7 +387,7 @@ pub fn plan_create(request: &SeedCreateRequest) -> Result<SeedCreatePlan> {
 }
 
 pub fn plan_open(request: &SeedOpenRequest) -> Result<SeedOpenPlan> {
-    validate_seed_profile(&request.profile)?;
+    validate_seed_profile(&request.identity)?;
     validate_safe_auth_source(&request.auth_source)?;
 
     if !request.confirm_software_derivation {
@@ -396,7 +396,7 @@ pub fn plan_open(request: &SeedOpenRequest) -> Result<SeedOpenPlan> {
         ));
     }
 
-    let mut warnings = seed_mode_usage_warnings(&request.profile);
+    let mut warnings = seed_mode_usage_warnings(&request.identity);
     warnings.push(Diagnostic {
         level: DiagnosticLevel::Warning,
         code: "SEED_SOFTWARE_DERIVATION".to_string(),
@@ -407,9 +407,9 @@ pub fn plan_open(request: &SeedOpenRequest) -> Result<SeedOpenPlan> {
         SeedOpenOutput::DerivedBytes(derivation) => {
             validate_derivation_request(derivation)?;
             Some(SoftwareSeedDerivationPlan {
-                kdf: request.profile.derivation.kdf,
+                kdf: request.identity.derivation.kdf,
                 output_bytes: derivation.output_bytes,
-                info_preview: canonical_derivation_info(&request.profile.derivation, &derivation.spec),
+                info_preview: canonical_derivation_info(&request.identity.derivation, &derivation.spec),
             })
         }
         SeedOpenOutput::RawSeed => {
@@ -420,8 +420,8 @@ pub fn plan_open(request: &SeedOpenRequest) -> Result<SeedOpenPlan> {
     };
 
     Ok(SeedOpenPlan {
-        sealed_at_rest: request.profile.storage.sealed_at_rest,
-        software_derived_at_use_time: request.profile.derivation.software_derived_at_use_time,
+        sealed_at_rest: request.identity.storage.sealed_at_rest,
+        software_derived_at_use_time: request.identity.derivation.software_derived_at_use_time,
         warnings,
         next_backend_action: SeedBackendAction::UnsealSeed,
         derivation,
@@ -429,14 +429,14 @@ pub fn plan_open(request: &SeedOpenRequest) -> Result<SeedOpenPlan> {
 }
 
 pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
-    validate_seed_profile(&request.profile)?;
+    validate_seed_profile(&request.identity)?;
     validate_safe_auth_source(&request.auth_source)?;
 
-    let policy = &request.profile.export_policy;
+    let policy = &request.identity.export_policy;
 
     if matches!(policy.access, SeedExportAccess::Deny) {
         return Err(Error::Validation(
-            "seed export is denied by profile policy".to_string(),
+            "seed export is denied by identity policy".to_string(),
         ));
     }
 
@@ -488,7 +488,7 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
         ));
     }
 
-    let mut warnings = seed_mode_usage_warnings(&request.profile);
+    let mut warnings = seed_mode_usage_warnings(&request.identity);
     warnings.push(Diagnostic {
         level: DiagnosticLevel::Warning,
         code: "SEED_EXPORT_BREAK_GLASS".to_string(),
@@ -502,14 +502,14 @@ pub fn plan_export(request: &SeedExportRequest) -> Result<SeedExportPlan> {
     })
 }
 
-pub fn seed_profile_from_profile(profile: &Profile) -> Result<SeedProfile> {
-    let mut seed_profile = SeedProfile::scaffold(
-        profile.name.clone(),
-        profile.algorithm,
-        profile.uses.clone(),
+pub fn seed_profile_from_profile(identity: &Identity) -> Result<SeedIdentity> {
+    let mut seed_profile = SeedIdentity::scaffold(
+        identity.name.clone(),
+        identity.algorithm,
+        identity.uses.clone(),
     )?;
 
-    if let Some(object_label) = profile.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY) {
+    if let Some(object_label) = identity.metadata.get(SEED_OBJECT_LABEL_METADATA_KEY) {
         seed_profile.storage.object_label = object_label.clone();
     }
 
@@ -527,19 +527,19 @@ pub fn plan_recovery_import(request: &SeedRecoveryImportRequest) -> Result<SeedR
     let profile_name = request
         .target_profile
         .clone()
-        .unwrap_or_else(|| request.bundle.profile.name.clone());
-    let profile = SeedProfile {
+        .unwrap_or_else(|| request.bundle.identity.name.clone());
+    let identity = SeedIdentity {
         schema_version: SEED_PROFILE_SCHEMA_VERSION,
-        profile: profile_name.clone(),
-        algorithm: request.bundle.profile.algorithm,
-        uses: normalize_uses(request.bundle.profile.uses.clone()),
+        identity: profile_name.clone(),
+        algorithm: request.bundle.identity.algorithm,
+        uses: normalize_uses(request.bundle.identity.uses.clone()),
         storage: SeedStorage::tpm_sealed(profile_name),
-        derivation: request.bundle.profile.derivation.clone(),
+        derivation: request.bundle.identity.derivation.clone(),
         export_policy: SeedExportPolicy::high_friction_recovery_only(),
     };
-    validate_seed_profile(&profile)?;
+    validate_seed_profile(&identity)?;
 
-    let mut warnings = seed_mode_usage_warnings(&profile);
+    let mut warnings = seed_mode_usage_warnings(&identity);
     warnings.push(Diagnostic {
         level: DiagnosticLevel::Warning,
         code: "SEED_RECOVERY_IMPORT".to_string(),
@@ -549,8 +549,8 @@ pub fn plan_recovery_import(request: &SeedRecoveryImportRequest) -> Result<SeedR
     });
 
     Ok(SeedRecoveryImportPlan {
-        profile,
-        restored_from_profile: request.bundle.profile.name.clone(),
+        identity,
+        restored_from_identity: request.bundle.identity.name.clone(),
         seed_bytes: seed.len(),
         warnings,
         next_backend_action: SeedBackendAction::SealImportedSeed,
@@ -565,7 +565,7 @@ pub fn restore_recovery_bundle(
     let seed = decode_recovery_bundle_seed(&request.bundle)?;
 
     backend.seal_seed(&SeedCreateRequest {
-        profile: plan.profile.clone(),
+        identity: plan.identity.clone(),
         source: SeedCreateSource::Import {
             ingress: SeedImportIngress::InMemory,
             material: Some(SecretBox::new(Box::new(seed))),
@@ -574,8 +574,8 @@ pub fn restore_recovery_bundle(
     })?;
 
     Ok(SeedRecoveryImportResult {
-        profile: plan.profile,
-        restored_from_profile: plan.restored_from_profile,
+        identity: plan.identity,
+        restored_from_identity: plan.restored_from_identity,
         seed_bytes: plan.seed_bytes,
     })
 }
@@ -588,7 +588,7 @@ pub fn export_recovery_bundle(
 
     match request.format {
         SeedExportFormat::RecoveryBundleV1 => {
-            let seed = backend.unseal_seed(&request.profile, &request.auth_source)?;
+            let seed = backend.unseal_seed(&request.identity, &request.auth_source)?;
             Ok(build_recovery_bundle(request, seed.expose_secret()))
         }
         SeedExportFormat::RawSeedBase64 => Err(Error::Unsupported(
@@ -602,7 +602,7 @@ pub trait SeedBackend {
     fn seal_seed(&self, request: &SeedCreateRequest) -> Result<()>;
     fn unseal_seed(
         &self,
-        profile: &SeedProfile,
+        identity: &SeedIdentity,
         auth_source: &SeedOpenAuthSource,
     ) -> Result<SeedMaterial>;
 }
@@ -615,10 +615,10 @@ pub struct SeedSealedObjectLayout {
 }
 
 impl SeedSealedObjectLayout {
-    fn for_profile(objects_dir: &Path, profile: &SeedProfile) -> Result<Self> {
-        validate_profile_name(&profile.storage.object_label)?;
+    fn for_profile(objects_dir: &Path, identity: &SeedIdentity) -> Result<Self> {
+        validate_profile_name(&identity.storage.object_label)?;
 
-        let object_dir = objects_dir.join(&profile.storage.object_label);
+        let object_dir = objects_dir.join(&identity.storage.object_label);
         Ok(Self {
             public_blob: object_dir.join("sealed.pub"),
             private_blob: object_dir.join("sealed.priv"),
@@ -651,8 +651,8 @@ impl<R> SubprocessSeedBackend<R> {
         &self.objects_dir
     }
 
-    pub fn sealed_object_layout(&self, profile: &SeedProfile) -> Result<SeedSealedObjectLayout> {
-        SeedSealedObjectLayout::for_profile(&self.objects_dir, profile)
+    pub fn sealed_object_layout(&self, identity: &SeedIdentity) -> Result<SeedSealedObjectLayout> {
+        SeedSealedObjectLayout::for_profile(&self.objects_dir, identity)
     }
 }
 
@@ -663,7 +663,7 @@ where
     fn seal_seed(&self, request: &SeedCreateRequest) -> Result<()> {
         plan_create(request)?;
 
-        let layout = self.sealed_object_layout(&request.profile)?;
+        let layout = self.sealed_object_layout(&request.identity)?;
         let source_material = self.materialize_seed_source(&request.source)?;
         let transient = new_seed_tempdir()?;
         let staging = self.new_object_staging_dir()?;
@@ -683,10 +683,10 @@ where
 
     fn unseal_seed(
         &self,
-        profile: &SeedProfile,
+        identity: &SeedIdentity,
         auth_source: &SeedOpenAuthSource,
     ) -> Result<SeedMaterial> {
-        validate_seed_profile(profile)?;
+        validate_seed_profile(identity)?;
         validate_safe_auth_source(auth_source)?;
 
         if !matches!(auth_source, SeedOpenAuthSource::None) {
@@ -696,7 +696,7 @@ where
             ));
         }
 
-        let layout = self.sealed_object_layout(profile)?;
+        let layout = self.sealed_object_layout(identity)?;
         ensure_layout_exists(&layout)?;
 
         let transient = new_seed_tempdir()?;
@@ -786,7 +786,7 @@ where
     ) -> Result<()> {
         if layout.object_dir.exists() && !overwrite_existing {
             return Err(Error::State(format!(
-                "seed object already exists for profile '{}'; pass overwrite_existing to replace it",
+                "seed object already exists for identity '{}'; pass overwrite_existing to replace it",
                 layout
                     .object_dir
                     .file_name()
@@ -857,10 +857,10 @@ impl SeedBackend for ScaffoldSeedBackend {
 
     fn unseal_seed(
         &self,
-        profile: &SeedProfile,
+        identity: &SeedIdentity,
         auth_source: &SeedOpenAuthSource,
     ) -> Result<SeedMaterial> {
-        self.inner.unseal_seed(profile, auth_source)
+        self.inner.unseal_seed(identity, auth_source)
     }
 }
 
@@ -1142,7 +1142,7 @@ pub fn open_and_derive(
     request: &SeedOpenRequest,
 ) -> Result<SeedMaterial> {
     plan_open(request)?;
-    let seed = backend.unseal_seed(&request.profile, &request.auth_source)?;
+    let seed = backend.unseal_seed(&request.identity, &request.auth_source)?;
 
     match &request.output {
         SeedOpenOutput::DerivedBytes(derivation) => deriver.derive(&seed, derivation),
@@ -1161,11 +1161,11 @@ fn build_recovery_bundle(request: &SeedExportRequest, seed: &[u8]) -> SeedRecove
             .expect("system time before unix epoch")
             .as_secs(),
         reason: request.reason.clone(),
-        profile: SeedRecoveryBundleProfile {
-            name: request.profile.profile.clone(),
-            algorithm: request.profile.algorithm,
-            uses: request.profile.uses.clone(),
-            derivation: request.profile.derivation.clone(),
+        identity: SeedRecoveryBundleIdentity {
+            name: request.identity.identity.clone(),
+            algorithm: request.identity.algorithm,
+            uses: request.identity.uses.clone(),
+            derivation: request.identity.derivation.clone(),
         },
         seed: SeedRecoveryBundleSecret {
             encoding: "hex".to_string(),
@@ -1176,39 +1176,39 @@ fn build_recovery_bundle(request: &SeedExportRequest, seed: &[u8]) -> SeedRecove
     }
 }
 
-pub fn validate_seed_profile(profile: &SeedProfile) -> Result<()> {
-    validate_profile_name(&profile.profile)?;
+pub fn validate_seed_profile(identity: &SeedIdentity) -> Result<()> {
+    validate_profile_name(&identity.identity)?;
 
-    if profile.schema_version != SEED_PROFILE_SCHEMA_VERSION {
+    if identity.schema_version != SEED_PROFILE_SCHEMA_VERSION {
         return Err(Error::Validation(format!(
-            "unsupported seed profile schema version: {}",
-            profile.schema_version
+            "unsupported seed identity schema version: {}",
+            identity.schema_version
         )));
     }
 
-    if profile.uses.is_empty() {
+    if identity.uses.is_empty() {
         return Err(Error::Validation(
-            "seed profile must declare at least one use".to_string(),
+            "seed identity must declare at least one use".to_string(),
         ));
     }
 
-    if !matches!(profile.storage.kind, SeedStorageKind::TpmSealed)
-        || !profile.storage.sealed_at_rest
+    if !matches!(identity.storage.kind, SeedStorageKind::TpmSealed)
+        || !identity.storage.sealed_at_rest
     {
         return Err(Error::Validation(
-            "seed profiles must use TPM-sealed storage at rest".to_string(),
+            "seed identities must use TPM-sealed storage at rest".to_string(),
         ));
     }
 
-    if profile.storage.allow_insecure_temp_secret_files {
+    if identity.storage.allow_insecure_temp_secret_files {
         return Err(Error::Validation(
-            "seed profiles may not permit insecure temp secret files".to_string(),
+            "seed identities may not permit insecure temp secret files".to_string(),
         ));
     }
 
-    if !profile.derivation.software_derived_at_use_time {
+    if !identity.derivation.software_derived_at_use_time {
         return Err(Error::Validation(
-            "seed profiles must explicitly record that derivation happens in software at use time"
+            "seed identities must explicitly record that derivation happens in software at use time"
                 .to_string(),
         ));
     }
@@ -1228,19 +1228,19 @@ fn validate_derivation_request(request: &SoftwareSeedDerivationRequest) -> Resul
     Ok(())
 }
 
-fn validate_profile_name(profile: &str) -> Result<()> {
-    if profile.trim().is_empty() {
+fn validate_profile_name(identity: &str) -> Result<()> {
+    if identity.trim().is_empty() {
         return Err(Error::Validation(
-            "profile name must not be empty".to_string(),
+            "identity name must not be empty".to_string(),
         ));
     }
 
-    if !profile
+    if !identity
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
     {
         return Err(Error::Validation(
-            "profile name may only contain ASCII letters, digits, '.', '_' or '-'".to_string(),
+            "identity name may only contain ASCII letters, digits, '.', '_' or '-'".to_string(),
         ));
     }
 
@@ -1295,11 +1295,11 @@ fn normalize_uses(uses: Vec<UseCase>) -> Vec<UseCase> {
     unique.into_iter().collect()
 }
 
-fn seed_mode_usage_warnings(profile: &SeedProfile) -> Vec<Diagnostic> {
+fn seed_mode_usage_warnings(identity: &SeedIdentity) -> Vec<Diagnostic> {
     let mut warnings = Vec::new();
 
-    if profile.algorithm == Algorithm::P256
-        && profile
+    if identity.algorithm == Algorithm::P256
+        && identity
             .uses
             .iter()
             .all(|use_case| matches!(use_case, UseCase::Sign | UseCase::Verify))
@@ -1312,7 +1312,10 @@ fn seed_mode_usage_warnings(profile: &SeedProfile) -> Vec<Diagnostic> {
         });
     }
 
-    if matches!(profile.export_policy.access, SeedExportAccess::RecoveryOnly) {
+    if matches!(
+        identity.export_policy.access,
+        SeedExportAccess::RecoveryOnly
+    ) {
         warnings.push(Diagnostic {
             level: DiagnosticLevel::Info,
             code: "SEED_RECOVERY_EXPORT".to_string(),
@@ -1428,7 +1431,7 @@ fn canonical_derivation_info(derivation: &SeedDerivation, spec: &DerivationSpec)
         "tpm2-derive".to_string(),
         "seed".to_string(),
         format!("kdf={}", seed_kdf_name(derivation.kdf)),
-        format!("profile-derivation-domain={}", derivation.domain_label),
+        format!("identity-derivation-domain={}", derivation.domain_label),
         format!("spec-version={:?}", spec.version()),
         format!("namespace={}", context.namespace),
         format!("purpose={}", context.purpose),
@@ -1459,13 +1462,13 @@ mod tests {
 
     use super::*;
 
-    fn seed_profile() -> SeedProfile {
-        SeedProfile::scaffold(
-            "seed-profile".to_string(),
+    fn seed_profile() -> SeedIdentity {
+        SeedIdentity::scaffold(
+            "seed-identity".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Derive, UseCase::SshAgent],
+            vec![UseCase::Derive, UseCase::Ssh],
         )
-        .expect("seed profile")
+        .expect("seed identity")
     }
 
     fn derivation_request() -> SoftwareSeedDerivationRequest {
@@ -1486,7 +1489,7 @@ mod tests {
     #[test]
     fn create_rejects_insecure_import_ingress() {
         let request = SeedCreateRequest {
-            profile: seed_profile(),
+            identity: seed_profile(),
             source: SeedCreateSource::Import {
                 ingress: SeedImportIngress::CommandArgument,
                 material: Some(SecretBox::new(Box::new(vec![7_u8; 32]))),
@@ -1501,7 +1504,7 @@ mod tests {
     #[test]
     fn open_requires_explicit_software_derivation_ack() {
         let request = SeedOpenRequest {
-            profile: seed_profile(),
+            identity: seed_profile(),
             auth_source: SeedOpenAuthSource::InteractivePrompt,
             output: SeedOpenOutput::DerivedBytes(derivation_request()),
             require_fresh_unseal: true,
@@ -1515,7 +1518,7 @@ mod tests {
     #[test]
     fn export_requires_confirmation_phrase() {
         let request = SeedExportRequest {
-            profile: seed_profile(),
+            identity: seed_profile(),
             auth_source: SeedOpenAuthSource::InteractivePrompt,
             destination: SeedExportDestination::ExplicitPath(
                 "/safe/location/recovery.json".to_string(),
@@ -1533,7 +1536,7 @@ mod tests {
     #[test]
     fn export_recovery_bundle_materializes_seed_hex() {
         let request = SeedExportRequest {
-            profile: seed_profile(),
+            identity: seed_profile(),
             auth_source: SeedOpenAuthSource::None,
             destination: SeedExportDestination::ExplicitPath(
                 "/safe/location/recovery.json".to_string(),
@@ -1551,7 +1554,7 @@ mod tests {
         assert_eq!(bundle.schema_version, SEED_RECOVERY_BUNDLE_SCHEMA_VERSION);
         assert_eq!(bundle.kind, SEED_RECOVERY_BUNDLE_KIND);
         assert_eq!(bundle.reason, "hardware migration");
-        assert_eq!(bundle.profile.name, "seed-profile");
+        assert_eq!(bundle.identity.name, "seed-identity");
         assert_eq!(bundle.seed.encoding, "hex");
         assert_eq!(bundle.seed.bytes, seed.len());
         assert_eq!(bundle.seed.material, hex_encode(&seed));
@@ -1566,8 +1569,8 @@ mod tests {
             kind: SEED_RECOVERY_BUNDLE_KIND.to_string(),
             exported_at_unix_seconds: 1,
             reason: "hardware migration".to_string(),
-            profile: SeedRecoveryBundleProfile {
-                name: "seed-profile".to_string(),
+            identity: SeedRecoveryBundleIdentity {
+                name: "seed-identity".to_string(),
                 algorithm: Algorithm::Ed25519,
                 uses: vec![UseCase::Derive],
                 derivation: SeedDerivation::hkdf_sha256_v1(),
@@ -1594,10 +1597,10 @@ mod tests {
                 kind: SEED_RECOVERY_BUNDLE_KIND.to_string(),
                 exported_at_unix_seconds: 1,
                 reason: "hardware migration".to_string(),
-                profile: SeedRecoveryBundleProfile {
-                    name: "old-profile".to_string(),
+                identity: SeedRecoveryBundleIdentity {
+                    name: "old-identity".to_string(),
                     algorithm: Algorithm::Ed25519,
-                    uses: vec![UseCase::Derive, UseCase::SshAgent],
+                    uses: vec![UseCase::Derive, UseCase::Ssh],
                     derivation: SeedDerivation::hkdf_sha256_v1(),
                 },
                 seed: SeedRecoveryBundleSecret {
@@ -1607,22 +1610,22 @@ mod tests {
                     material: hex_encode(&seed),
                 },
             },
-            target_profile: Some("new-profile".to_string()),
+            target_profile: Some("new-identity".to_string()),
             overwrite_existing: true,
         };
         let backend = RecordingImportBackend::default();
 
         let result = restore_recovery_bundle(&backend, &request).expect("restore bundle");
 
-        assert_eq!(result.profile.profile, "new-profile");
-        assert_eq!(result.profile.storage.object_label, "new-profile");
-        assert_eq!(result.restored_from_profile, "old-profile");
+        assert_eq!(result.identity.identity, "new-identity");
+        assert_eq!(result.identity.storage.object_label, "new-identity");
+        assert_eq!(result.restored_from_identity, "old-identity");
         assert_eq!(result.seed_bytes, seed.len());
 
         let sealed = backend.last_request.borrow();
         let sealed = sealed.as_ref().expect("seal request recorded");
         assert!(sealed.overwrite_existing);
-        assert_eq!(sealed.profile.profile, "new-profile");
+        assert_eq!(sealed.identity.identity, "new-identity");
         match &sealed.source {
             RecordedSeedCreateSource::Import {
                 ingress,
@@ -1638,23 +1641,23 @@ mod tests {
     #[test]
     fn seed_profile_from_profile_uses_metadata_object_label_override() {
         let root = tempfile::tempdir().expect("state root");
-        let mut profile = crate::model::Profile::new(
-            "seed-profile".to_string(),
+        let mut identity = crate::model::Identity::new(
+            "seed-identity".to_string(),
             Algorithm::Ed25519,
             vec![UseCase::Derive],
-            crate::model::ModeResolution {
+            crate::model::IdentityModeResolution {
                 requested: crate::model::ModePreference::Seed,
                 resolved: crate::model::Mode::Seed,
                 reasons: vec!["seed requested".to_string()],
             },
             crate::model::StateLayout::new(root.path().to_path_buf()),
         );
-        profile.metadata.insert(
+        identity.metadata.insert(
             SEED_OBJECT_LABEL_METADATA_KEY.to_string(),
             "portable-seed-object".to_string(),
         );
 
-        let seed_profile = seed_profile_from_profile(&profile).expect("seed profile from host");
+        let seed_profile = seed_profile_from_profile(&identity).expect("seed identity from host");
         assert_eq!(seed_profile.storage.object_label, "portable-seed-object");
     }
 
@@ -1681,7 +1684,7 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<SeedMaterial> {
             Ok(SecretBox::new(Box::new(self.0.clone())))
@@ -1695,7 +1698,7 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordedSealRequest {
-        profile: SeedProfile,
+        identity: SeedIdentity,
         overwrite_existing: bool,
         source: RecordedSeedCreateSource,
     }
@@ -1724,7 +1727,7 @@ mod tests {
             };
 
             self.last_request.replace(Some(RecordedSealRequest {
-                profile: request.profile.clone(),
+                identity: request.identity.clone(),
                 overwrite_existing: request.overwrite_existing,
                 source,
             }));
@@ -1733,7 +1736,7 @@ mod tests {
 
         fn unseal_seed(
             &self,
-            _profile: &SeedProfile,
+            _profile: &SeedIdentity,
             _auth_source: &SeedOpenAuthSource,
         ) -> Result<SeedMaterial> {
             unreachable!("recovery import does not unseal from the backend")
@@ -1893,10 +1896,10 @@ mod tests {
             objects_dir.path().to_path_buf(),
             RecordingRunner::new(state.clone()),
         );
-        let profile = seed_profile();
-        let layout = backend.sealed_object_layout(&profile).expect("layout");
+        let identity = seed_profile();
+        let layout = backend.sealed_object_layout(&identity).expect("layout");
         let request = SeedCreateRequest {
-            profile,
+            identity,
             source: SeedCreateSource::Import {
                 ingress: SeedImportIngress::InMemory,
                 material: Some(SecretBox::new(Box::new(seed.clone()))),
@@ -1946,7 +1949,7 @@ mod tests {
             RecordingRunner::new(state.clone()),
         );
         let request = SeedCreateRequest {
-            profile: seed_profile(),
+            identity: seed_profile(),
             source: SeedCreateSource::GenerateRandom { bytes: 32 },
             overwrite_existing: false,
         };
@@ -1973,14 +1976,14 @@ mod tests {
             objects_dir.path().to_path_buf(),
             RecordingRunner::new(state.clone()),
         );
-        let profile = seed_profile();
-        let layout = backend.sealed_object_layout(&profile).expect("layout");
+        let identity = seed_profile();
+        let layout = backend.sealed_object_layout(&identity).expect("layout");
         fs::create_dir_all(&layout.object_dir).expect("object dir");
         fs::write(&layout.public_blob, b"public-blob").expect("public blob");
         fs::write(&layout.private_blob, b"private-blob").expect("private blob");
 
         let unsealed = backend
-            .unseal_seed(&profile, &SeedOpenAuthSource::None)
+            .unseal_seed(&identity, &SeedOpenAuthSource::None)
             .expect("unseal seed");
 
         assert_eq!(
