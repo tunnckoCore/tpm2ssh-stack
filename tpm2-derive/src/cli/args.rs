@@ -7,8 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "tpm2-derive",
     version,
     about = "TPM-backed identity operations with native, PRF, and seed modes",
-    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, 'import' to reseal an exported seed bundle into fresh TPM-backed state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path currently supports the seed-backed slice in this CLI, while higher-level wrappers such as 'tpm2ssh' can provide broader user-facing SSH/Git flows.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin\n  tpm2-derive derive --with app-prf --org com.example --purpose session\n  tpm2-derive ssh-add --with seed-user\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive import --bundle backup.json --identity restored-user --confirm"
+    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, 'import' to reseal an exported seed bundle into fresh TPM-backed state, and the operational subcommands ('derive', 'sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin\n  tpm2-derive derive --with app-prf --org com.example --purpose session --context tenant=alpha\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format spki-pem --output prod-signer.pem\n  tpm2-derive export --with app-prf --kind keypair --confirm --reason \"hardware migration\" --output app-prf.json\n  tpm2-derive import --bundle backup.json --identity restored-user --confirm"
 )]
 pub struct Cli {
     #[arg(
@@ -37,11 +37,11 @@ pub enum Command {
     Encrypt(EncryptArgs),
     /// Decrypt data previously encrypted with the encrypt command.
     Decrypt(DecryptArgs),
-    /// Export public material or recovery artifacts from a persisted identity.
+    /// Export public material or gated secret-bearing artifacts from a persisted identity.
     Export(ExportArgs),
     /// Import a break-glass recovery bundle and reseal it into TPM-backed state.
     Import(ImportArgs),
-    /// Add a derived private key to ssh-agent.
+    /// Add a PRF- or seed-derived private key to ssh-agent.
     #[command(name = "ssh-add")]
     SshAdd(SshAddArgs),
 }
@@ -206,7 +206,7 @@ pub struct DecryptArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Export public material or high-friction recovery artifacts")]
+#[command(about = "Export public material or gated secret-bearing artifacts from a persisted identity")]
 pub struct ExportArgs {
     #[arg(long = "with", help = "Existing identity name to use")]
     pub identity: String,
@@ -275,7 +275,7 @@ pub struct ImportArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Add a derived private key to ssh-agent")]
+#[command(about = "Add a PRF- or seed-derived private key to ssh-agent")]
 pub struct SshAddArgs {
     #[arg(long = "with", help = "Existing identity name to use")]
     pub identity: String,
@@ -376,6 +376,8 @@ pub fn parse_key_value(value: &str) -> Result<(String, String), String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory as _;
+
     use super::*;
 
     #[test]
@@ -514,5 +516,19 @@ mod tests {
         );
 
         assert!(Cli::try_parse_from(["tpm2-derive", "keygen", "--with", "seed-user"]).is_err());
+    }
+
+    #[test]
+    fn top_level_help_tracks_adr_surface() {
+        let mut command = Cli::command();
+        let mut help = Vec::new();
+        command.write_long_help(&mut help).expect("help renders");
+        let help = String::from_utf8(help).expect("utf8 help");
+
+        assert!(help.contains("identity"));
+        assert!(help.contains("ssh-add"));
+        assert!(help.contains("supports PRF- and seed-backed identities"));
+        assert!(!help.contains("seed-backed slice"));
+        assert!(!help.contains("\n  keygen\n"));
     }
 }

@@ -445,51 +445,51 @@ If one of these intentionally uses a different derivation branch, that must be m
 ### Checklist
 
 #### Parsing and CLI tests
-- [ ] new identity grammar tests
-- [ ] `--with` tests
-- [ ] `ssh-add` tests
-- [ ] `--org` / `--purpose` / `--context` tests
-- [ ] rejection tests for removed old grammar
+- [x] new identity grammar tests
+- [x] `--with` tests
+- [x] `ssh-add` tests
+- [x] `--org` / `--purpose` / `--context` tests
+- [x] rejection tests for removed old grammar
 
 #### Model/schema tests
-- [ ] identity schema round-trip tests
-- [ ] use-bit serialization tests
-- [ ] derivation-default persistence tests
+- [x] identity schema round-trip tests
+- [x] use-bit serialization tests
+- [x] derivation-default persistence tests
 
 #### Capability/auto tests
-- [ ] inspect matrix tests
-- [ ] explicit mode no-fallback tests
-- [ ] `auto` ordering tests
-- [ ] `use=all` expansion tests
+- [x] inspect matrix tests
+- [x] explicit mode no-fallback tests
+- [x] `auto` ordering tests
+- [x] `use=all` expansion tests
 
 #### Derivation merge tests
-- [ ] defaults-only case
-- [ ] org override case
-- [ ] purpose override case
-- [ ] context new-key append case
-- [ ] context same-key replace case
-- [ ] repeated same command key last-wins case
-- [ ] native derivation-flag rejection case
+- [x] defaults-only case
+- [x] org override case
+- [x] purpose override case
+- [x] context new-key append case
+- [x] context same-key replace case
+- [x] repeated same command key last-wins case
+- [x] native derivation-flag rejection case
 
 #### Operation tests
-- [ ] seed sign/verify tests
-- [ ] PRF sign/verify tests
-- [ ] seed encrypt/decrypt tests
-- [ ] PRF encrypt/decrypt tests
-- [ ] derive no-double-expansion PRF regression tests
-- [ ] export public-key tests for native/prf/seed
-- [ ] export secret-key tests for prf/seed
-- [ ] export keypair tests for prf/seed
-- [ ] export-secret gating tests
-- [ ] ssh-add seed tests
-- [ ] ssh-add PRF tests
-- [ ] ssh-add native rejection tests
+- [x] seed sign/verify tests
+- [x] PRF sign/verify tests
+- [x] seed encrypt/decrypt tests
+- [x] PRF encrypt/decrypt tests
+- [x] derive no-double-expansion PRF regression tests
+- [x] export public-key tests for native/prf/seed
+- [x] export secret-key tests for prf/seed
+- [x] export keypair tests for prf/seed
+- [x] export-secret gating tests
+- [x] ssh-add seed tests
+- [x] ssh-add PRF tests
+- [x] ssh-add native rejection tests
 
 #### Output/docs cleanup
-- [ ] update README examples
-- [ ] update CLI help examples
-- [ ] remove lingering public `profile` wording
-- [ ] remove lingering public `setup` wording
+- [x] update README examples
+- [x] update CLI help examples
+- [x] remove lingering public `profile` wording
+- [x] remove lingering public `setup` wording
 
 ### Deliverables
 
@@ -572,8 +572,8 @@ Use this if multiple agents are working concurrently.
 
 Before calling the refactor done:
 
-- [ ] public CLI uses `identity` and `--with`
-- [ ] internal code no longer treats `profile` as the main public abstraction
+- [x] public CLI uses `identity` and `--with`
+- [x] internal code no longer treats `profile` as the main public abstraction
 - [x] `inspect` shows a truthful capability matrix
 - [x] `auto` chooses exactly one valid mode or fails
 - [x] `native` rejects derivation-input flags
@@ -583,7 +583,7 @@ Before calling the refactor done:
 - [x] `keygen` cannot bypass secret-export policy
 - [x] `ssh-add` works for PRF and seed, and rejects native
 - [x] native support advertised by inspect matches real backend execution
-- [ ] README/help/examples match the accepted ADR
+- [x] README/help/examples match the accepted ADR
 
 # Suggested commit slicing
 

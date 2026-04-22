@@ -490,23 +490,30 @@ pub fn export(request: &ExportRequest) -> Result<ExportResult> {
 }
 
 fn export_public_key(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
+    export_public_key_with_runner(identity, request, &ProcessCommandRunner)
+}
+
+fn export_public_key_with_runner<R>(
+    identity: &Identity,
+    request: &ExportRequest,
+    runner: &R,
+) -> Result<ExportResult>
+where
+    R: CommandRunner,
+{
     let format = request
         .public_key_format
         .unwrap_or(PublicKeyExportFormat::SpkiDer);
 
     match identity.mode.resolved {
-        Mode::Native => export_native_public_key_with_runner(
-            identity,
-            request.output.as_deref(),
-            format,
-            &ProcessCommandRunner,
-        ),
+        Mode::Native => {
+            export_native_public_key_with_runner(identity, request.output.as_deref(), format, runner)
+        }
         Mode::Prf | Mode::Seed => {
-            let runner = ProcessCommandRunner;
             let material = crate::ops::keygen::derive_identity_key_material_with_defaults(
                 identity,
                 &request.derivation,
-                &runner,
+                runner,
             )?;
             let public_key_der =
                 crate::ops::keygen::public_key_spki_der_from_material(identity, &material)?;
@@ -531,13 +538,47 @@ fn export_public_key(identity: &Identity, request: &ExportRequest) -> Result<Exp
 }
 
 fn export_secret_key(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
+    export_secret_key_with_runner(identity, request, &ProcessCommandRunner)
+}
+
+fn export_secret_key_with_runner<R>(
+    identity: &Identity,
+    request: &ExportRequest,
+    runner: &R,
+) -> Result<ExportResult>
+where
+    R: CommandRunner,
+{
+    let seed_backend = SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    export_secret_key_with_dependencies(
+        identity,
+        request,
+        runner,
+        &seed_backend,
+        &HkdfSha256SeedDeriver,
+    )
+}
+
+fn export_secret_key_with_dependencies<R, B, D>(
+    identity: &Identity,
+    request: &ExportRequest,
+    runner: &R,
+    seed_backend: &B,
+    seed_deriver: &D,
+) -> Result<ExportResult>
+where
+    R: CommandRunner,
+    B: SeedBackend,
+    D: SeedSoftwareDeriver,
+{
     enforce_secret_export_policy(identity, request, ExportKind::SecretKey)?;
 
-    let runner = ProcessCommandRunner;
-    let material = crate::ops::keygen::derive_identity_key_material_with_defaults(
+    let material = crate::ops::keygen::derive_identity_key_material(
         identity,
         &request.derivation,
-        &runner,
+        runner,
+        seed_backend,
+        seed_deriver,
     )?;
     let secret_key_hex = crate::ops::keygen::hex_encode(
         &crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?,
@@ -559,13 +600,47 @@ fn export_secret_key(identity: &Identity, request: &ExportRequest) -> Result<Exp
 }
 
 fn export_keypair(identity: &Identity, request: &ExportRequest) -> Result<ExportResult> {
+    export_keypair_with_runner(identity, request, &ProcessCommandRunner)
+}
+
+fn export_keypair_with_runner<R>(
+    identity: &Identity,
+    request: &ExportRequest,
+    runner: &R,
+) -> Result<ExportResult>
+where
+    R: CommandRunner,
+{
+    let seed_backend = SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    export_keypair_with_dependencies(
+        identity,
+        request,
+        runner,
+        &seed_backend,
+        &HkdfSha256SeedDeriver,
+    )
+}
+
+fn export_keypair_with_dependencies<R, B, D>(
+    identity: &Identity,
+    request: &ExportRequest,
+    runner: &R,
+    seed_backend: &B,
+    seed_deriver: &D,
+) -> Result<ExportResult>
+where
+    R: CommandRunner,
+    B: SeedBackend,
+    D: SeedSoftwareDeriver,
+{
     enforce_secret_export_policy(identity, request, ExportKind::Keypair)?;
 
-    let runner = ProcessCommandRunner;
-    let material = crate::ops::keygen::derive_identity_key_material_with_defaults(
+    let material = crate::ops::keygen::derive_identity_key_material(
         identity,
         &request.derivation,
-        &runner,
+        runner,
+        seed_backend,
+        seed_deriver,
     )?;
     let secret_key_hex = crate::ops::keygen::hex_encode(
         &crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?,
@@ -2224,6 +2299,284 @@ mod tests {
         fs::remove_dir_all(root_dir).expect("temporary prf export state should be removed");
     }
 
+    #[test]
+    fn export_prf_public_key_renders_derived_child_key() {
+        let root_dir = unique_temp_path("export-prf-derived-public-key");
+        let identity = persisted_prf_export_identity(&root_dir, Algorithm::P256, vec![UseCase::Sign]);
+        let output_path = root_dir.join("exports").join("prf-box.spki.der");
+
+        let result = export_public_key_with_runner(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::PublicKey,
+                output: Some(output_path.clone()),
+                public_key_format: Some(PublicKeyExportFormat::SpkiDer),
+                state_dir: Some(root_dir.clone()),
+                reason: None,
+                confirm: false,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"tpm-prf-material"),
+        )
+        .expect("prf public-key export");
+
+        assert_eq!(result.mode, Mode::Prf);
+        assert_eq!(result.kind, ExportKind::PublicKey);
+        assert_eq!(result.artifact.path, output_path);
+        assert!(!fs::read(&result.artifact.path).expect("exported public key").is_empty());
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn export_secret_key_and_keypair_require_export_secret_confirm_and_reason() {
+        let root_dir = unique_temp_path("export-prf-secret-policy");
+        let base_identity = persisted_prf_export_identity(&root_dir, Algorithm::Ed25519, vec![UseCase::Sign]);
+        let with_export_secret = persisted_prf_export_identity(
+            &root_dir,
+            Algorithm::Ed25519,
+            vec![UseCase::Sign, UseCase::ExportSecret],
+        );
+        let runner = RecordingPrfRunner::new(b"tpm-prf-material");
+
+        let missing_use = export_secret_key_with_runner(
+            &base_identity,
+            &ExportRequest {
+                identity: base_identity.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &runner,
+        )
+        .expect_err("missing export-secret should fail");
+        assert!(matches!(missing_use, Error::PolicyRefusal(message) if message.contains("use=export-secret")));
+
+        let missing_confirm = export_secret_key_with_runner(
+            &with_export_secret,
+            &ExportRequest {
+                identity: with_export_secret.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: false,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &runner,
+        )
+        .expect_err("missing confirm should fail");
+        assert!(matches!(missing_confirm, Error::Validation(message) if message.contains("--confirm")));
+
+        let missing_reason = export_keypair_with_runner(
+            &with_export_secret,
+            &ExportRequest {
+                identity: with_export_secret.name.clone(),
+                kind: ExportKind::Keypair,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: None,
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &runner,
+        )
+        .expect_err("missing reason should fail");
+        assert!(matches!(missing_reason, Error::Validation(message) if message.contains("--reason")));
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn export_prf_secret_key_and_keypair_succeed_when_policy_requirements_are_met() {
+        let root_dir = unique_temp_path("export-prf-secret-success");
+        let identity = persisted_prf_export_identity(
+            &root_dir,
+            Algorithm::Ed25519,
+            vec![UseCase::Sign, UseCase::ExportSecret],
+        );
+        let runner = RecordingPrfRunner::new(b"tpm-prf-material");
+
+        let secret_result = export_secret_key_with_runner(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &runner,
+        )
+        .expect("secret-key export");
+        assert_eq!(secret_result.kind, ExportKind::SecretKey);
+        assert!(!fs::read_to_string(&secret_result.artifact.path)
+            .expect("secret-key output")
+            .trim()
+            .is_empty());
+
+        let keypair_result = export_keypair_with_runner(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::Keypair,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("hardware migration".to_string()),
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &runner,
+        )
+        .expect("keypair export");
+        assert_eq!(keypair_result.kind, ExportKind::Keypair);
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&keypair_result.artifact.path).expect("keypair output"),
+        )
+        .expect("parse keypair json");
+        assert_eq!(payload["identity"], identity.name);
+        assert!(payload["secret_key_hex"].as_str().expect("secret hex").len() >= 64);
+        assert!(payload["public_key_spki_der_hex"]
+            .as_str()
+            .expect("public hex")
+            .len()
+            > 0);
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn export_seed_secret_key_and_keypair_require_export_secret() {
+        let root_dir = unique_temp_path("export-seed-secret-policy");
+        let identity = persisted_seed_export_identity(&root_dir, Algorithm::Ed25519, vec![UseCase::Sign]);
+        let backend = FakeSeedExportBackend::new(vec![0x33; 32]);
+        let error = export_secret_key_with_dependencies(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect_err("seed secret export without use bit should fail");
+
+        assert!(matches!(error, Error::PolicyRefusal(message) if message.contains("use=export-secret")));
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn export_seed_secret_key_and_keypair_succeed_when_policy_requirements_are_met() {
+        let root_dir = unique_temp_path("export-seed-secret-success");
+        let identity = persisted_seed_export_identity(
+            &root_dir,
+            Algorithm::Ed25519,
+            vec![UseCase::Sign, UseCase::ExportSecret],
+        );
+        let backend = FakeSeedExportBackend::new(vec![0x55; 32]);
+
+        let secret_result = export_secret_key_with_dependencies(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed secret-key export");
+        assert_eq!(secret_result.kind, ExportKind::SecretKey);
+        assert!(!fs::read_to_string(&secret_result.artifact.path)
+            .expect("seed secret output")
+            .trim()
+            .is_empty());
+
+        let keypair_result = export_keypair_with_dependencies(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::Keypair,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("hardware migration".to_string()),
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("seed keypair export");
+        assert_eq!(keypair_result.kind, ExportKind::Keypair);
+        let payload: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&keypair_result.artifact.path).expect("seed keypair output"),
+        )
+        .expect("parse seed keypair json");
+        assert_eq!(payload["identity"], identity.name);
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn export_native_secret_key_remains_forbidden() {
+        let root_dir = unique_temp_path("export-native-secret-key");
+        let (identity, _) = persisted_native_export_profile(&root_dir);
+        let error = export_secret_key_with_runner(
+            &identity,
+            &ExportRequest {
+                identity: identity.name.clone(),
+                kind: ExportKind::SecretKey,
+                output: None,
+                public_key_format: None,
+                state_dir: Some(root_dir.clone()),
+                reason: Some("backup".to_string()),
+                confirm: true,
+                confirm_phrase: None,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+        )
+        .expect_err("native secret export should fail");
+
+        assert!(matches!(error, Error::PolicyRefusal(message) if message.contains("native mode")));
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
     #[derive(Clone, Default)]
     struct FakeNativeSetupRunner {
         calls: Arc<Mutex<Vec<CommandInvocation>>>,
@@ -2332,6 +2685,19 @@ mod tests {
         programs: Arc<Mutex<Vec<String>>>,
     }
 
+    #[derive(Clone)]
+    struct RecordingPrfRunner {
+        raw_output: Vec<u8>,
+    }
+
+    impl RecordingPrfRunner {
+        fn new(raw_output: &[u8]) -> Self {
+            Self {
+                raw_output: raw_output.to_vec(),
+            }
+        }
+    }
+
     impl FakePrfSetupRunner {
         fn recorded_programs(&self) -> Vec<String> {
             self.programs.lock().expect("recorded programs").clone()
@@ -2369,6 +2735,20 @@ mod tests {
                     };
                 }
             }
+
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            }
+        }
+    }
+
+    impl CommandRunner for RecordingPrfRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            let output_path = pathbuf_arg(invocation, "-o");
+            fs::write(output_path, &self.raw_output).expect("write fake prf output");
 
             CommandOutput {
                 exit_code: Some(0),
@@ -2783,6 +3163,48 @@ mod tests {
         identity.persist().expect("persist identity");
 
         (identity, handle_path)
+    }
+
+    fn persisted_prf_export_identity(root_dir: &Path, algorithm: Algorithm, uses: Vec<UseCase>) -> Identity {
+        let state_layout = StateLayout::new(root_dir.to_path_buf());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let mut identity = Identity::new(
+            "prf-box".to_string(),
+            algorithm,
+            uses,
+            IdentityModeResolution {
+                requested: ModePreference::Prf,
+                resolved: Mode::Prf,
+                reasons: vec!["prf requested".to_string()],
+            },
+            state_layout,
+        );
+        identity.metadata.insert(
+            PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+            format!("objects/{}/prf-root.ctx", identity.name),
+        );
+        identity.persist().expect("persist prf identity");
+        identity
+    }
+
+    fn persisted_seed_export_identity(root_dir: &Path, algorithm: Algorithm, uses: Vec<UseCase>) -> Identity {
+        let state_layout = StateLayout::new(root_dir.to_path_buf());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let identity = Identity::new(
+            "seed-box".to_string(),
+            algorithm,
+            uses,
+            IdentityModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            state_layout,
+        );
+        identity.persist().expect("persist seed identity");
+        identity
     }
 
     #[derive(Clone)]
