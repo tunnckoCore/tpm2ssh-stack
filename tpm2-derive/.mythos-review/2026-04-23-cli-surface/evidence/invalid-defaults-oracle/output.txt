@@ -1,0 +1,6 @@
+create_whitespace_purpose: accepted identity defaults IdentityDerivationDefaults { org: Some("com.example"), purpose: Some("   "), context: {} }
+create_whitespace_purpose: later encrypt rejected identity with validation error: purpose must not be empty
+create_empty_context_value: accepted identity defaults IdentityDerivationDefaults { org: Some("com.example"), purpose: Some("app"), context: {"tenant": ""} }
+create_empty_context_value: later encrypt rejected identity with validation error: context value for key 'tenant' must not be empty
+load_invalid_defaults: load_named accepted persisted defaults IdentityDerivationDefaults { org: Some("com.example"), purpose: Some("app"), context: {"tenant": ""} }
+load_invalid_defaults: later encrypt rejected identity with validation error: context value for key 'tenant' must not be empty
