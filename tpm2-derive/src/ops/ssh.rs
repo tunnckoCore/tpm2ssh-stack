@@ -1,10 +1,18 @@
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::sync::Mutex;
+#[cfg(unix)]
+use std::thread;
+
+use tempfile::Builder as TempfileBuilder;
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use p256::SecretKey;
@@ -27,28 +35,38 @@ use crate::model::{Algorithm, Identity, SshAddRequest, SshAddResult, UseCase};
 use super::keygen::{derive_identity_key_material, normalized_secret_key_bytes};
 use super::seed::{HkdfSha256SeedDeriver, SeedBackend, SeedSoftwareDeriver, SubprocessSeedBackend};
 
-pub trait SshAddClient {
-    fn add_private_key(&self, socket: &Path, private_key_openssh: &Zeroizing<String>)
-    -> Result<()>;
+trait SshAddClient {
+    fn add_private_key(
+        &self,
+        socket: &VerifiedSocketPath,
+        private_key_openssh: &Zeroizing<String>,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ProcessSshAddClient;
+pub(crate) struct ProcessSshAddClient;
 
 impl SshAddClient for ProcessSshAddClient {
     fn add_private_key(
         &self,
-        socket: &Path,
+        socket: &VerifiedSocketPath,
         private_key_openssh: &Zeroizing<String>,
     ) -> Result<()> {
         let program = resolve_trusted_program_path("ssh-add").map_err(|error| {
             Error::State(format!("failed to resolve trusted ssh-add binary: {error}"))
         })?;
 
+        #[cfg(unix)]
+        let proxy = socket.spawn_proxy()?;
+        #[cfg(unix)]
+        let ssh_auth_sock = proxy.socket_path();
+        #[cfg(not(unix))]
+        let ssh_auth_sock = socket.path();
+
         let mut child = Command::new(program)
             .env_clear()
             .args(["-q", "-"])
-            .env("SSH_AUTH_SOCK", socket)
+            .env("SSH_AUTH_SOCK", ssh_auth_sock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -56,7 +74,7 @@ impl SshAddClient for ProcessSshAddClient {
             .map_err(|error| {
                 Error::State(format!(
                     "failed to spawn ssh-add for socket '{}': {error}",
-                    socket.display()
+                    socket.path().display()
                 ))
             })?;
 
@@ -78,6 +96,9 @@ impl SshAddClient for ProcessSshAddClient {
             ))
         })?;
 
+        #[cfg(unix)]
+        proxy.wait()?;
+
         if output.status.success() {
             return Ok(());
         }
@@ -87,13 +108,13 @@ impl SshAddClient for ProcessSshAddClient {
         Err(Error::State(if detail.is_empty() {
             format!(
                 "ssh-add failed for socket '{}' with status {:?}",
-                socket.display(),
+                socket.path().display(),
                 output.status.code()
             )
         } else {
             format!(
                 "ssh-add failed for socket '{}': {}",
-                socket.display(),
+                socket.path().display(),
                 detail
             )
         }))
@@ -116,7 +137,7 @@ pub fn add_with_defaults(identity: &Identity, request: &SshAddRequest) -> Result
     )
 }
 
-pub fn add_with_backend<R, B, D, C>(
+fn add_with_backend<R, B, D, C>(
     identity: &Identity,
     request: &SshAddRequest,
     prf_runner: &R,
@@ -204,8 +225,7 @@ where
             ))
         })?);
 
-    socket.revalidate()?;
-    client.add_private_key(socket.path(), &private_key_openssh)?;
+    client.add_private_key(&socket, &private_key_openssh)?;
 
     Ok(SshAddResult {
         identity: identity.name.clone(),
@@ -399,17 +419,36 @@ fn default_comment(identity: &Identity) -> String {
     format!("{}@tpm2-derive", identity.name)
 }
 
-#[derive(Debug, Clone)]
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketFingerprint {
+    device_id: u64,
+    inode: u64,
+    status_change_time_secs: i64,
+    status_change_time_nanos: i64,
+    modified_time_secs: i64,
+    modified_time_nanos: i64,
+}
+
+#[cfg(unix)]
+impl SocketFingerprint {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+            status_change_time_secs: metadata.ctime(),
+            status_change_time_nanos: metadata.ctime_nsec(),
+            modified_time_secs: metadata.mtime(),
+            modified_time_nanos: metadata.mtime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct VerifiedSocketPath {
     path: PathBuf,
     #[cfg(unix)]
-    device_id: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    status_change_time_secs: i64,
-    #[cfg(unix)]
-    status_change_time_nanos: i64,
+    connected_stream: Mutex<Option<UnixStream>>,
 }
 
 impl VerifiedSocketPath {
@@ -418,29 +457,156 @@ impl VerifiedSocketPath {
     }
 
     #[cfg(unix)]
-    fn revalidate(&self) -> Result<()> {
-        reject_symlinked_ancestor_components(&self.path)?;
-        let metadata = load_socket_metadata(&self.path)?;
-        validate_socket_metadata(&self.path, &metadata)?;
-        validate_socket_parent_directory(&self.path)?;
-        if metadata.dev() != self.device_id
-            || metadata.ino() != self.inode
-            || metadata.ctime() != self.status_change_time_secs
-            || metadata.ctime_nsec() != self.status_change_time_nanos
-        {
-            return Err(Error::Validation(format!(
-                "ssh-add socket '{}' changed after validation; refusing to export private key",
-                self.path.display()
-            )));
-        }
+    fn spawn_proxy(&self) -> Result<SshAddProxy> {
+        let upstream = self
+            .connected_stream
+            .lock()
+            .map_err(|_| {
+                Error::State("failed to acquire validated ssh-agent socket lock".to_string())
+            })?
+            .take()
+            .ok_or_else(|| {
+                Error::State(format!(
+                    "validated ssh-agent socket '{}' was already consumed",
+                    self.path.display()
+                ))
+            })?;
+        SshAddProxy::new(&self.path, upstream)
+    }
+}
 
-        Ok(())
+#[cfg(unix)]
+#[derive(Debug)]
+struct SshAddProxy {
+    socket_path: PathBuf,
+    _temp_dir: tempfile::TempDir,
+    forwarder: thread::JoinHandle<Result<()>>,
+}
+
+#[cfg(unix)]
+impl SshAddProxy {
+    fn new(target_path: &Path, upstream: UnixStream) -> Result<Self> {
+        let temp_dir = TempfileBuilder::new()
+            .prefix("tpm2-derive-ssh-add-proxy-")
+            .tempdir()
+            .map_err(|error| {
+                Error::State(format!(
+                    "failed to create ssh-add proxy workspace for '{}': {error}",
+                    target_path.display()
+                ))
+            })?;
+        let socket_path = temp_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).map_err(|error| {
+            Error::State(format!(
+                "failed to bind ssh-add proxy socket for '{}': {error}",
+                target_path.display()
+            ))
+        })?;
+        let target = target_path.to_path_buf();
+        let forwarder = thread::spawn(move || proxy_ssh_add_connection(listener, upstream, target));
+
+        Ok(Self {
+            socket_path,
+            _temp_dir: temp_dir,
+            forwarder,
+        })
     }
 
-    #[cfg(not(unix))]
-    fn revalidate(&self) -> Result<()> {
-        Ok(())
+    fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
+
+    fn wait(self) -> Result<()> {
+        self.forwarder.join().map_err(|_| {
+            Error::State("ssh-add proxy thread panicked while forwarding agent traffic".to_string())
+        })?
+    }
+}
+
+#[cfg(unix)]
+fn proxy_ssh_add_connection(
+    listener: UnixListener,
+    upstream: UnixStream,
+    target_path: PathBuf,
+) -> Result<()> {
+    let (downstream, _) = listener.accept().map_err(|error| {
+        Error::State(format!(
+            "ssh-add proxy failed to accept a client for '{}': {error}",
+            target_path.display()
+        ))
+    })?;
+    bridge_unix_streams(upstream, downstream, &target_path)
+}
+
+#[cfg(unix)]
+fn bridge_unix_streams(
+    upstream: UnixStream,
+    downstream: UnixStream,
+    target_path: &Path,
+) -> Result<()> {
+    let mut upstream_for_downstream = upstream.try_clone().map_err(|error| {
+        Error::State(format!(
+            "failed to clone validated ssh-agent stream for '{}': {error}",
+            target_path.display()
+        ))
+    })?;
+    let mut downstream_writer = downstream.try_clone().map_err(|error| {
+        Error::State(format!(
+            "failed to clone ssh-add proxy client stream for '{}': {error}",
+            target_path.display()
+        ))
+    })?;
+    let target = target_path.to_path_buf();
+    let upstream_to_downstream = thread::spawn(move || -> Result<()> {
+        io::copy(&mut upstream_for_downstream, &mut downstream_writer).map_err(|error| {
+            Error::State(format!(
+                "failed while forwarding agent response bytes for '{}': {error}",
+                target.display()
+            ))
+        })?;
+        let _ = downstream_writer.shutdown(std::net::Shutdown::Write);
+        Ok(())
+    });
+
+    let mut downstream_for_upstream = downstream;
+    let mut upstream_writer = upstream;
+    io::copy(&mut downstream_for_upstream, &mut upstream_writer).map_err(|error| {
+        Error::State(format!(
+            "failed while forwarding agent request bytes for '{}': {error}",
+            target_path.display()
+        ))
+    })?;
+    let _ = upstream_writer.shutdown(std::net::Shutdown::Write);
+
+    upstream_to_downstream.join().map_err(|_| {
+        Error::State(format!(
+            "ssh-add proxy forwarding thread panicked for '{}'",
+            target_path.display()
+        ))
+    })?
+}
+
+#[cfg(unix)]
+fn connect_validated_socket(path: &Path, fingerprint: SocketFingerprint) -> Result<UnixStream> {
+    let stream = UnixStream::connect(path).map_err(|error| {
+        Error::State(format!(
+            "failed to connect to validated ssh-agent socket '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    let metadata = load_socket_metadata(path)?;
+    validate_socket_metadata(path, &metadata)?;
+    validate_socket_parent_directory(path)?;
+    let current = SocketFingerprint::from_metadata(&metadata);
+    if current != fingerprint {
+        return Err(Error::Validation(format!(
+            "ssh-add socket '{}' changed during validation; refusing to export private key",
+            path.display()
+        )));
+    }
+
+    Ok(stream)
 }
 
 fn requested_socket_path(explicit_socket: Option<&Path>) -> Result<PathBuf> {
@@ -607,12 +773,11 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<VerifiedSocketPath> 
     {
         validate_socket_metadata(&path, &metadata)?;
         validate_socket_parent_directory(&path)?;
+        let connected_stream =
+            connect_validated_socket(&path, SocketFingerprint::from_metadata(&metadata))?;
         return Ok(VerifiedSocketPath {
             path,
-            device_id: metadata.dev(),
-            inode: metadata.ino(),
-            status_change_time_secs: metadata.ctime(),
-            status_change_time_nanos: metadata.ctime_nsec(),
+            connected_stream: Mutex::new(Some(connected_stream)),
         });
     }
 
@@ -718,10 +883,10 @@ mod tests {
     impl SshAddClient for RecordingSshAddClient {
         fn add_private_key(
             &self,
-            socket: &Path,
+            socket: &VerifiedSocketPath,
             private_key_openssh: &Zeroizing<String>,
         ) -> Result<()> {
-            self.sockets.borrow_mut().push(socket.to_path_buf());
+            self.sockets.borrow_mut().push(socket.path().to_path_buf());
             self.private_keys
                 .borrow_mut()
                 .push(private_key_openssh.to_string());
@@ -972,14 +1137,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ssh_add_rejects_socket_swap_after_validation() {
+    fn ssh_add_keeps_preconnected_socket_when_path_is_swapped() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::{Duration, Instant};
+
         let temp = tempdir().expect("tempdir");
         let socket_path = temp.path().join("agent.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let accept_listener = listener.try_clone().expect("clone listener");
+        accept_listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let accepted_original = Arc::new(AtomicBool::new(false));
+        let accepted_original_flag = accepted_original.clone();
+        let accepter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match accept_listener.accept() {
+                    Ok((_stream, _addr)) => {
+                        accepted_original_flag.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                    Err(_) => return,
+                }
+            }
+        });
         let identity = seed_identity(temp.path());
         let client = RecordingSshAddClient::default();
 
-        let error = add_with_backend(
+        let result = add_with_backend(
             &identity,
             &SshAddRequest {
                 identity: identity.name.clone(),
@@ -995,13 +1191,16 @@ mod tests {
             &SwappingSeedDeriver::new(socket_path.clone(), listener),
             &client,
         )
-        .expect_err("socket swap after validation should fail");
+        .expect("preconnected validated socket should survive later path swaps");
 
+        accepter.join().expect("accept thread should join");
         assert!(
-            matches!(error, Error::Validation(message) if message.contains("changed after validation"))
+            accepted_original.load(Ordering::SeqCst),
+            "original validated agent socket should receive the pinned connection"
         );
-        assert!(client.sockets().is_empty());
-        assert!(client.keys().is_empty());
+        assert_eq!(result.socket, socket_path);
+        assert_eq!(client.sockets(), vec![result.socket.clone()]);
+        assert_eq!(client.keys().len(), 1);
     }
 
     fn assert_zeroizing_string(_: &Zeroizing<String>) {}
