@@ -23,6 +23,11 @@ use super::prf::{
 const DEFAULT_DERIVATION_ORG: &str = "tpm2-derive.identity";
 const ENCRYPT_KEY_MATERIAL_TAG: &str = "encrypt-key";
 
+pub(crate) const IDENTITY_JSON_BYTES_LIMIT: usize = 256 * 1024;
+pub(crate) const BUFFERED_MESSAGE_INPUT_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+pub(crate) const VERIFY_SIGNATURE_INPUT_BYTES_LIMIT: usize = 64 * 1024;
+pub(crate) const BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct EffectiveDerivationInputs {
     pub org: String,
@@ -252,6 +257,90 @@ fn temporary_workspace_root(kind: &str, _identity: &str) -> Result<PathBuf> {
         ))
     })?;
     Ok(path)
+}
+
+pub(crate) fn ensure_bytes_within_limit(label: &str, len: usize, max_bytes: usize) -> Result<()> {
+    if len > max_bytes {
+        return Err(Error::Validation(format!(
+            "{label} exceeds the {max_bytes}-byte limit"
+        )));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn load_input_bytes_with_limit(
+    input: &InputSource,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    match input {
+        InputSource::Stdin => {
+            let stdin = std::io::stdin();
+            read_reader_bytes_with_limit(stdin.lock(), label, max_bytes)
+        }
+        InputSource::Path { path } => read_path_bytes_with_limit(path, label, max_bytes),
+    }
+}
+
+pub(crate) fn read_path_string_with_limit(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    let bytes = read_path_bytes_with_limit(path, label, max_bytes)?;
+    String::from_utf8(bytes).map_err(|error| {
+        Error::State(format!(
+            "failed to decode {label} '{}' as UTF-8: {error}",
+            path.display()
+        ))
+    })
+}
+
+pub(crate) fn read_path_bytes_with_limit(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Ok(metadata) = fs::metadata(path) {
+        if metadata.is_file() {
+            let file_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            ensure_bytes_within_limit(
+                &format!("{label} '{}'", path.display()),
+                file_len,
+                max_bytes,
+            )?;
+        }
+    }
+
+    let file = fs::File::open(path).map_err(|error| {
+        Error::State(format!(
+            "failed to read {label} '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    read_reader_bytes_with_limit(file, &format!("{label} '{}'", path.display()), max_bytes)
+}
+
+pub(crate) fn read_reader_bytes_with_limit<R>(
+    reader: R,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>>
+where
+    R: Read,
+{
+    let max_with_sentinel = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX.saturating_sub(1))
+        .saturating_add(1);
+    let mut limited_reader = reader.take(max_with_sentinel);
+    let mut buffer = Vec::new();
+    limited_reader
+        .read_to_end(&mut buffer)
+        .map_err(|error| Error::State(format!("failed to read {label}: {error}")))?;
+    ensure_bytes_within_limit(label, buffer.len(), max_bytes)?;
+    Ok(buffer)
 }
 
 pub(crate) fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {

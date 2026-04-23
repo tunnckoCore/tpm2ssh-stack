@@ -34,8 +34,9 @@ use crate::ops::seed::{
 use secrecy::ExposeSecret;
 
 use super::shared::{
-    classify_native_command_failure, encode_textual_output_bytes,
-    ensure_derivation_overrides_allowed, ensure_dir, load_input_bytes, write_output_file,
+    BUFFERED_MESSAGE_INPUT_BYTES_LIMIT, classify_native_command_failure,
+    encode_textual_output_bytes, ensure_derivation_overrides_allowed, ensure_dir,
+    load_input_bytes_with_limit, write_output_file,
 };
 
 #[cfg(test)]
@@ -644,7 +645,7 @@ fn validate_sign_output_format(
 }
 
 fn load_sign_input(input: &crate::model::InputSource) -> Result<Vec<u8>> {
-    load_input_bytes(input, "sign input")
+    load_input_bytes_with_limit(input, "sign input", BUFFERED_MESSAGE_INPUT_BYTES_LIMIT)
 }
 
 #[cfg(test)]
@@ -706,18 +707,52 @@ mod tests {
         (0..64).map(|index| digest[index % digest.len()]).collect()
     }
 
-    fn native_identity(root: &Path) -> Identity {
+    fn signing_identity(root: &Path, mode: Mode, algorithm: Algorithm) -> Identity {
         Identity::new(
-            "native-sign".to_string(),
-            Algorithm::P256,
+            format!("{mode:?}-signer").to_lowercase(),
+            algorithm,
             vec![UseCase::Sign, UseCase::Verify],
             IdentityModeResolution {
-                requested: ModePreference::Native,
-                resolved: Mode::Native,
-                reasons: vec!["native requested".to_string()],
+                requested: match mode {
+                    Mode::Native => ModePreference::Native,
+                    Mode::Prf => ModePreference::Prf,
+                    Mode::Seed => ModePreference::Seed,
+                },
+                resolved: mode,
+                reasons: vec![format!("{mode:?} requested")],
             },
             StateLayout::new(root.to_path_buf()),
         )
+    }
+
+    fn native_identity(root: &Path) -> Identity {
+        signing_identity(root, Mode::Native, Algorithm::P256)
+    }
+
+    #[test]
+    fn native_sign_rejects_oversized_buffered_input() {
+        let state_root = tempdir().expect("state root");
+        let identity = signing_identity(state_root.path(), Mode::Native, Algorithm::P256);
+        let input_path = state_root.path().join("oversized.bin");
+        let file = fs::File::create(&input_path).expect("oversized input file");
+        file.set_len((BUFFERED_MESSAGE_INPUT_BYTES_LIMIT + 1) as u64)
+            .expect("oversized sign input");
+
+        let error = execute_with_defaults(
+            &identity,
+            &SignRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+                format: Format::Hex,
+                output: None,
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect_err("oversized buffered sign input should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("sign input") && message.contains("byte limit"))
+        );
     }
 
     fn write_default_handle(identity: &Identity) {
@@ -728,6 +763,32 @@ mod tests {
             .join(format!("{}.handle", identity.name));
         fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
         fs::write(handle_path, b"serialized-handle").expect("handle file");
+    }
+
+    #[test]
+    fn seed_ed25519_sign_rejects_oversized_buffered_input() {
+        let state_root = tempdir().expect("state root");
+        let identity = signing_identity(state_root.path(), Mode::Seed, Algorithm::Ed25519);
+        let input_path = state_root.path().join("oversized.bin");
+        let file = fs::File::create(&input_path).expect("oversized input file");
+        file.set_len((BUFFERED_MESSAGE_INPUT_BYTES_LIMIT + 1) as u64)
+            .expect("oversized sign input");
+
+        let error = execute_with_defaults(
+            &identity,
+            &SignRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+                format: Format::Hex,
+                output: None,
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect_err("oversized buffered sign input should fail for seed ed25519");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("sign input") && message.contains("byte limit"))
+        );
     }
 
     #[test]

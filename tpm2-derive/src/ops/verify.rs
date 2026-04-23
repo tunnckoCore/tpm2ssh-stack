@@ -27,8 +27,9 @@ use crate::ops::seed::{
 use secrecy::ExposeSecret;
 
 use super::shared::{
+    BUFFERED_MESSAGE_INPUT_BYTES_LIMIT, VERIFY_SIGNATURE_INPUT_BYTES_LIMIT,
     classify_native_command_failure, decode_input_bytes, ensure_derivation_overrides_allowed,
-    load_input_bytes,
+    load_input_bytes_with_limit,
 };
 #[cfg(test)]
 use super::sign::{
@@ -57,6 +58,12 @@ pub struct VerifyOperationResult {
     pub signature_format: VerifySignatureFormat,
 }
 
+struct LoadedVerifyRequest {
+    input_bytes: Vec<u8>,
+    signature_bytes: Vec<u8>,
+    signature_input_format: InputFormat,
+}
+
 pub fn execute_with_defaults(
     identity: &Identity,
     request: &VerifyRequest,
@@ -83,6 +90,41 @@ where
     }
 }
 
+fn load_verify_request(request: &VerifyRequest) -> Result<LoadedVerifyRequest> {
+    if matches!(request.input, InputSource::Stdin)
+        && matches!(request.signature, InputSource::Stdin)
+    {
+        return Err(Error::Validation(
+            "verify cannot read both --input and --signature from stdin at the same time"
+                .to_string(),
+        ));
+    }
+
+    let input_bytes = load_input_bytes_with_limit(
+        &request.input,
+        "verify input",
+        BUFFERED_MESSAGE_INPUT_BYTES_LIMIT,
+    )?;
+    let raw_signature_input = load_input_bytes_with_limit(
+        &request.signature,
+        "verify signature",
+        VERIFY_SIGNATURE_INPUT_BYTES_LIMIT,
+    )?;
+    let (signature_bytes, signature_input_format) =
+        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
+    if signature_bytes.is_empty() {
+        return Err(Error::Validation(
+            "verify signature must not be empty".to_string(),
+        ));
+    }
+
+    Ok(LoadedVerifyRequest {
+        input_bytes,
+        signature_bytes,
+        signature_input_format,
+    })
+}
+
 fn verify_derived_identity<R>(
     request: &VerifyRequest,
     identity: &Identity,
@@ -99,24 +141,12 @@ where
         )));
     }
 
-    if matches!(request.input, InputSource::Stdin)
-        && matches!(request.signature, InputSource::Stdin)
-    {
-        return Err(Error::Validation(
-            "verify cannot read both --input and --signature from stdin at the same time"
-                .to_string(),
-        ));
-    }
-
-    let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let raw_signature_input = load_input_bytes(&request.signature, "verify signature")?;
-    let (signature_bytes, signature_input_format) =
-        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
-    if signature_bytes.is_empty() {
-        return Err(Error::Validation(
-            "verify signature must not be empty".to_string(),
-        ));
-    }
+    let loaded = load_verify_request(request)?;
+    let LoadedVerifyRequest {
+        input_bytes,
+        signature_bytes,
+        signature_input_format,
+    } = loaded;
 
     let derived = derive_identity_key_material_with_defaults(identity, derivation, runner)?;
     let digest = Sha256::digest(&input_bytes).to_vec();
@@ -186,24 +216,12 @@ where
         )));
     }
 
-    if matches!(request.input, InputSource::Stdin)
-        && matches!(request.signature, InputSource::Stdin)
-    {
-        return Err(Error::Validation(
-            "verify cannot read both --input and --signature from stdin at the same time"
-                .to_string(),
-        ));
-    }
-
-    let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let raw_signature_input = load_input_bytes(&request.signature, "verify signature")?;
-    let (signature_bytes, signature_input_format) =
-        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
-    if signature_bytes.is_empty() {
-        return Err(Error::Validation(
-            "verify signature must not be empty".to_string(),
-        ));
-    }
+    let loaded = load_verify_request(request)?;
+    let LoadedVerifyRequest {
+        input_bytes,
+        signature_bytes,
+        signature_input_format,
+    } = loaded;
 
     let digest = Sha256::digest(&input_bytes).to_vec();
     let public_key_der = export_native_public_key_der_with_runner(identity, runner)?;
@@ -256,24 +274,12 @@ where
         )));
     }
 
-    if matches!(request.input, InputSource::Stdin)
-        && matches!(request.signature, InputSource::Stdin)
-    {
-        return Err(Error::Validation(
-            "verify cannot read both --input and --signature from stdin at the same time"
-                .to_string(),
-        ));
-    }
-
-    let input_bytes = load_input_bytes(&request.input, "verify input")?;
-    let raw_signature_input = load_input_bytes(&request.signature, "verify signature")?;
-    let (signature_bytes, signature_input_format) =
-        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
-    if signature_bytes.is_empty() {
-        return Err(Error::Validation(
-            "verify signature must not be empty".to_string(),
-        ));
-    }
+    let loaded = load_verify_request(request)?;
+    let LoadedVerifyRequest {
+        input_bytes,
+        signature_bytes,
+        signature_input_format,
+    } = loaded;
 
     let seed_request = seed_verify_open_request(identity)?;
     let seed_plan = plan_open(&seed_request)?;
@@ -653,20 +659,112 @@ mod tests {
 
     use crate::model::{IdentityModeResolution, InputSource, ModePreference, StateLayout};
 
+    fn verify_identity(root: &std::path::Path, mode: Mode, algorithm: Algorithm) -> Identity {
+        Identity::new(
+            format!("{mode:?}-verifier").to_lowercase(),
+            algorithm,
+            vec![UseCase::Sign, UseCase::Verify],
+            IdentityModeResolution {
+                requested: match mode {
+                    Mode::Native => ModePreference::Native,
+                    Mode::Prf => ModePreference::Prf,
+                    Mode::Seed => ModePreference::Seed,
+                },
+                resolved: mode,
+                reasons: vec![format!("{mode:?} requested")],
+            },
+            StateLayout::new(root.to_path_buf()),
+        )
+    }
+
+    #[test]
+    fn native_verify_rejects_oversized_signature_input() {
+        let state_root = tempdir().expect("state root");
+        let identity = verify_identity(state_root.path(), Mode::Native, Algorithm::P256);
+        let input_path = state_root.path().join("input.bin");
+        let sig_path = state_root.path().join("oversized.sig");
+        fs::write(&input_path, b"hello native verify").expect("input file");
+        let file = fs::File::create(&sig_path).expect("oversized signature file");
+        file.set_len((VERIFY_SIGNATURE_INPUT_BYTES_LIMIT + 1) as u64)
+            .expect("oversized signature input");
+
+        let error = execute_with_defaults(
+            &identity,
+            &VerifyRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path { path: sig_path },
+                format: InputFormat::Auto,
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect_err("oversized verify signature input should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("verify signature") && message.contains("byte limit"))
+        );
+    }
+
+    #[test]
+    fn seed_verify_rejects_oversized_buffered_message_input() {
+        let state_root = tempdir().expect("state root");
+        let identity = verify_identity(state_root.path(), Mode::Seed, Algorithm::Ed25519);
+        let input_path = state_root.path().join("oversized.bin");
+        let sig_path = state_root.path().join("sig.bin");
+        let file = fs::File::create(&input_path).expect("oversized input file");
+        file.set_len((BUFFERED_MESSAGE_INPUT_BYTES_LIMIT + 1) as u64)
+            .expect("oversized verify input");
+        fs::write(&sig_path, [0u8; 64]).expect("signature file");
+
+        let error = execute_with_defaults(
+            &identity,
+            &VerifyRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path { path: sig_path },
+                format: InputFormat::Raw,
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect_err("oversized verify input should fail for seed ed25519");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("verify input") && message.contains("byte limit"))
+        );
+    }
+
+    #[test]
+    fn seed_verify_rejects_oversized_signature_input() {
+        let state_root = tempdir().expect("state root");
+        let identity = verify_identity(state_root.path(), Mode::Seed, Algorithm::Ed25519);
+        let input_path = state_root.path().join("input.bin");
+        let sig_path = state_root.path().join("oversized.sig");
+        fs::write(&input_path, b"hello seed verify").expect("input file");
+        let file = fs::File::create(&sig_path).expect("oversized signature file");
+        file.set_len((VERIFY_SIGNATURE_INPUT_BYTES_LIMIT + 1) as u64)
+            .expect("oversized signature input");
+
+        let error = execute_with_defaults(
+            &identity,
+            &VerifyRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path { path: input_path },
+                signature: InputSource::Path { path: sig_path },
+                format: InputFormat::Raw,
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect_err("oversized verify signature input should fail for seed ed25519");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("verify signature") && message.contains("byte limit"))
+        );
+    }
+
     #[test]
     fn native_verify_rejects_derivation_overrides() {
         let state_root = tempdir().expect("state root");
-        let identity = Identity::new(
-            "native-verify".to_string(),
-            Algorithm::P256,
-            vec![UseCase::Sign, UseCase::Verify],
-            IdentityModeResolution {
-                requested: ModePreference::Native,
-                resolved: Mode::Native,
-                reasons: vec!["native requested".to_string()],
-            },
-            StateLayout::new(state_root.path().to_path_buf()),
-        );
+        let identity = verify_identity(state_root.path(), Mode::Native, Algorithm::P256);
         let input_path = state_root.path().join("input.bin");
         let sig_path = state_root.path().join("sig.bin");
         fs::write(&input_path, b"hello native verify").expect("input file");
