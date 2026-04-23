@@ -353,24 +353,6 @@ where
     Ok(buffer)
 }
 
-pub(crate) fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
-    match input {
-        InputSource::Stdin => {
-            let mut buffer = Vec::new();
-            std::io::stdin().read_to_end(&mut buffer).map_err(|error| {
-                Error::State(format!("failed to read {label} from stdin: {error}"))
-            })?;
-            Ok(buffer)
-        }
-        InputSource::Path { path } => fs::read(path).map_err(|error| {
-            Error::State(format!(
-                "failed to read {label} '{}': {error}",
-                path.display()
-            ))
-        }),
-    }
-}
-
 pub(crate) fn encode_textual_output_bytes(format: Format, bytes: &[u8]) -> Result<Vec<u8>> {
     match format {
         Format::Hex => Ok(hex_encode(bytes).into_bytes()),
@@ -715,6 +697,8 @@ fn validate_non_empty(field: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    use std::io::Cursor;
+
     use secrecy::ExposeSecret;
 
     fn assert_secret_bytes(_: &SecretBytes) {}
@@ -725,5 +709,23 @@ mod tests {
 
         assert_secret_bytes(&secret);
         assert_eq!(secret.expose_secret().as_slice(), &[0x12, 0x34, 0x56]);
+    }
+
+    #[test]
+    fn read_reader_bytes_with_limit_accepts_exact_limit() {
+        let bytes = read_reader_bytes_with_limit(Cursor::new(vec![0xAA; 4]), "stdin input", 4)
+            .expect("read exact-size input");
+
+        assert_eq!(bytes, vec![0xAA; 4]);
+    }
+
+    #[test]
+    fn read_reader_bytes_with_limit_rejects_oversized_input() {
+        let error = read_reader_bytes_with_limit(Cursor::new(vec![0xAA; 5]), "stdin input", 4)
+            .expect_err("oversized stdin input should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("stdin input") && message.contains("4-byte limit"))
+        );
     }
 }

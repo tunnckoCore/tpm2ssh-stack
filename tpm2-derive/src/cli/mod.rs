@@ -2,7 +2,6 @@ mod args;
 mod render;
 
 use std::fs;
-use std::io::Read;
 use std::path::PathBuf;
 
 use args::{
@@ -22,6 +21,7 @@ use crate::model::{
     VerifyRequest,
 };
 use crate::ops;
+use crate::ops::shared::{BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT, load_input_bytes_with_limit};
 use crate::ops::sign::SignOperationResult;
 
 #[cfg(test)]
@@ -267,7 +267,11 @@ fn run_encrypt(json: bool, args: EncryptArgs) -> Result<String> {
         }
     };
 
-    let input_bytes = load_input_bytes(&parse_input_source(&args.input), "encrypt input")?;
+    let input_bytes = load_input_bytes_with_limit(
+        &parse_input_source(&args.input),
+        "encrypt input",
+        BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT,
+    )?;
     let derivation = derivation_overrides(args.derivation.clone());
     let runner = ProcessCommandRunner;
     match ops::encrypt::encrypt_with_defaults(&identity, &input_bytes, &derivation, &runner) {
@@ -329,7 +333,11 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
         );
     }
 
-    let raw_input = load_input_bytes(&parse_input_source(&args.input), "decrypt input")?;
+    let raw_input = load_input_bytes_with_limit(
+        &parse_input_source(&args.input),
+        "decrypt input",
+        BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT,
+    )?;
     // Try to interpret as hex first (the format we emit), otherwise use raw bytes.
     let ciphertext = try_hex_decode(&raw_input).unwrap_or(raw_input);
     let derivation = derivation_overrides(args.derivation.clone());
@@ -536,24 +544,6 @@ fn parse_input_source(input: &str) -> InputSource {
     }
 }
 
-fn load_input_bytes(input: &InputSource, label: &str) -> Result<Vec<u8>> {
-    match input {
-        InputSource::Stdin => {
-            let mut buffer = Vec::new();
-            std::io::stdin().read_to_end(&mut buffer).map_err(|error| {
-                Error::State(format!("failed to read {label} from stdin: {error}"))
-            })?;
-            Ok(buffer)
-        }
-        InputSource::Path { path } => fs::read(path).map_err(|error| {
-            Error::State(format!(
-                "failed to read {label} '{}': {error}",
-                path.display()
-            ))
-        }),
-    }
-}
-
 fn hex_decode_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
@@ -724,6 +714,7 @@ mod tests {
     use super::*;
 
     use std::cell::RefCell;
+    use std::fs::File;
     use std::path::Path;
 
     use crate::backend::{CommandInvocation, CommandOutput};
@@ -1625,6 +1616,87 @@ mod tests {
                 .expect("error message")
                 .contains("--allow-plaintext-output")
         );
+    }
+
+    #[test]
+    fn encrypt_rejects_oversized_buffered_input_before_running_backend() {
+        let state_root = tempdir().expect("state root");
+        let identity = Identity::new(
+            "seed-encrypt-limit".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Encrypt],
+            IdentityModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            StateLayout::new(state_root.path().to_path_buf()),
+        );
+        identity.persist().expect("persist identity");
+
+        let input_path = state_root.path().join("oversized-encrypt.bin");
+        let file = File::create(&input_path).expect("oversized encrypt input");
+        file.set_len((BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT + 1) as u64)
+            .expect("oversized encrypt input length");
+
+        let error = run(Cli::try_parse_from([
+            "tpm2-derive",
+            "--json",
+            "encrypt",
+            "--with",
+            &identity.name,
+            "--input",
+            &input_path.display().to_string(),
+            "--state-dir",
+            &state_root.path().display().to_string(),
+        ])
+        .expect("cli parse"))
+        .expect_err("oversized encrypt input should fail before backend execution");
+
+        assert!(error.to_string().contains("encrypt input"));
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn decrypt_rejects_oversized_buffered_input_before_running_backend() {
+        let state_root = tempdir().expect("state root");
+        let identity = Identity::new(
+            "seed-decrypt-limit".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Decrypt],
+            IdentityModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            StateLayout::new(state_root.path().to_path_buf()),
+        );
+        identity.persist().expect("persist identity");
+
+        let input_path = state_root.path().join("oversized-decrypt.hex");
+        let file = File::create(&input_path).expect("oversized decrypt input");
+        file.set_len((BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT + 1) as u64)
+            .expect("oversized decrypt input length");
+
+        let output_path = state_root.path().join("plaintext.bin");
+        let error = run(Cli::try_parse_from([
+            "tpm2-derive",
+            "--json",
+            "decrypt",
+            "--with",
+            &identity.name,
+            "--input",
+            &input_path.display().to_string(),
+            "--output",
+            &output_path.display().to_string(),
+            "--state-dir",
+            &state_root.path().display().to_string(),
+        ])
+        .expect("cli parse"))
+        .expect_err("oversized decrypt input should fail before backend execution");
+
+        assert!(error.to_string().contains("decrypt input"));
+        assert!(error.to_string().contains("limit"));
     }
 
     fn hex_decode_test(hex: &str) -> Vec<u8> {

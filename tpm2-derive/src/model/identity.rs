@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::model::{Algorithm, Mode, ModePreference, StateLayout, UseCase};
+use crate::ops::shared::{IDENTITY_JSON_BYTES_LIMIT, read_path_string_with_limit};
 
 pub const IDENTITY_SCHEMA_VERSION: u32 = 2;
 
@@ -154,13 +155,11 @@ impl Identity {
 
     pub fn load_from_layout(name: &str, state_layout: StateLayout) -> Result<Self> {
         let identity_path = state_layout.identity_path(name);
-        let contents = fs::read_to_string(&identity_path).map_err(|error| {
-            Error::State(format!(
-                "failed to read identity '{}' from '{}': {error}",
-                name,
-                identity_path.display()
-            ))
-        })?;
+        let contents = read_path_string_with_limit(
+            &identity_path,
+            &format!("identity '{}'", name),
+            IDENTITY_JSON_BYTES_LIMIT,
+        )?;
 
         let mut parsed: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
             Error::State(format!(
@@ -249,6 +248,7 @@ mod tests {
     use super::*;
 
     use std::env;
+    use std::fs::File;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -353,6 +353,26 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "identity file should be 0600");
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn load_named_rejects_oversized_identity_json() {
+        let root_dir = unique_temp_path("identity-oversized");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("create state layout");
+
+        let identity_path = state_layout.identity_path("oversized");
+        let file = File::create(&identity_path).expect("create oversized identity file");
+        file.set_len((IDENTITY_JSON_BYTES_LIMIT + 1) as u64)
+            .expect("oversized identity json");
+
+        let error = Identity::load_named("oversized", Some(root_dir.clone()))
+            .expect_err("oversized identity JSON should fail closed");
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("identity 'oversized'") && message.contains("limit"))
+        );
 
         fs::remove_dir_all(root_dir).expect("cleanup");
     }

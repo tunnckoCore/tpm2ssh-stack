@@ -72,21 +72,21 @@ This plan is written for multiple agents working in parallel.
 
 ### Checklist
 
-- [ ] add a global native persistent-handle allocation lock
-- [ ] add a per-identity native setup lock
-- [ ] replace fixed native setup scratch dir with unique temp staging dir
-- [ ] replace fixed native sign digest/signature artifact paths with unique per-request temp paths
-- [ ] remove raw persistent-handle fallback when serialized handle state is missing
-- [ ] add retry/rollback around persistent handle allocation collisions
-- [ ] add rollback on native setup failure after TPM object persistence but before identity persistence
-- [ ] add explicit transient cleanup where needed
+- [x] add a global native persistent-handle allocation lock
+- [x] add a per-identity native setup lock
+- [x] replace fixed native setup scratch dir with unique temp staging dir
+- [x] replace fixed native sign digest/signature artifact paths with unique per-request temp paths
+- [x] remove raw persistent-handle fallback when serialized handle state is missing
+- [x] add retry/rollback around persistent handle allocation collisions
+- [x] add rollback on native setup failure after TPM object persistence but before identity persistence
+- [x] add explicit transient cleanup where needed
 
 ### Acceptance checks
 
-- [ ] parallel native sign for the same identity cannot clobber files or return the wrong signature
-- [ ] same-name native setup cannot race successfully
-- [ ] handle allocation is no longer a naked scan-then-use race
-- [ ] missing serialized handle state causes hard failure, not fallback to arbitrary persistent handle use
+- [x] parallel native sign for the same identity cannot clobber files or return the wrong signature
+- [x] same-name native setup cannot race successfully
+- [x] handle allocation is no longer a naked scan-then-use race
+- [x] missing serialized handle state causes hard failure, not fallback to arbitrary persistent handle use
 
 ---
 
@@ -107,27 +107,27 @@ This plan is written for multiple agents working in parallel.
 
 ### Checklist
 
-- [ ] replace duplicated input-loading helpers with one shared bounded helper
-- [ ] add bounded identity JSON loading
-- [ ] add bounded signature-input loading for verify
-- [ ] add explicit buffered input caps for Ed25519 sign/verify paths
-- [ ] add explicit buffered caps for any remaining non-streaming encrypt/decrypt paths
-- [ ] reject oversized stdin with `take(limit + 1)` style bounded reads
-- [ ] reject oversized files with metadata pre-check where possible
+- [x] replace duplicated input-loading helpers with one shared bounded helper
+- [x] add bounded identity JSON loading
+- [x] add bounded signature-input loading for verify
+- [x] add explicit buffered input caps for Ed25519 sign/verify paths
+- [x] add explicit buffered caps for any remaining non-streaming encrypt/decrypt paths
+- [x] reject oversized stdin with `take(limit + 1)` style bounded reads
+- [x] reject oversized files with metadata pre-check where possible
 
 ### Initial limits
 
-- [ ] identity JSON cap
-- [ ] verify signature input cap
-- [ ] buffered Ed25519 message cap
-- [ ] temporary buffered encrypt/decrypt cap until streaming lands
+- [x] identity JSON cap
+- [x] verify signature input cap
+- [x] buffered Ed25519 message cap
+- [x] temporary buffered encrypt/decrypt cap until streaming lands
 
 ### Acceptance checks
 
-- [ ] no unbounded `read_to_end` / `fs::read` / `read_to_string` remain on large operational paths
-- [ ] oversize identity JSON is rejected cleanly
-- [ ] oversize signature input is rejected cleanly
-- [ ] oversize buffered message/stdin input is rejected cleanly
+- [x] no unbounded `read_to_end` / `fs::read` / `read_to_string` remain on large operational paths
+- [x] oversize identity JSON is rejected cleanly
+- [x] oversize signature input is rejected cleanly
+- [x] oversize buffered message/stdin input is rejected cleanly
 
 ---
 
@@ -149,18 +149,18 @@ This plan is written for multiple agents working in parallel.
 
 ### Checklist
 
-- [ ] make derived-secret helpers return secret/zeroizing containers instead of plain `Vec<u8>`
-- [ ] eliminate `.expose_secret().to_vec()` fan-out where possible
-- [ ] wrap unavoidable temporary secret buffers in zeroizing containers
-- [ ] zeroize temporary key/scalar/symmetric-key buffers after use
-- [ ] minimize secret-bearing `String` creation in export and ssh-add flows
+- [x] make derived-secret helpers return secret/zeroizing containers instead of plain `Vec<u8>`
+- [x] eliminate `.expose_secret().to_vec()` fan-out where possible
+- [x] wrap unavoidable temporary secret buffers in zeroizing containers
+- [x] zeroize temporary key/scalar/symmetric-key buffers after use
+- [x] minimize secret-bearing `String` creation in export and ssh-add flows
 - [ ] audit temp-file secret lifetime and shorten it where practical
 
 ### Acceptance checks
 
-- [ ] core derived-key helpers no longer return plain `Vec<u8>`
-- [ ] explicit `zeroize` usage appears in real secret paths
-- [ ] export and ssh-add no longer create unnecessary duplicate plaintext copies of private material
+- [x] core derived-key helpers no longer return plain `Vec<u8>`
+- [x] explicit `zeroize` usage appears in real secret paths
+- [x] export and ssh-add no longer create unnecessary duplicate plaintext copies of private material
 
 ---
 
@@ -184,7 +184,7 @@ This plan is written for multiple agents working in parallel.
 - [ ] switch native sign to stream-hash input before TPM signing
 - [ ] switch native verify to stream-hash input before TPM verification
 - [ ] switch p256/secp256k1 sign/verify to prehash-based APIs
-- [ ] keep Ed25519 buffered but capped
+- [x] keep Ed25519 buffered but capped
 - [ ] redesign encrypt/decrypt around chunked streaming reader->writer APIs
 - [ ] remove encrypt/decrypt hex encode -> decode round-trips for file output
 - [ ] require `--output` or equivalent for large non-inline payloads
@@ -215,18 +215,18 @@ This plan is written for multiple agents working in parallel.
 
 ### Checklist
 
-- [ ] classify `ssh-add` as secret egress and gate it accordingly
-- [ ] decide whether `ssh-add` requires `use=export-secret` or a dedicated equivalent policy bit
-- [ ] add confirmation/reason friction for `ssh-add` if it remains a secret-egress path
-- [ ] stop `decrypt` from defaulting to inline plaintext output
-- [ ] require explicit opt-in for stdout/plaintext decrypt output, or require `--output`
-- [ ] make native `ssh` / inspect / `use=all` behavior truthful with actual runtime behavior
+- [x] classify `ssh-add` as secret egress and gate it accordingly
+- [x] decide whether `ssh-add` requires `use=export-secret` or a dedicated equivalent policy bit
+- [x] add confirmation/reason friction for `ssh-add` if it remains a secret-egress path
+- [x] stop `decrypt` from defaulting to inline plaintext output
+- [x] require explicit opt-in for stdout/plaintext decrypt output, or require `--output`
+- [x] make native `ssh` / inspect / `use=all` behavior truthful with actual runtime behavior
 
 ### Acceptance checks
 
-- [ ] `ssh-add` is no looser than other secret-bearing egress paths
-- [ ] decrypt does not emit plaintext inline by default
-- [ ] inspect/use-bit advertising matches actual runtime support semantics
+- [x] `ssh-add` is no looser than other secret-bearing egress paths
+- [x] decrypt does not emit plaintext inline by default
+- [x] inspect/use-bit advertising matches actual runtime support semantics
 
 ---
 
@@ -244,25 +244,25 @@ This plan is written for multiple agents working in parallel.
 
 ### Checklist
 
-- [ ] add regression test for parallel native sign same identity
-- [ ] add regression test for repeated/concurrent native setup
-- [ ] add regression test for missing serialized native handle state -> hard failure
-- [ ] add oversize identity JSON rejection tests
-- [ ] add oversize signature input rejection tests
-- [ ] add oversize buffered message/stdin rejection tests
-- [ ] add real swtpm tests for native create/sign/verify/export after concurrency changes
+- [x] add regression test for parallel native sign same identity
+- [x] add regression test for repeated/concurrent native setup
+- [x] add regression test for missing serialized native handle state -> hard failure
+- [x] add oversize identity JSON rejection tests
+- [x] add oversize signature input rejection tests
+- [x] add oversize buffered message/stdin rejection tests
+- [x] add real swtpm tests for native create/sign/verify/export after concurrency changes
 - [ ] add real swtpm tests for seed/prf large operational paths after streaming changes
-- [ ] add tests for ssh-add policy gating
-- [ ] add tests for decrypt plaintext policy
+- [x] add tests for ssh-add policy gating
+- [x] add tests for decrypt plaintext policy
 
 ### Acceptance checks
 
-- [ ] every changed file/path has regression coverage for the exact hardening behavior it introduces
-- [ ] no hardening change is considered done with mock-only coverage if the changed path can be exercised against real `tpm2-tools`
-- [ ] `cargo test` passes
-- [ ] `cargo build` passes
-- [ ] `cargo check` passes
-- [ ] `nix shell nixpkgs#swtpm nixpkgs#tpm2-tools -c cargo test --features real-tpm-tests --test real_tpm_cli -- --nocapture` passes
+- [x] every changed file/path has regression coverage for the exact hardening behavior it introduces
+- [x] no hardening change is considered done with mock-only coverage if the changed path can be exercised against real `tpm2-tools`
+- [x] `cargo test` passes
+- [x] `cargo build` passes
+- [x] `cargo check` passes
+- [x] `nix shell nixpkgs#swtpm nixpkgs#tpm2-tools -c cargo test --features real-tpm-tests --test real_tpm_cli -- --nocapture` passes
 
 ---
 
@@ -352,10 +352,10 @@ nix shell nixpkgs#swtpm nixpkgs#tpm2-tools -c cargo test --features real-tpm-tes
 
 # Exit criteria for the hardening wave
 
-- [ ] #9 zeroization/secret lifetime is materially improved in real secret paths
-- [ ] #10 native handle allocation/setup/sign concurrency issues are fixed
+- [x] #9 zeroization/secret lifetime is materially improved in real secret paths
+- [x] #10 native handle allocation/setup/sign concurrency issues are fixed
 - [ ] #11 unbounded reads are removed or bounded, with streaming added for large-path operations
-- [ ] secret-egress behavior is consistent and explicit
-- [ ] every implemented hardening change has tests
-- [ ] changed operational paths are validated with real `tpm2-tools` on `swtpm`, not just mocks
-- [ ] real swtpm integration coverage validates the hardened paths
+- [x] secret-egress behavior is consistent and explicit
+- [x] every implemented hardening change has tests
+- [x] changed operational paths are validated with real `tpm2-tools` on `swtpm`, not just mocks
+- [x] real swtpm integration coverage validates the hardened paths

@@ -9,7 +9,7 @@ pub mod keygen;
 pub mod native;
 pub mod prf;
 pub mod seed;
-mod shared;
+pub(crate) mod shared;
 pub mod sign;
 pub mod ssh;
 pub mod verify;

@@ -7,7 +7,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use serde_json::Value;
-use support::{RealTpmHarness, hex_decode, hex_encode, normalize_openssh_public_key, run_cli_json};
+use support::{
+    RealTpmHarness, hex_decode, hex_encode, normalize_openssh_public_key, run_cli, run_cli_json,
+};
 use tpm2_derive::backend::{ProcessCommandRunner, default_probe};
 use tpm2_derive::error::Error;
 use tpm2_derive::model::{
@@ -479,6 +481,66 @@ fn decrypt_cli_requires_explicit_plaintext_egress_with_real_swtpm() {
     assert_eq!(file_output["ok"], Value::Bool(true));
     assert!(file_output["result"]["plaintext"].is_null());
     assert_eq!(fs::read(&output_path).expect("plaintext file"), plaintext);
+}
+
+#[test]
+fn encrypt_and_decrypt_cli_reject_oversized_buffered_inputs_with_real_swtpm() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity = create_identity(
+        &harness,
+        "seed-buffer-limit-cli",
+        Algorithm::Ed25519,
+        ModePreference::Seed,
+        vec![UseCase::Encrypt, UseCase::Decrypt],
+        DerivationOverrides::default(),
+    );
+
+    let oversized_bytes = (8 * 1024 * 1024 + 1) as u64;
+    let encrypt_input = harness.workspace_path("oversized-encrypt.bin");
+    fs::File::create(&encrypt_input)
+        .expect("create oversized encrypt input")
+        .set_len(oversized_bytes)
+        .expect("size oversized encrypt input");
+
+    let state_dir = harness.state_dir().display().to_string();
+    let encrypt_error = run_cli(vec![
+        "tpm2-derive".to_string(),
+        "--json".to_string(),
+        "encrypt".to_string(),
+        "--with".to_string(),
+        identity.name.clone(),
+        "--input".to_string(),
+        encrypt_input.display().to_string(),
+        "--state-dir".to_string(),
+        state_dir.clone(),
+    ])
+    .expect_err("oversized encrypt input should fail before TPM work");
+    assert!(encrypt_error.contains("encrypt input"));
+    assert!(encrypt_error.contains("limit"));
+
+    let decrypt_input = harness.workspace_path("oversized-decrypt.hex");
+    fs::File::create(&decrypt_input)
+        .expect("create oversized decrypt input")
+        .set_len(oversized_bytes)
+        .expect("size oversized decrypt input");
+    let decrypt_output = harness.workspace_path("oversized-decrypt.out");
+
+    let decrypt_error = run_cli(vec![
+        "tpm2-derive".to_string(),
+        "--json".to_string(),
+        "decrypt".to_string(),
+        "--with".to_string(),
+        identity.name.clone(),
+        "--input".to_string(),
+        decrypt_input.display().to_string(),
+        "--output".to_string(),
+        decrypt_output.display().to_string(),
+        "--state-dir".to_string(),
+        state_dir,
+    ])
+    .expect_err("oversized decrypt input should fail before TPM work");
+    assert!(decrypt_error.contains("decrypt input"));
+    assert!(decrypt_error.contains("limit"));
 }
 
 #[test]
