@@ -125,6 +125,44 @@ fn ssh_add_requires_secret_egress_policy_with_real_swtpm() {
     assert!(matches!(missing_reason, Error::Validation(message) if message.contains("--reason")));
 }
 
+#[cfg(unix)]
+#[test]
+fn ssh_add_rejects_group_writable_socket_parent_with_real_swtpm() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity = create_identity(
+        &harness,
+        "seed-ssh-socket-hardening",
+        Algorithm::Ed25519,
+        ModePreference::Seed,
+        vec![UseCase::Sign, UseCase::Ssh, UseCase::ExportSecret],
+        DerivationOverrides::default(),
+    );
+    let socket = harness.start_ssh_agent().expect("start ssh-agent");
+    let parent = socket.parent().expect("socket parent");
+    let mut permissions = fs::metadata(parent).expect("parent metadata").permissions();
+    permissions.set_mode(0o770);
+    fs::set_permissions(parent, permissions).expect("chmod parent directory");
+
+    let error = ssh::add_with_defaults(
+        &identity,
+        &SshAddRequest {
+            identity: identity.name.clone(),
+            comment: Some("seed@test".to_string()),
+            socket: Some(socket),
+            state_dir: Some(harness.state_dir().to_path_buf()),
+            reason: Some("load deployment key into agent".to_string()),
+            confirm: true,
+            derivation: DerivationOverrides::default(),
+        },
+    )
+    .expect_err("ssh-add should reject group-writable socket parents");
+    assert!(
+        matches!(error, Error::Validation(message) if message.contains("writable by group or other users"))
+    );
+}
+
 #[test]
 fn native_identity_library_round_trip_covers_create_sign_verify_and_export() {
     let harness = RealTpmHarness::start().expect("start swtpm harness");
@@ -767,8 +805,20 @@ fn seed_identity_library_round_trip_covers_encrypt_export_and_ssh_add() {
     )
     .expect("seed decrypt with real TPM-sealed seed");
     assert_eq!(decrypted.mode, Mode::Seed);
+    assert_eq!(decrypted.encoding, "suppressed");
+    assert!(decrypted.plaintext.is_none());
+    assert_eq!(decrypted.plaintext_bytes, plaintext.len());
+
+    let inline_decrypted = encrypt::decrypt_with_defaults_policy(
+        &identity,
+        &ciphertext,
+        &DerivationOverrides::default(),
+        &runner,
+        encrypt::PlaintextOutputPolicy::AllowInline,
+    )
+    .expect("seed decrypt with explicit inline plaintext opt-in");
     assert_eq!(
-        decrypted.plaintext.as_deref(),
+        inline_decrypted.plaintext.as_deref(),
         Some(hex_encode(plaintext).as_str())
     );
 
@@ -1022,8 +1072,20 @@ fn prf_identity_library_round_trip_covers_derivation_overrides_encrypt_export_an
         encrypt::decrypt_with_defaults(&identity, &ciphertext, &override_inputs, &runner)
             .expect("prf decrypt with matching derivation overrides");
     assert_eq!(decrypted.mode, Mode::Prf);
+    assert_eq!(decrypted.encoding, "suppressed");
+    assert!(decrypted.plaintext.is_none());
+    assert_eq!(decrypted.plaintext_bytes, plaintext.len());
+
+    let inline_decrypted = encrypt::decrypt_with_defaults_policy(
+        &identity,
+        &ciphertext,
+        &override_inputs,
+        &runner,
+        encrypt::PlaintextOutputPolicy::AllowInline,
+    )
+    .expect("prf decrypt with explicit inline plaintext opt-in");
     assert_eq!(
-        decrypted.plaintext.as_deref(),
+        inline_decrypted.plaintext.as_deref(),
         Some(hex_encode(plaintext).as_str())
     );
 

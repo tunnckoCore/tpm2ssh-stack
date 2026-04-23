@@ -352,10 +352,10 @@ nix shell nixpkgs#swtpm nixpkgs#tpm2-tools nixpkgs#openssh -c cargo test --featu
 
 # Exit criteria for the hardening wave
 
-- [ ] #9 zeroization/secret lifetime is materially improved in real secret paths
+- [x] #9 zeroization/secret lifetime is materially improved in real secret paths
 - [x] #10 native handle allocation/setup/sign concurrency issues are fixed
 - [x] #11 unbounded reads are removed or bounded, with streaming added for large-path operations
-- [ ] secret-egress behavior is consistent and explicit
+- [x] secret-egress behavior is consistent and explicit
 - [x] every implemented hardening change has tests
 - [x] changed operational paths are validated with real `tpm2-tools` on `swtpm`, not just mocks
 - [x] real swtpm integration coverage validates the hardened paths

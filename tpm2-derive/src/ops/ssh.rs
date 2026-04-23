@@ -28,14 +28,19 @@ use super::keygen::{derive_identity_key_material, normalized_secret_key_bytes};
 use super::seed::{HkdfSha256SeedDeriver, SeedBackend, SeedSoftwareDeriver, SubprocessSeedBackend};
 
 pub trait SshAddClient {
-    fn add_private_key(&self, socket: &Path, private_key_openssh: &str) -> Result<()>;
+    fn add_private_key(&self, socket: &Path, private_key_openssh: &Zeroizing<String>)
+    -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProcessSshAddClient;
 
 impl SshAddClient for ProcessSshAddClient {
-    fn add_private_key(&self, socket: &Path, private_key_openssh: &str) -> Result<()> {
+    fn add_private_key(
+        &self,
+        socket: &Path,
+        private_key_openssh: &Zeroizing<String>,
+    ) -> Result<()> {
         let program = resolve_trusted_program_path("ssh-add").map_err(|error| {
             Error::State(format!("failed to resolve trusted ssh-add binary: {error}"))
         })?;
@@ -190,14 +195,15 @@ where
             identity.name
         ))
     })?;
-    let private_key_openssh = private_key.to_openssh(LineEnding::LF).map_err(|error| {
-        Error::Internal(format!(
-            "failed to render OpenSSH private key for identity '{}': {error}",
-            identity.name
-        ))
-    })?;
+    let private_key_openssh =
+        Zeroizing::new(private_key.to_openssh(LineEnding::LF).map_err(|error| {
+            Error::Internal(format!(
+                "failed to render OpenSSH private key for identity '{}': {error}",
+                identity.name
+            ))
+        })?);
 
-    client.add_private_key(&socket, private_key_openssh.as_ref())?;
+    client.add_private_key(&socket, &private_key_openssh)?;
 
     Ok(SshAddResult {
         identity: identity.name.clone(),
@@ -450,9 +456,9 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
                     parent.display()
                 )));
             }
-            if parent_metadata.permissions().mode() & 0o002 != 0 {
+            if parent_metadata.permissions().mode() & 0o022 != 0 {
                 return Err(Error::Validation(format!(
-                    "ssh-add requires socket parent directory '{}' to not be world-writable",
+                    "ssh-add requires socket parent directory '{}' to not be writable by group or other users",
                     parent.display()
                 )));
             }
@@ -550,7 +556,11 @@ mod tests {
     }
 
     impl SshAddClient for RecordingSshAddClient {
-        fn add_private_key(&self, _socket: &Path, private_key_openssh: &str) -> Result<()> {
+        fn add_private_key(
+            &self,
+            _socket: &Path,
+            private_key_openssh: &Zeroizing<String>,
+        ) -> Result<()> {
             self.private_keys
                 .borrow_mut()
                 .push(private_key_openssh.to_string());
@@ -628,6 +638,24 @@ mod tests {
 
         let resolved = resolve_socket(Some(&socket_path)).expect("socket should validate");
         assert_eq!(resolved, socket_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_socket_rejects_group_writable_parent_directory() {
+        let temp = tempdir().expect("tempdir");
+        let parent = temp.path().join("agent-dir");
+        std::fs::create_dir(&parent).expect("parent dir");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770))
+            .expect("chmod parent");
+        let socket_path = parent.join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+
+        let error =
+            resolve_socket(Some(&socket_path)).expect_err("group-writable parent should fail");
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("writable by group or other users"))
+        );
     }
 
     #[cfg(unix)]

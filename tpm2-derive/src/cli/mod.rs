@@ -479,7 +479,13 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
                 Vec::new(),
             );
         }
-        ops::encrypt::decrypt_with_defaults(&identity, &ciphertext, &derivation, &runner)
+        ops::encrypt::decrypt_with_defaults_policy(
+            &identity,
+            &ciphertext,
+            &derivation,
+            &runner,
+            ops::encrypt::PlaintextOutputPolicy::AllowInline,
+        )
     };
     match decryption {
         Ok(mut result) => {

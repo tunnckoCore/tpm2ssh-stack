@@ -1,6 +1,6 @@
 //! Encrypt/decrypt operations using symmetric keys derived from identity material.
 
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write, sink};
 
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -32,6 +32,12 @@ const STREAM_FRAME_PLAINTEXT_BYTES: usize = 64 * 1024;
 const STREAM_ENVELOPE_MAGIC: [u8; 8] = *b"TPM2ENC1";
 
 pub(crate) const INLINE_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PlaintextOutputPolicy {
+    SuppressInline,
+    AllowInline,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct StreamIoStats {
@@ -177,16 +183,36 @@ pub fn decrypt_with_defaults<R>(
 where
     R: CommandRunner,
 {
+    decrypt_with_defaults_policy(
+        identity,
+        ciphertext,
+        derivation,
+        prf_runner,
+        PlaintextOutputPolicy::SuppressInline,
+    )
+}
+
+pub fn decrypt_with_defaults_policy<R>(
+    identity: &Identity,
+    ciphertext: &[u8],
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+    plaintext_output: PlaintextOutputPolicy,
+) -> Result<DecryptResult>
+where
+    R: CommandRunner,
+{
     let seed_backend =
         SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
     let seed_deriver = HkdfSha256SeedDeriver;
-    decrypt(
+    decrypt_with_policy(
         identity,
         ciphertext,
         derivation,
         prf_runner,
         &seed_backend,
         &seed_deriver,
+        plaintext_output,
     )
 }
 
@@ -203,6 +229,31 @@ where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
 {
+    decrypt_with_policy(
+        identity,
+        ciphertext,
+        derivation,
+        prf_runner,
+        seed_backend,
+        seed_deriver,
+        PlaintextOutputPolicy::SuppressInline,
+    )
+}
+
+pub fn decrypt_with_policy<R, B, D>(
+    identity: &Identity,
+    ciphertext: &[u8],
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+    seed_backend: &B,
+    seed_deriver: &D,
+    plaintext_output: PlaintextOutputPolicy,
+) -> Result<DecryptResult>
+where
+    R: CommandRunner,
+    B: SeedBackend,
+    D: SeedSoftwareDeriver,
+{
     ensure_derivation_overrides_allowed(identity, derivation)?;
     if !identity.uses.contains(&UseCase::Decrypt) {
         return Err(Error::PolicyRefusal(format!(
@@ -213,9 +264,26 @@ where
 
     let key_material =
         derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
-    let mut plaintext = Vec::new();
-    let stats =
-        decrypt_reader_to_writer(&key_material, &mut Cursor::new(ciphertext), &mut plaintext)?;
+    let (encoding, plaintext, stats) = match plaintext_output {
+        PlaintextOutputPolicy::SuppressInline => {
+            let mut suppressed_plaintext = sink();
+            let stats = decrypt_reader_to_writer(
+                &key_material,
+                &mut Cursor::new(ciphertext),
+                &mut suppressed_plaintext,
+            )?;
+            ("suppressed".to_string(), None, stats)
+        }
+        PlaintextOutputPolicy::AllowInline => {
+            let mut plaintext = Vec::new();
+            let stats = decrypt_reader_to_writer(
+                &key_material,
+                &mut Cursor::new(ciphertext),
+                &mut plaintext,
+            )?;
+            ("hex".to_string(), Some(hex_encode(&plaintext)), stats)
+        }
+    };
 
     Ok(DecryptResult {
         identity: identity.name.clone(),
@@ -224,8 +292,8 @@ where
         ciphertext_bytes: stats.ciphertext_bytes,
         plaintext_bytes: stats.plaintext_bytes,
         output_path: None,
-        encoding: "hex".to_string(),
-        plaintext: Some(hex_encode(&plaintext)),
+        encoding,
+        plaintext,
     })
 }
 
@@ -814,7 +882,7 @@ mod tests {
             .ciphertext
             .clone()
             .expect("ciphertext should be inline");
-        let decrypted = decrypt(
+        let default_decrypt = decrypt(
             &identity,
             &hex_decode(&ciphertext),
             &DerivationOverrides::default(),
@@ -822,11 +890,24 @@ mod tests {
             &backend,
             &HkdfSha256SeedDeriver,
         )
-        .expect("seed decrypt");
+        .expect("seed decrypt default");
+        let inline_decrypt = decrypt_with_policy(
+            &identity,
+            &hex_decode(&ciphertext),
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+            PlaintextOutputPolicy::AllowInline,
+        )
+        .expect("seed decrypt inline");
 
-        assert_eq!(decrypted.mode, Mode::Seed);
+        assert_eq!(default_decrypt.mode, Mode::Seed);
+        assert_eq!(default_decrypt.encoding, "suppressed");
+        assert!(default_decrypt.plaintext.is_none());
+        assert_eq!(default_decrypt.plaintext_bytes, plaintext.len());
         assert_eq!(
-            hex_decode(decrypted.plaintext.as_deref().expect("plaintext")),
+            hex_decode(inline_decrypt.plaintext.as_deref().expect("plaintext")),
             plaintext
         );
     }
@@ -852,7 +933,7 @@ mod tests {
             .ciphertext
             .clone()
             .expect("ciphertext should be inline");
-        let decrypted = decrypt(
+        let default_decrypt = decrypt(
             &identity,
             &hex_decode(&ciphertext),
             &DerivationOverrides::default(),
@@ -860,14 +941,27 @@ mod tests {
             &backend,
             &HkdfSha256SeedDeriver,
         )
-        .expect("prf decrypt");
+        .expect("prf decrypt default");
+        let inline_decrypt = decrypt_with_policy(
+            &identity,
+            &hex_decode(&ciphertext),
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+            PlaintextOutputPolicy::AllowInline,
+        )
+        .expect("prf decrypt inline");
 
-        assert_eq!(decrypted.mode, Mode::Prf);
+        assert_eq!(default_decrypt.mode, Mode::Prf);
+        assert_eq!(default_decrypt.encoding, "suppressed");
+        assert!(default_decrypt.plaintext.is_none());
+        assert_eq!(default_decrypt.plaintext_bytes, plaintext.len());
         assert_eq!(
-            hex_decode(decrypted.plaintext.as_deref().expect("plaintext")),
+            hex_decode(inline_decrypt.plaintext.as_deref().expect("plaintext")),
             plaintext
         );
-        assert_eq!(runner.invocations().len(), 2);
+        assert_eq!(runner.invocations().len(), 3);
     }
 
     #[test]
