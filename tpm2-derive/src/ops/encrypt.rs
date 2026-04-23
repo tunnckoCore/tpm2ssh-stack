@@ -407,7 +407,10 @@ mod tests {
         .expect("seed decrypt");
 
         assert_eq!(decrypted.mode, Mode::Seed);
-        assert_eq!(hex_decode(decrypted.plaintext.as_deref().expect("plaintext")), plaintext);
+        assert_eq!(
+            hex_decode(decrypted.plaintext.as_deref().expect("plaintext")),
+            plaintext
+        );
     }
 
     #[test]
@@ -442,7 +445,10 @@ mod tests {
         .expect("prf decrypt");
 
         assert_eq!(decrypted.mode, Mode::Prf);
-        assert_eq!(hex_decode(decrypted.plaintext.as_deref().expect("plaintext")), plaintext);
+        assert_eq!(
+            hex_decode(decrypted.plaintext.as_deref().expect("plaintext")),
+            plaintext
+        );
         assert_eq!(runner.invocations().len(), 2);
     }
 
@@ -508,13 +514,17 @@ mod tests {
         )
         .expect_err("native encrypt should fail");
 
-        assert!(matches!(error, Error::Unsupported(message) if message.contains("not implemented yet")));
+        assert!(
+            matches!(error, Error::Unsupported(message) if message.contains("not implemented yet"))
+        );
     }
 
     fn hex_decode(hex: &str) -> Vec<u8> {
         hex.as_bytes()
             .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).expect("utf8"), 16).expect("hex"))
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("utf8"), 16).expect("hex")
+            })
             .collect()
     }
 }
