@@ -182,22 +182,7 @@ impl Identity {
             IDENTITY_JSON_BYTES_LIMIT,
         )?;
 
-        let mut parsed: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
-            Error::State(format!(
-                "failed to parse identity '{}' from '{}': {error}",
-                name,
-                identity_path.display()
-            ))
-        })?;
-
-        if let Some(uses) = parsed
-            .get_mut("uses")
-            .and_then(serde_json::Value::as_array_mut)
-        {
-            uses.retain(|value| value.as_str() != Some("derive"));
-        }
-
-        let mut identity: Self = serde_json::from_value(parsed).map_err(|error| {
+        let mut identity: Self = serde_json::from_str(&contents).map_err(|error| {
             Error::State(format!(
                 "failed to decode identity '{}' from '{}': {error}",
                 name,
@@ -510,6 +495,42 @@ mod tests {
         assert!(
             matches!(error, Error::State(message) if message.contains("recreate the identity instead of repointing persisted state"))
         );
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn load_named_rejects_legacy_derive_use() {
+        let root_dir = unique_temp_path("identity-legacy-derive-use");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("create state layout");
+        let identity = Identity::new(
+            "prod-signer".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            state_layout.clone(),
+        );
+        identity.persist().expect("persist identity");
+
+        let identity_path = state_layout.identity_path("prod-signer");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&identity_path).expect("identity json"))
+                .expect("parse identity json");
+        value["uses"] = serde_json::json!(["sign", "derive"]);
+        fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&value).expect("json bytes"),
+        )
+        .expect("rewrite identity json");
+
+        let error = Identity::load_named("prod-signer", Some(root_dir.clone()))
+            .expect_err("legacy derive use should now fail closed");
+        assert!(matches!(error, Error::State(message) if message.contains("failed to decode identity")));
 
         fs::remove_dir_all(root_dir).expect("cleanup");
     }
