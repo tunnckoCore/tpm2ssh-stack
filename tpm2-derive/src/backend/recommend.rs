@@ -217,6 +217,10 @@ fn algorithm_supports_ssh_identity(algorithm: Algorithm) -> bool {
     matches!(algorithm, Algorithm::Ed25519 | Algorithm::P256)
 }
 
+fn validate_recommended_use_contract(concrete_uses: &[UseCase]) -> crate::error::Result<()> {
+    UseCase::validate_coupled_use_contract(concrete_uses)
+}
+
 fn supports_mode(
     native: &NativeCapabilitySummary,
     prf_available: bool,
@@ -242,14 +246,16 @@ fn supports_mode(
         return false;
     }
 
+    if validate_recommended_use_contract(&concrete_uses).is_err() {
+        return false;
+    }
+
     match mode {
         Mode::Native => {
             let Some(algorithm) = algorithm else {
                 return false;
             };
             !concrete_uses.is_empty()
-                && (!concrete_uses.contains(&UseCase::Verify)
-                    || concrete_uses.contains(&UseCase::Sign))
                 && concrete_uses
                     .iter()
                     .all(|use_case| native.supports_use(algorithm, *use_case))
@@ -303,10 +309,8 @@ fn unsupported_mode_reason(
                 );
             }
 
-            if concrete_uses.contains(&UseCase::Verify) && !concrete_uses.contains(&UseCase::Sign) {
-                return format!(
-                    "Native mode cannot satisfy requested uses {requested} for {algorithm:?}; verify-only native identities are not wired in the current prototype slice"
-                );
+            if let Err(error) = validate_recommended_use_contract(&concrete_uses) {
+                return error.to_string();
             }
 
             let missing = concrete_uses
@@ -330,6 +334,9 @@ fn unsupported_mode_reason(
             }
 
             let concrete_uses = expand_mode_requested_uses(mode, algorithm, native, uses);
+            if let Err(error) = validate_recommended_use_contract(&concrete_uses) {
+                return error.to_string();
+            }
             if concrete_uses.contains(&UseCase::Ssh)
                 && !algorithm.is_some_and(algorithm_supports_ssh_identity)
             {
@@ -357,6 +364,9 @@ fn unsupported_mode_reason(
             }
 
             let concrete_uses = expand_mode_requested_uses(mode, algorithm, native, uses);
+            if let Err(error) = validate_recommended_use_contract(&concrete_uses) {
+                return error.to_string();
+            }
             if concrete_uses.contains(&UseCase::Ssh)
                 && !algorithm.is_some_and(algorithm_supports_ssh_identity)
             {
@@ -404,7 +414,9 @@ mod tests {
         Algorithm, Mode, NativeAlgorithmCapability, NativeCapabilitySummary, UseCase,
     };
 
-    use super::{mode_rejection_reason, report_supports_mode, supports_mode};
+    use super::{
+        SupportMatrix, mode_rejection_reason, recommend_mode, report_supports_mode, supports_mode,
+    };
     use crate::model::{CapabilityReport, TpmStatus};
 
     fn native_summary(sign: bool, verify: bool) -> NativeCapabilitySummary {
@@ -460,14 +472,14 @@ mod tests {
     }
 
     #[test]
-    fn prf_support_matches_the_current_identity_surface() {
+    fn prf_support_matches_the_current_identity_surface_when_coupled_uses_are_present() {
         let report = report(native_summary(true, true), true, true);
 
         for uses in [
             vec![UseCase::Sign],
-            vec![UseCase::Verify],
+            vec![UseCase::Sign, UseCase::Verify],
             vec![UseCase::Encrypt, UseCase::Decrypt],
-            vec![UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh],
             vec![UseCase::ExportSecret],
         ] {
             assert!(report_supports_mode(
@@ -476,6 +488,55 @@ mod tests {
                 &uses,
                 Mode::Prf
             ));
+        }
+    }
+
+    #[test]
+    fn recommendation_support_checks_reject_one_sided_coupled_use_requests() {
+        let report = report(native_summary(true, true), true, true);
+
+        for (uses, expected_reason) in [
+            (vec![UseCase::Verify], "use=verify requires use=sign"),
+            (vec![UseCase::Decrypt], "use=decrypt requires use=encrypt"),
+            (vec![UseCase::Ssh], "use=ssh requires use=sign"),
+        ] {
+            for mode in [Mode::Prf, Mode::Seed] {
+                assert!(
+                    !report_supports_mode(&report, Algorithm::P256, &uses, mode),
+                    "{mode:?} should reject {:?}",
+                    uses
+                );
+
+                let reason = mode_rejection_reason(&report, Algorithm::P256, &uses, mode);
+                assert!(
+                    reason.contains(expected_reason),
+                    "unexpected rejection reason for {mode:?} {:?}: {reason}",
+                    uses
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recommendation_does_not_select_a_mode_for_one_sided_coupled_use_requests() {
+        let support = SupportMatrix {
+            native: native_summary(true, true),
+            prf: true,
+            seed: true,
+        };
+
+        for uses in [
+            vec![UseCase::Verify],
+            vec![UseCase::Decrypt],
+            vec![UseCase::Ssh],
+        ] {
+            let mut reasons = Vec::new();
+            assert_eq!(
+                recommend_mode(&support, Some(Algorithm::P256), &uses, &mut reasons),
+                None,
+                "one-sided request should not produce a recommendation: {:?}",
+                uses
+            );
         }
     }
 

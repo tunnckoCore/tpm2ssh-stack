@@ -74,24 +74,7 @@ impl UseCase {
         }
     }
 
-    /// Check whether all given use-cases are compatible with the given mode.
-    /// Returns `Ok(())` or an error describing the incompatibility.
-    pub fn validate_for_mode(uses: &[UseCase], mode: Mode) -> crate::error::Result<()> {
-        let allowed = Self::allowed_for_mode(mode);
-        for use_case in uses {
-            if use_case.is_all() {
-                return Err(crate::error::Error::PolicyRefusal(format!(
-                    "use '{use_case:?}' must be expanded before validating {mode:?} mode compatibility"
-                )));
-            }
-
-            if !allowed.contains(use_case) {
-                return Err(crate::error::Error::PolicyRefusal(format!(
-                    "use '{use_case:?}' is not allowed in {mode:?} mode; allowed uses: {allowed:?}"
-                )));
-            }
-        }
-
+    pub fn validate_coupled_use_contract(uses: &[UseCase]) -> crate::error::Result<()> {
         if uses.contains(&UseCase::Verify) && !uses.contains(&UseCase::Sign) {
             return Err(crate::error::Error::PolicyRefusal(
                 "use=verify requires use=sign because this tool derives the same signing identity for sign/verify"
@@ -114,5 +97,26 @@ impl UseCase {
         }
 
         Ok(())
+    }
+
+    /// Check whether all given use-cases are compatible with the given mode.
+    /// Returns `Ok(())` or an error describing the incompatibility.
+    pub fn validate_for_mode(uses: &[UseCase], mode: Mode) -> crate::error::Result<()> {
+        let allowed = Self::allowed_for_mode(mode);
+        for use_case in uses {
+            if use_case.is_all() {
+                return Err(crate::error::Error::PolicyRefusal(format!(
+                    "use '{use_case:?}' must be expanded before validating {mode:?} mode compatibility"
+                )));
+            }
+
+            if !allowed.contains(use_case) {
+                return Err(crate::error::Error::PolicyRefusal(format!(
+                    "use '{use_case:?}' is not allowed in {mode:?} mode; allowed uses: {allowed:?}"
+                )));
+            }
+        }
+
+        Self::validate_coupled_use_contract(uses)
     }
 }

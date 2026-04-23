@@ -77,8 +77,8 @@ Scope for this follow-up wave:
 
 ### Checklist
 
-- [ ] reuse one canonical coupled-use validation path in recommendation logic
-- [ ] add negative recommendation tests for verify-only, decrypt-only, and ssh-only requests
+- [x] reuse one canonical coupled-use validation path in recommendation logic
+- [x] add negative recommendation tests for verify-only, decrypt-only, and ssh-only requests
 
 ---
 

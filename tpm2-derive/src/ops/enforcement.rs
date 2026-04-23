@@ -322,7 +322,10 @@ mod tests {
         )
         .expect_err("decrypt-only should be rejected by the coupled use contract");
 
-        assert!(matches!(error, Error::PolicyRefusal(_)));
+        assert!(matches!(
+            error,
+            Error::PolicyRefusal(_) | Error::CapabilityMismatch(_)
+        ));
         assert!(
             error
                 .to_string()
