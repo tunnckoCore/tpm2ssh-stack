@@ -124,7 +124,16 @@ where
             Mode::Prf => {
                 let layout = materialize_prf_setup(&mut identity, runner)?;
                 if let Err(error) = identity.persist() {
-                    let _ = fs::remove_dir_all(layout.object_dir);
+                    if let Err(cleanup_error) = remove_identity_object_dir_if_present(
+                        &identity.storage.state_layout.objects_dir,
+                        &layout.object_dir,
+                        "cleaning up PRF root material after identity persistence failure",
+                    ) {
+                        return Err(Error::State(format!(
+                            "failed to persist identity '{}': {error}; additionally failed to clean up PRF root material safely: {cleanup_error}",
+                            identity.name
+                        )));
+                    }
                     return Err(error);
                 }
             }
@@ -1786,6 +1795,56 @@ fn native_handle_path(identity: &Identity) -> PathBuf {
     native_state_dir(identity).join(format!("{}.handle", native_key_id(identity)))
 }
 
+pub(crate) fn ensure_identity_object_dir_is_strict_child(
+    objects_dir: &Path,
+    object_dir: &Path,
+    operation: &str,
+) -> Result<()> {
+    let relative = object_dir.strip_prefix(objects_dir).map_err(|_| {
+        Error::State(format!(
+            "{operation} requires identity object directory '{}' to stay under '{}'",
+            object_dir.display(),
+            objects_dir.display()
+        ))
+    })?;
+
+    let mut components = relative.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(Error::State(format!(
+            "{operation} requires identity object directory '{}' to be a strict child of '{}'",
+            object_dir.display(),
+            objects_dir.display()
+        ))),
+    }
+}
+
+pub(crate) fn remove_identity_object_dir_if_present(
+    objects_dir: &Path,
+    object_dir: &Path,
+    operation: &str,
+) -> Result<()> {
+    ensure_identity_object_dir_is_strict_child(objects_dir, object_dir, operation)?;
+
+    if !object_dir.exists() {
+        return Ok(());
+    }
+
+    if !object_dir.is_dir() {
+        return Err(Error::State(format!(
+            "{operation} expected identity object directory '{}' to be a directory",
+            object_dir.display()
+        )));
+    }
+
+    fs::remove_dir_all(object_dir).map_err(|error| {
+        Error::State(format!(
+            "{operation} failed to remove identity object directory '{}': {error}",
+            object_dir.display()
+        ))
+    })
+}
+
 pub(crate) fn metadata_path(identity: &Identity, keys: &[&str]) -> Result<Option<PathBuf>> {
     let Some(value) = metadata_value(identity, keys) else {
         return Ok(None);
@@ -2742,6 +2801,34 @@ mod tests {
         );
 
         fs::remove_dir_all(root_dir).expect("temporary prf setup state should be removed");
+    }
+
+    #[test]
+    fn prf_cleanup_rejects_object_root_alias_before_delete() {
+        let root_dir = unique_temp_path("prf-root-alias-delete");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let sibling_dir = state_layout.objects_dir.join("sibling");
+        fs::create_dir_all(&sibling_dir).expect("sibling dir");
+        let sibling_marker = sibling_dir.join("keep.txt");
+        fs::write(&sibling_marker, b"keep").expect("sibling marker");
+        let shared_marker = state_layout.objects_dir.join("shared-root.txt");
+        fs::write(&shared_marker, b"root").expect("shared marker");
+
+        let error = remove_identity_object_dir_if_present(
+            &state_layout.objects_dir,
+            &state_layout.objects_dir.join("."),
+            "cleaning up PRF root material after identity persistence failure",
+        )
+        .expect_err("shared objects root alias should be rejected");
+
+        assert!(matches!(error, Error::State(message) if message.contains("strict child")));
+        assert!(state_layout.objects_dir.is_dir());
+        assert!(shared_marker.is_file());
+        assert!(sibling_marker.is_file());
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
     }
 
     #[test]

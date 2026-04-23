@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, Diagnostic, DiagnosticLevel, Identity, UseCase, validate_identity_name_policy,
 };
+use crate::ops::ensure_identity_object_dir_is_strict_child;
 
 pub const SEED_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const SEED_RECOVERY_BUNDLE_SCHEMA_VERSION: u32 = 1;
@@ -787,6 +788,12 @@ where
         layout: &SeedSealedObjectLayout,
         overwrite_existing: bool,
     ) -> Result<()> {
+        ensure_identity_object_dir_is_strict_child(
+            &self.objects_dir,
+            &layout.object_dir,
+            "persisting sealed seed objects",
+        )?;
+
         if layout.object_dir.exists() && !overwrite_existing {
             return Err(Error::State(format!(
                 "seed object already exists for identity '{}'; pass overwrite_existing to replace it",
@@ -1977,6 +1984,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn subprocess_backend_rejects_object_root_alias_before_overwrite_delete() {
+        let objects_dir = tempfile::tempdir().expect("objects dir");
+        let backend = SubprocessSeedBackend::with_runner(
+            objects_dir.path().to_path_buf(),
+            RecordingRunner::new(RecordingRunnerState::new(None, None, None)),
+        );
+
+        let sibling_dir = objects_dir.path().join("sibling");
+        fs::create_dir_all(&sibling_dir).expect("sibling dir");
+        let sibling_marker = sibling_dir.join("keep.txt");
+        fs::write(&sibling_marker, b"keep").expect("sibling marker");
+        let shared_marker = objects_dir.path().join("shared-root.txt");
+        fs::write(&shared_marker, b"root").expect("shared marker");
+
+        let staging = backend.new_object_staging_dir().expect("staging");
+        fs::write(&staging.public_blob, b"staged-public").expect("staged public");
+        fs::write(&staging.private_blob, b"staged-private").expect("staged private");
+
+        let object_dir = objects_dir.path().join(".");
+        let layout = SeedSealedObjectLayout {
+            public_blob: object_dir.join("sealed.pub"),
+            private_blob: object_dir.join("sealed.priv"),
+            object_dir,
+        };
+
+        let error = backend
+            .commit_staging_object(staging, &layout, true)
+            .expect_err("shared objects root alias should be rejected");
+
+        assert!(matches!(error, Error::State(message) if message.contains("strict child")));
+        assert!(objects_dir.path().is_dir());
+        assert!(shared_marker.is_file());
+        assert!(sibling_marker.is_file());
     }
 
     #[test]

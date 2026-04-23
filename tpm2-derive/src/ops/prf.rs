@@ -11,6 +11,7 @@ use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCom
 use crate::crypto::{DerivationSpec, DerivationVersion, OutputKind};
 use crate::error::{Error, Result};
 use crate::model::validate_identity_name_policy;
+use crate::ops::ensure_identity_object_dir_is_strict_child;
 
 pub const PRF_CONTEXT_PATH_METADATA_KEY: &str = "prf.context-path";
 pub const PRF_PARENT_CONTEXT_PATH_METADATA_KEY: &str = "prf.parent-context-path";
@@ -304,6 +305,12 @@ where
         staging: PrfRootStaging,
         final_layout: &PrfRootLayout,
     ) -> Result<PrfRootLayout> {
+        ensure_identity_object_dir_is_strict_child(
+            &self.objects_dir,
+            &final_layout.object_dir,
+            "persisting PRF root material",
+        )?;
+
         let staging_path = staging.tempdir.keep();
         fs::rename(&staging_path, &final_layout.object_dir).map_err(|error| {
             Error::State(format!(
@@ -769,9 +776,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        PrfProtocolVersion, PrfRequest, PrfRootLayout, RawPrfOutput, TpmPrfCommandKind,
-        TpmPrfExecutor, TpmPrfHashAlgorithm, TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner,
-        finalize, plan_tpm_prf_in,
+        PrfProtocolVersion, PrfRequest, PrfRootLayout, RawPrfOutput, SubprocessPrfBackend,
+        TpmPrfCommandKind, TpmPrfExecutor, TpmPrfHashAlgorithm, TpmPrfKeyHandle,
+        execute_tpm_prf_plan_with_runner, finalize, plan_tpm_prf_in,
     };
     use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
     use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
@@ -916,6 +923,35 @@ mod tests {
         assert_eq!(result.response.output.expose_secret().len(), 32);
         assert_eq!(runner.invocations().len(), 1);
         cleanup_test_dir(&workspace);
+    }
+
+    #[test]
+    fn subprocess_backend_rejects_object_root_alias_before_rename() {
+        let objects_dir = tempfile::tempdir().expect("objects dir");
+        let sibling_dir = objects_dir.path().join("sibling");
+        std::fs::create_dir_all(&sibling_dir).expect("sibling dir");
+        let sibling_marker = sibling_dir.join("keep.txt");
+        std::fs::write(&sibling_marker, b"keep").expect("sibling marker");
+        let shared_marker = objects_dir.path().join("shared-root.txt");
+        std::fs::write(&shared_marker, b"root").expect("shared marker");
+
+        let backend = SubprocessPrfBackend::with_runner(
+            objects_dir.path().to_path_buf(),
+            FakeRunner::new(Vec::new()),
+        );
+        let staging = backend.new_root_staging().expect("staging");
+        let final_layout = PrfRootLayout::for_object_dir(objects_dir.path().join("."));
+
+        let error = backend
+            .commit_root_staging(staging, &final_layout)
+            .expect_err("shared objects root alias should be rejected");
+
+        assert!(
+            matches!(error, crate::error::Error::State(message) if message.contains("strict child"))
+        );
+        assert!(objects_dir.path().is_dir());
+        assert!(shared_marker.is_file());
+        assert!(sibling_marker.is_file());
     }
 
     #[test]

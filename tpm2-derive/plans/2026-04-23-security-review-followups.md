@@ -59,9 +59,9 @@ Scope for this follow-up wave:
 
 ### Checklist
 
-- [ ] add a shared strict-child path invariant helper for identity object roots
-- [ ] apply it to destructive overwrite/delete flows
-- [ ] add regression coverage proving malformed names cannot touch shared root state
+- [x] add a shared strict-child path invariant helper for identity object roots
+- [x] apply it to destructive overwrite/delete flows
+- [x] add regression coverage proving malformed names cannot touch shared root state
 
 ---
 
