@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "target_name": "tpm2-derive",
+  "target_path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive",
+  "status": "complete",
+  "authorization_confirmed": true,
+  "disclosure_tier": "full internal",
+  "workspace": "./.mythos-review/2026-04-23-state-model",
+  "scope": {
+    "segment": [
+      "src/model/identity.rs",
+      "src/model/core.rs",
+      "src/model/state.rs",
+      "src/ops/enforcement.rs",
+      "src/backend/recommend.rs"
+    ],
+    "cross_references_used": [
+      "src/ops.rs",
+      "src/model/capability.rs",
+      "src/backend.rs"
+    ]
+  },
+  "steer": "assume host/server is properly protected, do not suggest things general advices and obvious things",
+  "phases": {
+    "bootstrap": "complete",
+    "ranking": "complete",
+    "planning": "complete",
+    "hunting": "complete",
+    "validation": "complete",
+    "packaging": "complete"
+  }
+}

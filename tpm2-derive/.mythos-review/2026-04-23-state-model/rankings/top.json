@@ -1,0 +1,342 @@
+[
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/native.rs",
+    "score": 22,
+    "reasons": [
+      "unsafe or high-privilege boundary",
+      "cryptographic material or protocol",
+      "process or code execution",
+      "handles security-sensitive material",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/prf.rs",
+    "score": 17,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "handles security-sensitive material",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/backend/parser.rs",
+    "score": 15,
+    "reasons": [
+      "parsing or protocol handling",
+      "cryptographic material or protocol",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/native/subprocess.rs",
+    "score": 15,
+    "reasons": [
+      "unsafe or high-privilege boundary",
+      "cryptographic material or protocol",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/backend/subprocess.rs",
+    "score": 14,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/backend/tss_esapi.rs",
+    "score": 14,
+    "reasons": [
+      "cryptographic material or protocol",
+      "network-facing or request handling",
+      "process or code execution"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops.rs",
+    "score": 14,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/encrypt.rs",
+    "score": 14,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/keygen.rs",
+    "score": 14,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/sign.rs",
+    "score": 14,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/ssh.rs",
+    "score": 14,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/.agents/skills/adr-skill/scripts/bootstrap_adr.js",
+    "score": 13,
+    "reasons": [
+      "cryptographic material or protocol",
+      "initialization or configuration path",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/backend.rs",
+    "score": 13,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/crypto/mod.rs",
+    "score": 13,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/command.rs",
+    "score": 13,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/seed.rs",
+    "score": 13,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/verify.rs",
+    "score": 13,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/tests/real_tpm_cli.rs",
+    "score": 13,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/cli/args.rs",
+    "score": 12,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/capability.rs",
+    "score": 12,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/core.rs",
+    "score": 12,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/backend/recommend.rs",
+    "score": 11,
+    "reasons": [
+      "cryptographic material or protocol",
+      "process or code execution",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/.agents/skills/adr-skill/scripts/new_adr.js",
+    "score": 10,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/cli/mod.rs",
+    "score": 10,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/identity.rs",
+    "score": 10,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/enforcement.rs",
+    "score": 10,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/ops/shared.rs",
+    "score": 10,
+    "reasons": [
+      "cryptographic material or protocol",
+      "handles security-sensitive material",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/tests/support/mod.rs",
+    "score": 10,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords",
+      "non-trivial file size"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/.agents/skills/adr-skill/scripts/set_adr_status.js",
+    "score": 9,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/bin/tpm2-derive.rs",
+    "score": 9,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/error.rs",
+    "score": 9,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/diagnostic.rs",
+    "score": 9,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/envelope.rs",
+    "score": 9,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/state.rs",
+    "score": 9,
+    "reasons": [
+      "cryptographic material or protocol",
+      "parsing keywords"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/cli/render.rs",
+    "score": 6,
+    "reasons": [
+      "cryptographic material or protocol"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/lib.rs",
+    "score": 6,
+    "reasons": [
+      "cryptographic material or protocol"
+    ]
+  },
+  {
+    "path": "/home/arcka/code/tpm2ssh-stack-worktrees/hardening-review-state-and-model/tpm2-derive/src/model/mod.rs",
+    "score": 6,
+    "reasons": [
+      "cryptographic material or protocol"
+    ]
+  }
+]
