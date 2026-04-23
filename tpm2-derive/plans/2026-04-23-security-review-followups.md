@@ -92,7 +92,7 @@ Scope for this follow-up wave:
 
 ### Checklist
 
-- [ ] delete `R-001-fixed-tool-set-no-shell-injection.md`
-- [ ] delete `R-002-env-mutation-not-promoted.md`
-- [ ] delete `R-003-port-race-availability-only.md`
-- [ ] update any summary docs that still point at those rejected items
+- [x] delete `R-001-fixed-tool-set-no-shell-injection.md`
+- [x] delete `R-002-env-mutation-not-promoted.md`
+- [x] delete `R-003-port-race-availability-only.md`
+- [x] update any summary docs that still point at those rejected items
