@@ -1,5 +1,7 @@
 //! Encrypt/decrypt operations using symmetric keys derived from identity material.
 
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
+
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
@@ -23,6 +25,19 @@ use super::shared::{
 };
 
 const NONCE_LEN: usize = 12;
+const STORED_NONCE_PREFIX_LEN: usize = 8;
+const FRAME_LENGTH_BYTES: usize = 4;
+const AEAD_TAG_BYTES: usize = 16;
+const STREAM_FRAME_PLAINTEXT_BYTES: usize = 64 * 1024;
+const STREAM_ENVELOPE_MAGIC: [u8; 8] = *b"TPM2ENC1";
+
+pub(crate) const INLINE_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct StreamIoStats {
+    plaintext_bytes: usize,
+    ciphertext_bytes: usize,
+}
 
 pub fn encrypt_with_defaults<R>(
     identity: &Identity,
@@ -69,18 +84,87 @@ where
 
     let key_material =
         derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
-    let ciphertext = aead_encrypt(&*key_material, plaintext)?;
+    let mut ciphertext = Vec::new();
+    let stats =
+        encrypt_reader_to_writer(&key_material, &mut Cursor::new(plaintext), &mut ciphertext)?;
 
     Ok(EncryptResult {
         identity: identity.name.clone(),
         mode: identity.mode.resolved,
         algorithm: identity.algorithm,
-        input_bytes: plaintext.len(),
-        ciphertext_bytes: ciphertext.len(),
+        input_bytes: stats.plaintext_bytes,
+        ciphertext_bytes: stats.ciphertext_bytes,
         nonce_bytes: NONCE_LEN,
         output_path: None,
         encoding: "hex".to_string(),
         ciphertext: Some(hex_encode(&ciphertext)),
+    })
+}
+
+pub fn encrypt_stream_with_defaults<R, I, O>(
+    identity: &Identity,
+    plaintext: &mut I,
+    output: &mut O,
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+) -> Result<EncryptResult>
+where
+    R: CommandRunner,
+    I: Read + ?Sized,
+    O: Write + ?Sized,
+{
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    let seed_deriver = HkdfSha256SeedDeriver;
+    encrypt_stream(
+        identity,
+        plaintext,
+        output,
+        derivation,
+        prf_runner,
+        &seed_backend,
+        &seed_deriver,
+    )
+}
+
+pub fn encrypt_stream<R, B, D, I, O>(
+    identity: &Identity,
+    plaintext: &mut I,
+    output: &mut O,
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+    seed_backend: &B,
+    seed_deriver: &D,
+) -> Result<EncryptResult>
+where
+    R: CommandRunner,
+    B: SeedBackend,
+    D: SeedSoftwareDeriver,
+    I: Read + ?Sized,
+    O: Write + ?Sized,
+{
+    ensure_derivation_overrides_allowed(identity, derivation)?;
+    if !identity.uses.contains(&UseCase::Encrypt) {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' is not configured with use=encrypt",
+            identity.name
+        )));
+    }
+
+    let key_material =
+        derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
+    let stats = encrypt_reader_to_writer(&key_material, plaintext, output)?;
+
+    Ok(EncryptResult {
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
+        input_bytes: stats.plaintext_bytes,
+        ciphertext_bytes: stats.ciphertext_bytes,
+        nonce_bytes: NONCE_LEN,
+        output_path: None,
+        encoding: "binary".to_string(),
+        ciphertext: None,
     })
 }
 
@@ -129,17 +213,149 @@ where
 
     let key_material =
         derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
-    let plaintext = aead_decrypt(&*key_material, ciphertext)?;
+    let mut plaintext = Vec::new();
+    let stats =
+        decrypt_reader_to_writer(&key_material, &mut Cursor::new(ciphertext), &mut plaintext)?;
 
     Ok(DecryptResult {
         identity: identity.name.clone(),
         mode: identity.mode.resolved,
         algorithm: identity.algorithm,
-        ciphertext_bytes: ciphertext.len(),
-        plaintext_bytes: plaintext.len(),
+        ciphertext_bytes: stats.ciphertext_bytes,
+        plaintext_bytes: stats.plaintext_bytes,
         output_path: None,
         encoding: "hex".to_string(),
         plaintext: Some(hex_encode(&plaintext)),
+    })
+}
+
+pub fn decrypt_stream_with_defaults<R, I, O>(
+    identity: &Identity,
+    ciphertext: &mut I,
+    output: &mut O,
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+) -> Result<DecryptResult>
+where
+    R: CommandRunner,
+    I: Read + ?Sized,
+    O: Write + ?Sized,
+{
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    let seed_deriver = HkdfSha256SeedDeriver;
+    decrypt_stream(
+        identity,
+        ciphertext,
+        output,
+        derivation,
+        prf_runner,
+        &seed_backend,
+        &seed_deriver,
+    )
+}
+
+pub fn decrypt_stream<R, B, D, I, O>(
+    identity: &Identity,
+    ciphertext: &mut I,
+    output: &mut O,
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+    seed_backend: &B,
+    seed_deriver: &D,
+) -> Result<DecryptResult>
+where
+    R: CommandRunner,
+    B: SeedBackend,
+    D: SeedSoftwareDeriver,
+    I: Read + ?Sized,
+    O: Write + ?Sized,
+{
+    ensure_derivation_overrides_allowed(identity, derivation)?;
+    if !identity.uses.contains(&UseCase::Decrypt) {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' is not configured with use=decrypt",
+            identity.name
+        )));
+    }
+
+    let key_material =
+        derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
+    let stats = decrypt_reader_to_writer(&key_material, ciphertext, output)?;
+
+    Ok(DecryptResult {
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
+        ciphertext_bytes: stats.ciphertext_bytes,
+        plaintext_bytes: stats.plaintext_bytes,
+        output_path: None,
+        encoding: "binary".to_string(),
+        plaintext: None,
+    })
+}
+
+pub fn decrypt_ciphertext_to_writer_with_defaults<R, O>(
+    identity: &Identity,
+    ciphertext: &[u8],
+    output: &mut O,
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+) -> Result<DecryptResult>
+where
+    R: CommandRunner,
+    O: Write + ?Sized,
+{
+    let seed_backend =
+        SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
+    let seed_deriver = HkdfSha256SeedDeriver;
+    decrypt_ciphertext_to_writer(
+        identity,
+        ciphertext,
+        output,
+        derivation,
+        prf_runner,
+        &seed_backend,
+        &seed_deriver,
+    )
+}
+
+pub fn decrypt_ciphertext_to_writer<R, B, D, O>(
+    identity: &Identity,
+    ciphertext: &[u8],
+    output: &mut O,
+    derivation: &DerivationOverrides,
+    prf_runner: &R,
+    seed_backend: &B,
+    seed_deriver: &D,
+) -> Result<DecryptResult>
+where
+    R: CommandRunner,
+    B: SeedBackend,
+    D: SeedSoftwareDeriver,
+    O: Write + ?Sized,
+{
+    ensure_derivation_overrides_allowed(identity, derivation)?;
+    if !identity.uses.contains(&UseCase::Decrypt) {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' is not configured with use=decrypt",
+            identity.name
+        )));
+    }
+
+    let key_material =
+        derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
+    let stats = decrypt_reader_to_writer(&key_material, &mut Cursor::new(ciphertext), output)?;
+
+    Ok(DecryptResult {
+        identity: identity.name.clone(),
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
+        ciphertext_bytes: stats.ciphertext_bytes,
+        plaintext_bytes: stats.plaintext_bytes,
+        output_path: None,
+        encoding: "binary".to_string(),
+        plaintext: None,
     })
 }
 
@@ -207,7 +423,207 @@ where
     to_key_bytes(material.expose_secret())
 }
 
-fn aead_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+fn encrypt_reader_to_writer<I, O>(
+    key: &[u8; 32],
+    plaintext: &mut I,
+    output: &mut O,
+) -> Result<StreamIoStats>
+where
+    I: Read + ?Sized,
+    O: Write + ?Sized,
+{
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let mut nonce_prefix = [0u8; STORED_NONCE_PREFIX_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce_prefix);
+
+    write_all(output, &STREAM_ENVELOPE_MAGIC, "stream ciphertext header")?;
+    write_all(output, &nonce_prefix, "stream ciphertext nonce prefix")?;
+
+    let mut plaintext_bytes = 0usize;
+    let mut ciphertext_bytes = STREAM_ENVELOPE_MAGIC.len() + STORED_NONCE_PREFIX_LEN;
+    let mut chunk_index = 0u32;
+    let mut buffer = [0u8; STREAM_FRAME_PLAINTEXT_BYTES];
+
+    loop {
+        let read = plaintext
+            .read(&mut buffer)
+            .map_err(|error| Error::State(format!("failed to read plaintext stream: {error}")))?;
+        if read == 0 {
+            break;
+        }
+
+        plaintext_bytes = checked_add(plaintext_bytes, read, "plaintext")?;
+        let nonce = frame_nonce(&nonce_prefix, chunk_index);
+        let sealed = cipher
+            .encrypt(Nonce::from_slice(&nonce), &buffer[..read])
+            .map_err(|error| Error::Internal(format!("AEAD encrypt failed: {error}")))?;
+        let frame_length = u32::try_from(read).map_err(|_| {
+            Error::Validation("plaintext chunk exceeded the supported frame size".to_string())
+        })?;
+        write_all(
+            output,
+            &frame_length.to_le_bytes(),
+            "stream ciphertext frame length",
+        )?;
+        write_all(output, &sealed, "stream ciphertext frame")?;
+        ciphertext_bytes = checked_add(
+            ciphertext_bytes,
+            FRAME_LENGTH_BYTES + sealed.len(),
+            "ciphertext",
+        )?;
+        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+            Error::Validation("ciphertext exceeded the maximum supported chunk count".to_string())
+        })?;
+    }
+
+    Ok(StreamIoStats {
+        plaintext_bytes,
+        ciphertext_bytes,
+    })
+}
+
+fn decrypt_reader_to_writer<I, O>(
+    key: &[u8; 32],
+    ciphertext: &mut I,
+    output: &mut O,
+) -> Result<StreamIoStats>
+where
+    I: Read + ?Sized,
+    O: Write + ?Sized,
+{
+    let mut reader = BufReader::new(ciphertext);
+    let is_stream_envelope = reader
+        .fill_buf()
+        .map_err(|error| Error::State(format!("failed to inspect ciphertext stream: {error}")))?
+        .starts_with(&STREAM_ENVELOPE_MAGIC);
+
+    if is_stream_envelope {
+        reader.consume(STREAM_ENVELOPE_MAGIC.len());
+        decrypt_stream_envelope_to_writer(key, &mut reader, output)
+    } else {
+        let mut legacy = Vec::new();
+        reader
+            .read_to_end(&mut legacy)
+            .map_err(|error| Error::State(format!("failed to read ciphertext stream: {error}")))?;
+        let plaintext = aead_decrypt_legacy(key, &legacy)?;
+        write_all(output, &plaintext, "legacy plaintext output")?;
+        Ok(StreamIoStats {
+            plaintext_bytes: plaintext.len(),
+            ciphertext_bytes: legacy.len(),
+        })
+    }
+}
+
+fn decrypt_stream_envelope_to_writer<O>(
+    key: &[u8; 32],
+    reader: &mut impl Read,
+    output: &mut O,
+) -> Result<StreamIoStats>
+where
+    O: Write + ?Sized,
+{
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let mut nonce_prefix = [0u8; STORED_NONCE_PREFIX_LEN];
+    reader.read_exact(&mut nonce_prefix).map_err(|error| {
+        Error::Validation(format!(
+            "ciphertext stream header is truncated before the nonce prefix: {error}"
+        ))
+    })?;
+
+    let mut plaintext_bytes = 0usize;
+    let mut ciphertext_bytes = STREAM_ENVELOPE_MAGIC.len() + STORED_NONCE_PREFIX_LEN;
+    let mut chunk_index = 0u32;
+
+    while let Some(frame_length) = read_frame_length(reader)? {
+        let frame_plaintext_bytes = usize::try_from(frame_length).map_err(|_| {
+            Error::Validation("ciphertext frame length exceeded implementation limits".to_string())
+        })?;
+        if frame_plaintext_bytes > STREAM_FRAME_PLAINTEXT_BYTES {
+            return Err(Error::Validation(format!(
+                "ciphertext frame declared {} plaintext bytes; the maximum supported frame size is {} bytes",
+                frame_plaintext_bytes, STREAM_FRAME_PLAINTEXT_BYTES
+            )));
+        }
+        if frame_plaintext_bytes == 0 {
+            return Err(Error::Validation(
+                "ciphertext frame length must not be zero".to_string(),
+            ));
+        }
+
+        let sealed_len = checked_add(frame_plaintext_bytes, AEAD_TAG_BYTES, "ciphertext frame")?;
+        let mut sealed = vec![0u8; sealed_len];
+        reader.read_exact(&mut sealed).map_err(|error| {
+            Error::Validation(format!(
+                "ciphertext stream ended before frame {chunk_index} was fully read: {error}"
+            ))
+        })?;
+
+        let nonce = frame_nonce(&nonce_prefix, chunk_index);
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&nonce), sealed.as_ref())
+            .map_err(|_| {
+                Error::Validation("AEAD decryption failed: invalid ciphertext or key".to_string())
+            })?;
+        write_all(output, &plaintext, "plaintext output")?;
+        plaintext_bytes = checked_add(plaintext_bytes, plaintext.len(), "plaintext")?;
+        ciphertext_bytes = checked_add(
+            ciphertext_bytes,
+            FRAME_LENGTH_BYTES + sealed.len(),
+            "ciphertext",
+        )?;
+        chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
+            Error::Validation("ciphertext exceeded the maximum supported chunk count".to_string())
+        })?;
+    }
+
+    Ok(StreamIoStats {
+        plaintext_bytes,
+        ciphertext_bytes,
+    })
+}
+
+fn read_frame_length(reader: &mut impl Read) -> Result<Option<u32>> {
+    let mut first = [0u8; 1];
+    let read = reader.read(&mut first).map_err(|error| {
+        Error::State(format!("failed to read ciphertext frame header: {error}"))
+    })?;
+    if read == 0 {
+        return Ok(None);
+    }
+
+    let mut rest = [0u8; FRAME_LENGTH_BYTES - 1];
+    reader.read_exact(&mut rest).map_err(|error| {
+        Error::Validation(format!(
+            "ciphertext stream ended in the middle of a frame header: {error}"
+        ))
+    })?;
+
+    let mut header = [0u8; FRAME_LENGTH_BYTES];
+    header[0] = first[0];
+    header[1..].copy_from_slice(&rest);
+    Ok(Some(u32::from_le_bytes(header)))
+}
+
+fn frame_nonce(prefix: &[u8; STORED_NONCE_PREFIX_LEN], chunk_index: u32) -> [u8; NONCE_LEN] {
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce[..STORED_NONCE_PREFIX_LEN].copy_from_slice(prefix);
+    nonce[STORED_NONCE_PREFIX_LEN..].copy_from_slice(&chunk_index.to_le_bytes());
+    nonce
+}
+
+fn write_all(output: &mut (impl Write + ?Sized), bytes: &[u8], label: &str) -> Result<()> {
+    output
+        .write_all(bytes)
+        .map_err(|error| Error::State(format!("failed to write {label}: {error}")))
+}
+
+fn checked_add(current: usize, amount: usize, label: &str) -> Result<usize> {
+    current
+        .checked_add(amount)
+        .ok_or_else(|| Error::Validation(format!("{label} exceeded the maximum supported size")))
+}
+
+fn aead_encrypt_legacy(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(key.into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -223,8 +639,8 @@ fn aead_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(envelope)
 }
 
-fn aead_decrypt(key: &[u8; 32], envelope: &[u8]) -> Result<Vec<u8>> {
-    if envelope.len() < NONCE_LEN + 16 {
+fn aead_decrypt_legacy(key: &[u8; 32], envelope: &[u8]) -> Result<Vec<u8>> {
+    if envelope.len() < NONCE_LEN + AEAD_TAG_BYTES {
         return Err(Error::Validation(
             "ciphertext is too short to contain a valid AEAD envelope (nonce + tag)".to_string(),
         ));
@@ -452,6 +868,96 @@ mod tests {
             plaintext
         );
         assert_eq!(runner.invocations().len(), 2);
+    }
+
+    #[test]
+    fn stream_encrypt_decrypt_round_trip_large_payload() {
+        let state_root = tempdir().expect("state root");
+        let identity = seed_identity(state_root.path());
+        let backend = FakeSeedBackend::new(&[0x33; 32]);
+        let runner = RecordingPrfRunner::new(b"unused");
+        let plaintext = vec![0x7a; STREAM_FRAME_PLAINTEXT_BYTES * 3 + 123];
+        let mut ciphertext = Vec::new();
+
+        let encrypt_result = encrypt_stream(
+            &identity,
+            &mut Cursor::new(&plaintext),
+            &mut ciphertext,
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("stream encrypt");
+        let mut decrypted = Vec::new();
+        let decrypt_result = decrypt_stream(
+            &identity,
+            &mut Cursor::new(&ciphertext),
+            &mut decrypted,
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("stream decrypt");
+
+        assert_eq!(encrypt_result.encoding, "binary");
+        assert_eq!(decrypt_result.encoding, "binary");
+        assert_eq!(decrypted, plaintext);
+        assert!(ciphertext.starts_with(&STREAM_ENVELOPE_MAGIC));
+        assert!(encrypt_result.ciphertext.is_none());
+        assert!(decrypt_result.plaintext.is_none());
+    }
+
+    #[test]
+    fn stream_decrypt_accepts_legacy_ciphertext_envelopes() {
+        let key = [0x44; 32];
+        let plaintext = b"legacy compatibility plaintext";
+        let ciphertext = aead_encrypt_legacy(&key, plaintext).expect("legacy encrypt");
+        let mut decrypted = Vec::new();
+
+        let stats = decrypt_reader_to_writer(&key, &mut Cursor::new(&ciphertext), &mut decrypted)
+            .expect("legacy decrypt through streaming path");
+
+        assert_eq!(stats.ciphertext_bytes, ciphertext.len());
+        assert_eq!(stats.plaintext_bytes, plaintext.len());
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_ciphertext_to_writer_avoids_plaintext_hex_round_trip() {
+        let state_root = tempdir().expect("state root");
+        let identity = seed_identity(state_root.path());
+        let backend = FakeSeedBackend::new(&[0x21; 32]);
+        let runner = RecordingPrfRunner::new(b"unused");
+        let plaintext = b"stream to file";
+
+        let encrypted = encrypt(
+            &identity,
+            plaintext,
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("encrypt");
+        let ciphertext = hex_decode(encrypted.ciphertext.as_deref().expect("ciphertext"));
+        let mut output = Vec::new();
+
+        let result = decrypt_ciphertext_to_writer(
+            &identity,
+            &ciphertext,
+            &mut output,
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("decrypt to writer");
+
+        assert_eq!(result.encoding, "binary");
+        assert!(result.plaintext.is_none());
+        assert_eq!(output, plaintext);
     }
 
     #[test]

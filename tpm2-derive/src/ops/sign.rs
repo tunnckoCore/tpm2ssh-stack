@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use tempfile::{Builder as TempfileBuilder, TempDir};
 
 use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
+use k256::ecdsa::signature::hazmat::PrehashSigner as _;
 use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
 use serde::Serialize;
@@ -36,7 +37,7 @@ use zeroize::Zeroizing;
 use super::shared::{
     BUFFERED_MESSAGE_INPUT_BYTES_LIMIT, classify_native_command_failure,
     encode_textual_output_bytes, ensure_derivation_overrides_allowed, ensure_dir,
-    load_input_bytes_with_limit, write_output_file,
+    load_input_bytes_with_limit, stream_sha256_input, write_output_file,
 };
 
 #[cfg(test)]
@@ -190,17 +191,42 @@ where
         )));
     }
 
-    let input_bytes = load_sign_input(&request.input)?;
-    if input_bytes.is_empty() {
-        return Err(Error::Validation(
-            "sign input must not be empty".to_string(),
-        ));
-    }
-
     validate_sign_output_format(identity, request.format, request.output.as_deref())?;
 
+    enum PreparedSignInput {
+        Ed25519 {
+            input_bytes: Vec<u8>,
+            digest: Vec<u8>,
+        },
+        Prehashed(super::shared::Sha256InputDigest),
+    }
+
+    let prepared = match identity.algorithm {
+        Algorithm::Ed25519 => {
+            let input_bytes = load_sign_input(&request.input)?;
+            if input_bytes.is_empty() {
+                return Err(Error::Validation(
+                    "sign input must not be empty".to_string(),
+                ));
+            }
+            let digest = Sha256::digest(&input_bytes).to_vec();
+            PreparedSignInput::Ed25519 {
+                input_bytes,
+                digest,
+            }
+        }
+        Algorithm::P256 | Algorithm::Secp256k1 => {
+            let digest = stream_sha256_input(&request.input, "sign input")?;
+            if digest.input_bytes == 0 {
+                return Err(Error::Validation(
+                    "sign input must not be empty".to_string(),
+                ));
+            }
+            PreparedSignInput::Prehashed(digest)
+        }
+    };
+
     let derived = derive_identity_key_material_with_defaults(identity, derivation, runner)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
     let diagnostics = vec![Diagnostic::info(
         "derived-signer-material",
         format!(
@@ -211,12 +237,38 @@ where
         ),
     )];
 
-    let (signature_bytes, signature_format) = match identity.algorithm {
-        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, derived.expose_secret())?,
-        Algorithm::P256 => sign_seed_p256(&input_bytes, derived.expose_secret(), identity)?,
-        Algorithm::Secp256k1 => {
-            sign_seed_secp256k1(&input_bytes, derived.expose_secret(), identity)?
+    let (digest, input_bytes, signature_bytes, signature_format) = match prepared {
+        PreparedSignInput::Ed25519 {
+            input_bytes,
+            digest,
+        } => {
+            let (signature_bytes, signature_format) =
+                sign_seed_ed25519(&input_bytes, derived.expose_secret())?;
+            (digest, input_bytes.len(), signature_bytes, signature_format)
         }
+        PreparedSignInput::Prehashed(digest) => match identity.algorithm {
+            Algorithm::P256 => {
+                let (signature_bytes, signature_format) =
+                    sign_seed_p256_prehash(&digest.digest, derived.expose_secret(), identity)?;
+                (
+                    digest.digest.to_vec(),
+                    digest.input_bytes,
+                    signature_bytes,
+                    signature_format,
+                )
+            }
+            Algorithm::Secp256k1 => {
+                let (signature_bytes, signature_format) =
+                    sign_seed_secp256k1_prehash(&digest.digest, derived.expose_secret(), identity)?;
+                (
+                    digest.digest.to_vec(),
+                    digest.input_bytes,
+                    signature_bytes,
+                    signature_format,
+                )
+            }
+            Algorithm::Ed25519 => unreachable!("ed25519 uses buffered input"),
+        },
     };
 
     let (output_path, signature) =
@@ -229,7 +281,7 @@ where
             mode: identity.mode.resolved,
             digest_algorithm: DigestAlgorithm::Sha256,
             digest_hex: hex_encode(&digest),
-            input_bytes: input_bytes.len(),
+            input_bytes,
             output_format: request.format,
             output_path,
             signature_bytes: signature_bytes.len(),
@@ -258,28 +310,79 @@ where
         )));
     }
 
-    let input_bytes = load_sign_input(&request.input)?;
-    if input_bytes.is_empty() {
-        return Err(Error::Validation(
-            "sign input must not be empty".to_string(),
-        ));
+    validate_sign_output_format(identity, request.format, request.output.as_deref())?;
+
+    enum PreparedSignInput {
+        Ed25519 {
+            input_bytes: Vec<u8>,
+            digest: Vec<u8>,
+        },
+        Prehashed(super::shared::Sha256InputDigest),
     }
 
-    validate_sign_output_format(identity, request.format, request.output.as_deref())?;
+    let prepared = match identity.algorithm {
+        Algorithm::Ed25519 => {
+            let input_bytes = load_sign_input(&request.input)?;
+            if input_bytes.is_empty() {
+                return Err(Error::Validation(
+                    "sign input must not be empty".to_string(),
+                ));
+            }
+            let digest = Sha256::digest(&input_bytes).to_vec();
+            PreparedSignInput::Ed25519 {
+                input_bytes,
+                digest,
+            }
+        }
+        Algorithm::P256 | Algorithm::Secp256k1 => {
+            let digest = stream_sha256_input(&request.input, "sign input")?;
+            if digest.input_bytes == 0 {
+                return Err(Error::Validation(
+                    "sign input must not be empty".to_string(),
+                ));
+            }
+            PreparedSignInput::Prehashed(digest)
+        }
+    };
 
     let seed_request = seed_sign_open_request(identity)?;
     let seed_plan = plan_open(&seed_request)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
     let derived = open_and_derive(backend, deriver, &seed_request)?;
     let diagnostics =
         seed_sign_diagnostics(identity, &seed_plan.warnings, derived.expose_secret().len());
 
-    let (signature_bytes, signature_format) = match identity.algorithm {
-        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, derived.expose_secret())?,
-        Algorithm::P256 => sign_seed_p256(&input_bytes, derived.expose_secret(), identity)?,
-        Algorithm::Secp256k1 => {
-            sign_seed_secp256k1(&input_bytes, derived.expose_secret(), identity)?
+    let (digest, input_bytes, signature_bytes, signature_format) = match prepared {
+        PreparedSignInput::Ed25519 {
+            input_bytes,
+            digest,
+        } => {
+            let (signature_bytes, signature_format) =
+                sign_seed_ed25519(&input_bytes, derived.expose_secret())?;
+            (digest, input_bytes.len(), signature_bytes, signature_format)
         }
+        PreparedSignInput::Prehashed(digest) => match identity.algorithm {
+            Algorithm::P256 => {
+                let (signature_bytes, signature_format) =
+                    sign_seed_p256_prehash(&digest.digest, derived.expose_secret(), identity)?;
+                (
+                    digest.digest.to_vec(),
+                    digest.input_bytes,
+                    signature_bytes,
+                    signature_format,
+                )
+            }
+            Algorithm::Secp256k1 => {
+                let (signature_bytes, signature_format) =
+                    sign_seed_secp256k1_prehash(&digest.digest, derived.expose_secret(), identity)?;
+                (
+                    digest.digest.to_vec(),
+                    digest.input_bytes,
+                    signature_bytes,
+                    signature_format,
+                )
+            }
+            Algorithm::Ed25519 => unreachable!("ed25519 uses buffered input"),
+        },
     };
 
     let (output_path, signature) =
@@ -292,7 +395,7 @@ where
             mode: Mode::Seed,
             digest_algorithm: DigestAlgorithm::Sha256,
             digest_hex: hex_encode(&digest),
-            input_bytes: input_bytes.len(),
+            input_bytes,
             output_format: request.format,
             output_path,
             signature_bytes: signature_bytes.len(),
@@ -318,8 +421,8 @@ pub(crate) fn sign_seed_ed25519(
     Ok((signature.to_bytes().to_vec(), SeedSignatureFormat::Raw))
 }
 
-pub(crate) fn sign_seed_p256(
-    input_bytes: &[u8],
+pub(crate) fn sign_seed_p256_prehash(
+    digest: &[u8],
     derived_seed: &[u8],
     identity: &Identity,
 ) -> Result<(Vec<u8>, SeedSignatureFormat)> {
@@ -331,17 +434,17 @@ pub(crate) fn sign_seed_p256(
             identity.name
         ))
     })?;
-    let signature: P256Signature = <P256SigningKey as p256::ecdsa::signature::Signer<
-        P256Signature,
-    >>::sign(&signing_key, input_bytes);
+    let signature: P256Signature = signing_key.sign_prehash(digest).map_err(|error| {
+        Error::Validation(format!("failed to sign prehashed p256 digest: {error}"))
+    })?;
     Ok((
         signature.to_der().as_bytes().to_vec(),
         SeedSignatureFormat::Der,
     ))
 }
 
-pub(crate) fn sign_seed_secp256k1(
-    input_bytes: &[u8],
+pub(crate) fn sign_seed_secp256k1_prehash(
+    digest: &[u8],
     derived_seed: &[u8],
     identity: &Identity,
 ) -> Result<(Vec<u8>, SeedSignatureFormat)> {
@@ -353,9 +456,11 @@ pub(crate) fn sign_seed_secp256k1(
             identity.name
         ))
     })?;
-    let signature: K256Signature = <K256SigningKey as k256::ecdsa::signature::Signer<
-        K256Signature,
-    >>::sign(&signing_key, input_bytes);
+    let signature: K256Signature = signing_key.sign_prehash(digest).map_err(|error| {
+        Error::Validation(format!(
+            "failed to sign prehashed secp256k1 digest: {error}"
+        ))
+    })?;
     Ok((
         signature.to_der().as_bytes().to_vec(),
         SeedSignatureFormat::Der,
@@ -463,14 +568,14 @@ pub(crate) fn stage_native_sign(
             ))
         })?;
 
-    let input_bytes = load_sign_input(&request.input)?;
-    if input_bytes.is_empty() {
+    let digest_info = stream_sha256_input(&request.input, "sign input")?;
+    if digest_info.input_bytes == 0 {
         return Err(Error::Validation(
             "sign input must not be empty".to_string(),
         ));
     }
 
-    let digest = Sha256::digest(&input_bytes).to_vec();
+    let digest = digest_info.digest.to_vec();
     let digest_path = workspace_dir.path().join("sha256.digest.bin");
     let plain_signature_path = workspace_dir.path().join("signature.p1363.bin");
     let artifact_path = workspace_dir.path().join("signature.der");
@@ -508,7 +613,7 @@ pub(crate) fn stage_native_sign(
     Ok(StagedNativeSign {
         _workspace_dir: workspace_dir,
         digest_algorithm: DigestAlgorithm::Sha256,
-        input_bytes: input_bytes.len(),
+        input_bytes: digest_info.input_bytes,
         digest_path,
         artifact_path,
         plan,
@@ -733,28 +838,29 @@ mod tests {
     }
 
     #[test]
-    fn native_sign_rejects_oversized_buffered_input() {
+    fn stage_native_sign_hashes_large_input_to_a_sha256_digest_file() {
         let state_root = tempdir().expect("state root");
         let identity = signing_identity(state_root.path(), Mode::Native, Algorithm::P256);
-        let input_path = state_root.path().join("oversized.bin");
-        let file = fs::File::create(&input_path).expect("oversized input file");
-        file.set_len((BUFFERED_MESSAGE_INPUT_BYTES_LIMIT + 1) as u64)
-            .expect("oversized sign input");
+        write_default_handle(&identity);
+        let message = vec![0x5a; crate::ops::shared::SHA256_STREAM_BUFFER_BYTES * 3 + 29];
+        let input_path = state_root.path().join("input.bin");
+        fs::write(&input_path, &message).expect("input file");
 
-        let error = execute_with_defaults(
-            &identity,
+        let staged = stage_native_sign(
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
                 format: Format::Hex,
                 output: None,
             },
-            &DerivationOverrides::default(),
+            &identity,
         )
-        .expect_err("oversized buffered sign input should fail");
+        .expect("staged native sign");
 
-        assert!(
-            matches!(error, Error::Validation(message) if message.contains("sign input") && message.contains("byte limit"))
+        assert_eq!(staged.input_bytes, message.len());
+        assert_eq!(
+            fs::read(&staged.digest_path).expect("digest bytes"),
+            Sha256::digest(&message).to_vec()
         );
     }
 

@@ -21,7 +21,7 @@ use crate::model::{
     VerifyRequest,
 };
 use crate::ops;
-use crate::ops::shared::{BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT, load_input_bytes_with_limit};
+use crate::ops::shared::{load_input_bytes_with_limit, with_input_reader, with_output_file};
 use crate::ops::sign::SignOperationResult;
 
 #[cfg(test)]
@@ -29,8 +29,8 @@ use crate::model::{Identity, Mode};
 #[cfg(test)]
 use crate::ops::sign::{
     SEED_SIGNING_KEY_NAMESPACE, SeedSignatureFormat, execute_native_sign_plan_with_runner,
-    seed_sign_open_request, sign_seed_p256, sign_seed_secp256k1, sign_seed_with_backend,
-    stage_native_sign,
+    seed_sign_open_request, sign_seed_p256_prehash, sign_seed_secp256k1_prehash,
+    sign_seed_with_backend, stage_native_sign,
 };
 #[cfg(test)]
 use crate::ops::verify::{
@@ -267,24 +267,61 @@ fn run_encrypt(json: bool, args: EncryptArgs) -> Result<String> {
         }
     };
 
-    let input_bytes = load_input_bytes_with_limit(
-        &parse_input_source(&args.input),
-        "encrypt input",
-        BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT,
-    )?;
+    let input = parse_input_source(&args.input);
     let derivation = derivation_overrides(args.derivation.clone());
     let runner = ProcessCommandRunner;
-    match ops::encrypt::encrypt_with_defaults(&identity, &input_bytes, &derivation, &runner) {
+    let encryption = if let Some(ref output) = args.output {
+        with_output_file(output, |writer| {
+            with_input_reader(&input, "encrypt input", |reader| {
+                ops::encrypt::encrypt_stream_with_defaults(
+                    &identity,
+                    reader,
+                    writer,
+                    &derivation,
+                    &runner,
+                )
+            })
+        })
+    } else {
+        let input_bytes = match load_input_bytes_with_limit(
+            &input,
+            "encrypt input",
+            ops::encrypt::INLINE_OUTPUT_LIMIT_BYTES,
+        ) {
+            Ok(input_bytes) => input_bytes,
+            Err(Error::Validation(_)) => {
+                let error = Error::Validation(
+                    "encrypt input exceeded the inline output limit; use --output for large payloads"
+                        .to_string(),
+                );
+                return failure(
+                    json,
+                    command,
+                    ErrorEnvelope {
+                        code: error.code().as_str().to_string(),
+                        message: error.to_string(),
+                    },
+                    Vec::new(),
+                );
+            }
+            Err(error) => {
+                return failure(
+                    json,
+                    command,
+                    ErrorEnvelope {
+                        code: error.code().as_str().to_string(),
+                        message: error.to_string(),
+                    },
+                    Vec::new(),
+                );
+            }
+        };
+        ops::encrypt::encrypt_with_defaults(&identity, &input_bytes, &derivation, &runner)
+    };
+    match encryption {
         Ok(mut result) => {
             if let Some(ref output) = args.output {
-                let ct = result
-                    .ciphertext
-                    .as_ref()
-                    .map(|h| hex_decode_bytes(h))
-                    .unwrap_or_default();
-                write_output_file(output, &ct)?;
                 result.output_path = Some(output.clone());
-                result.ciphertext = None;
             }
             success(json, command, result)
         }
@@ -333,26 +370,121 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
         );
     }
 
-    let raw_input = load_input_bytes_with_limit(
-        &parse_input_source(&args.input),
-        "decrypt input",
-        BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT,
-    )?;
-    // Try to interpret as hex first (the format we emit), otherwise use raw bytes.
-    let ciphertext = try_hex_decode(&raw_input).unwrap_or(raw_input);
+    let input = parse_input_source(&args.input);
     let derivation = derivation_overrides(args.derivation.clone());
     let runner = ProcessCommandRunner;
-    match ops::encrypt::decrypt_with_defaults(&identity, &ciphertext, &derivation, &runner) {
+    let decryption = if let Some(ref output) = args.output {
+        let inline_limit = ops::encrypt::INLINE_OUTPUT_LIMIT_BYTES
+            .saturating_mul(2)
+            .saturating_add(16);
+        let small_path_input = match &input {
+            InputSource::Path { path } => fs::metadata(path)
+                .ok()
+                .filter(|metadata| metadata.is_file() && metadata.len() <= inline_limit as u64)
+                .is_some(),
+            InputSource::Stdin => false,
+        };
+
+        if small_path_input {
+            let raw_input = match load_input_bytes_with_limit(&input, "decrypt input", inline_limit)
+            {
+                Ok(raw_input) => raw_input,
+                Err(error) => {
+                    return failure(
+                        json,
+                        command,
+                        ErrorEnvelope {
+                            code: error.code().as_str().to_string(),
+                            message: error.to_string(),
+                        },
+                        Vec::new(),
+                    );
+                }
+            };
+
+            if let Some(ciphertext) = try_hex_decode(&raw_input) {
+                with_output_file(output, |writer| {
+                    ops::encrypt::decrypt_ciphertext_to_writer_with_defaults(
+                        &identity,
+                        &ciphertext,
+                        writer,
+                        &derivation,
+                        &runner,
+                    )
+                })
+            } else {
+                with_output_file(output, |writer| {
+                    with_input_reader(&input, "decrypt input", |reader| {
+                        ops::encrypt::decrypt_stream_with_defaults(
+                            &identity,
+                            reader,
+                            writer,
+                            &derivation,
+                            &runner,
+                        )
+                    })
+                })
+            }
+        } else {
+            with_output_file(output, |writer| {
+                with_input_reader(&input, "decrypt input", |reader| {
+                    ops::encrypt::decrypt_stream_with_defaults(
+                        &identity,
+                        reader,
+                        writer,
+                        &derivation,
+                        &runner,
+                    )
+                })
+            })
+        }
+    } else {
+        let raw_input = match load_input_bytes_with_limit(
+            &input,
+            "decrypt input",
+            ops::encrypt::INLINE_OUTPUT_LIMIT_BYTES
+                .saturating_mul(2)
+                .saturating_add(16),
+        ) {
+            Ok(raw_input) => raw_input,
+            Err(error) => {
+                return failure(
+                    json,
+                    command,
+                    ErrorEnvelope {
+                        code: error.code().as_str().to_string(),
+                        message: error.to_string(),
+                    },
+                    Vec::new(),
+                );
+            }
+        };
+        let ciphertext = try_hex_decode(&raw_input).unwrap_or(raw_input);
+        if ciphertext.len() > ops::encrypt::INLINE_OUTPUT_LIMIT_BYTES {
+            return failure(
+                json,
+                command,
+                ErrorEnvelope {
+                    code: Error::Validation(
+                        "decrypt input exceeded the inline output limit; use --output for large payloads"
+                            .to_string(),
+                    )
+                    .code()
+                    .as_str()
+                    .to_string(),
+                    message:
+                        "decrypt input exceeded the inline output limit; use --output for large payloads"
+                            .to_string(),
+                },
+                Vec::new(),
+            );
+        }
+        ops::encrypt::decrypt_with_defaults(&identity, &ciphertext, &derivation, &runner)
+    };
+    match decryption {
         Ok(mut result) => {
             if let Some(ref output) = args.output {
-                let pt = result
-                    .plaintext
-                    .as_ref()
-                    .map(|h| hex_decode_bytes(h))
-                    .unwrap_or_default();
-                write_output_file(output, &pt)?;
                 result.output_path = Some(output.clone());
-                result.plaintext = None;
             }
             success(json, command, result)
         }
@@ -562,92 +694,6 @@ fn try_hex_decode(input: &[u8]) -> Option<Vec<u8>> {
     Some(hex_decode_bytes(s))
 }
 
-fn write_output_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| {
-        Error::State(format!(
-            "failed to create output directory '{}': {e}",
-            parent.display()
-        ))
-    })?;
-
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            return Err(Error::Validation(format!(
-                "output '{}' must not be a symlink",
-                path.display()
-            )));
-        }
-        if !file_type.is_file() {
-            return Err(Error::Validation(format!(
-                "output '{}' must be a regular file path",
-                path.display()
-            )));
-        }
-    }
-
-    let temp_path = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("output"),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-
-    let mut file = options.open(&temp_path).map_err(|e| {
-        Error::State(format!(
-            "failed to create temp output file '{}': {e}",
-            temp_path.display()
-        ))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|e| {
-                let _ = fs::remove_file(&temp_path);
-                Error::State(format!(
-                    "failed to harden temp output permissions '{}': {e}",
-                    temp_path.display()
-                ))
-            })?;
-    }
-    use std::io::Write as _;
-    if let Err(e) = file.write_all(data) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(Error::State(format!(
-            "failed to write output to '{}': {e}",
-            temp_path.display()
-        )));
-    }
-    drop(file);
-
-    fs::rename(&temp_path, path).map_err(|e| {
-        let _ = fs::remove_file(&temp_path);
-        Error::State(format!(
-            "failed to move output into place '{}' -> '{}': {e}",
-            temp_path.display(),
-            path.display()
-        ))
-    })
-}
-
 #[allow(dead_code)]
 fn build_placeholder_request(operation: &str, identity: String) -> serde_json::Value {
     match operation {
@@ -714,7 +760,6 @@ mod tests {
     use super::*;
 
     use std::cell::RefCell;
-    use std::fs::File;
     use std::path::Path;
 
     use crate::backend::{CommandInvocation, CommandOutput};
@@ -729,6 +774,7 @@ mod tests {
     use secrecy::ExposeSecret;
     use secrecy::SecretBox;
     use serde_json::Value;
+    use sha2::Digest as _;
     use tempfile::tempdir;
 
     use crate::model::{IdentityModeResolution, StateLayout};
@@ -1173,8 +1219,12 @@ mod tests {
         let derived = HkdfSha256SeedDeriver
             .derive(&SecretBox::new(Box::new(vec![0x55; 32])), &derivation)
             .expect("derived seed");
-        let (signature, _format) =
-            sign_seed_p256(&message, derived.expose_secret(), &identity).expect("seed p256 sign");
+        let (signature, _format) = sign_seed_p256_prehash(
+            &sha2::Sha256::digest(&message),
+            derived.expose_secret(),
+            &identity,
+        )
+        .expect("seed p256 sign");
 
         let input_path = state_root.path().join("input.bin");
         let signature_path = state_root.path().join("signature.der");
@@ -1542,9 +1592,12 @@ mod tests {
         let derived = HkdfSha256SeedDeriver
             .derive(&SecretBox::new(Box::new(vec![0x55; 32])), &derivation)
             .expect("derived seed");
-        let (signature, _format) =
-            sign_seed_secp256k1(&message, derived.expose_secret(), &identity)
-                .expect("seed secp256k1 sign");
+        let (signature, _format) = sign_seed_secp256k1_prehash(
+            &sha2::Sha256::digest(&message),
+            derived.expose_secret(),
+            &identity,
+        )
+        .expect("seed secp256k1 sign");
 
         let input_path = state_root.path().join("input.bin");
         let signature_path = state_root.path().join("signature.der");
@@ -1619,84 +1672,80 @@ mod tests {
     }
 
     #[test]
-    fn encrypt_rejects_oversized_buffered_input_before_running_backend() {
+    fn run_encrypt_requires_output_for_large_inline_payloads() {
         let state_root = tempdir().expect("state root");
-        let identity = Identity::new(
-            "seed-encrypt-limit".to_string(),
+        let identity = seed_profile(
+            state_root.path(),
             Algorithm::Ed25519,
             vec![UseCase::Encrypt],
-            IdentityModeResolution {
-                requested: ModePreference::Seed,
-                resolved: Mode::Seed,
-                reasons: vec!["seed requested".to_string()],
-            },
-            StateLayout::new(state_root.path().to_path_buf()),
         );
         identity.persist().expect("persist identity");
+        let input_path = state_root.path().join("large-plaintext.bin");
+        fs::write(
+            &input_path,
+            vec![0x41; ops::encrypt::INLINE_OUTPUT_LIMIT_BYTES + 1],
+        )
+        .expect("input bytes");
 
-        let input_path = state_root.path().join("oversized-encrypt.bin");
-        let file = File::create(&input_path).expect("oversized encrypt input");
-        file.set_len((BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT + 1) as u64)
-            .expect("oversized encrypt input length");
+        let output = run_encrypt(
+            true,
+            EncryptArgs {
+                identity: identity.name.clone(),
+                derivation: Default::default(),
+                input: input_path.display().to_string(),
+                output: None,
+                state_dir: Some(state_root.path().to_path_buf()),
+            },
+        )
+        .expect("rendered failure output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
 
-        let error = run(Cli::try_parse_from([
-            "tpm2-derive",
-            "--json",
-            "encrypt",
-            "--with",
-            &identity.name,
-            "--input",
-            &input_path.display().to_string(),
-            "--state-dir",
-            &state_root.path().display().to_string(),
-        ])
-        .expect("cli parse"))
-        .expect_err("oversized encrypt input should fail before backend execution");
-
-        assert!(error.to_string().contains("encrypt input"));
-        assert!(error.to_string().contains("limit"));
+        assert_eq!(value["ok"], Value::Bool(false));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("use --output for large payloads")
+        );
     }
 
     #[test]
-    fn decrypt_rejects_oversized_buffered_input_before_running_backend() {
+    fn run_decrypt_requires_output_for_large_inline_payloads() {
         let state_root = tempdir().expect("state root");
-        let identity = Identity::new(
-            "seed-decrypt-limit".to_string(),
+        let identity = seed_profile(
+            state_root.path(),
             Algorithm::Ed25519,
-            vec![UseCase::Decrypt],
-            IdentityModeResolution {
-                requested: ModePreference::Seed,
-                resolved: Mode::Seed,
-                reasons: vec!["seed requested".to_string()],
-            },
-            StateLayout::new(state_root.path().to_path_buf()),
+            vec![UseCase::Encrypt, UseCase::Decrypt],
         );
         identity.persist().expect("persist identity");
+        let input_path = state_root.path().join("large-ciphertext.bin");
+        fs::write(
+            &input_path,
+            vec![0x91; ops::encrypt::INLINE_OUTPUT_LIMIT_BYTES + 1],
+        )
+        .expect("ciphertext bytes");
 
-        let input_path = state_root.path().join("oversized-decrypt.hex");
-        let file = File::create(&input_path).expect("oversized decrypt input");
-        file.set_len((BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT + 1) as u64)
-            .expect("oversized decrypt input length");
+        let output = run_decrypt(
+            true,
+            DecryptArgs {
+                identity: identity.name.clone(),
+                derivation: Default::default(),
+                input: input_path.display().to_string(),
+                output: None,
+                state_dir: Some(state_root.path().to_path_buf()),
+                allow_plaintext_output: true,
+            },
+        )
+        .expect("rendered failure output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
 
-        let output_path = state_root.path().join("plaintext.bin");
-        let error = run(Cli::try_parse_from([
-            "tpm2-derive",
-            "--json",
-            "decrypt",
-            "--with",
-            &identity.name,
-            "--input",
-            &input_path.display().to_string(),
-            "--output",
-            &output_path.display().to_string(),
-            "--state-dir",
-            &state_root.path().display().to_string(),
-        ])
-        .expect("cli parse"))
-        .expect_err("oversized decrypt input should fail before backend execution");
-
-        assert!(error.to_string().contains("decrypt input"));
-        assert!(error.to_string().contains("limit"));
+        assert_eq!(value["ok"], Value::Bool(false));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("use --output for large payloads")
+        );
     }
 
     fn hex_decode_test(hex: &str) -> Vec<u8> {

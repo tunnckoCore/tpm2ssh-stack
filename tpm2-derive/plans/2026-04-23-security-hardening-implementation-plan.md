@@ -180,20 +180,20 @@ This plan is written for multiple agents working in parallel.
 
 ### Checklist
 
-- [ ] add streaming SHA-256 hashing helper for native / p256 / secp256k1 sign/verify
-- [ ] switch native sign to stream-hash input before TPM signing
-- [ ] switch native verify to stream-hash input before TPM verification
-- [ ] switch p256/secp256k1 sign/verify to prehash-based APIs
+- [x] add streaming SHA-256 hashing helper for native / p256 / secp256k1 sign/verify
+- [x] switch native sign to stream-hash input before TPM signing
+- [x] switch native verify to stream-hash input before TPM verification
+- [x] switch p256/secp256k1 sign/verify to prehash-based APIs
 - [x] keep Ed25519 buffered but capped
-- [ ] redesign encrypt/decrypt around chunked streaming reader->writer APIs
-- [ ] remove encrypt/decrypt hex encode -> decode round-trips for file output
-- [ ] require `--output` or equivalent for large non-inline payloads
+- [x] redesign encrypt/decrypt around chunked streaming reader->writer APIs
+- [x] remove encrypt/decrypt hex encode -> decode round-trips for file output
+- [x] require `--output` or equivalent for large non-inline payloads
 
 ### Acceptance checks
 
-- [ ] native/p256/secp256k1 sign/verify no longer need full-message buffering
-- [ ] encrypt/decrypt file paths do not materialize giant hex strings in memory
-- [ ] large payloads work through streaming paths without inline JSON/plaintext dumps
+- [x] native/p256/secp256k1 sign/verify no longer need full-message buffering
+- [x] encrypt/decrypt file paths do not materialize giant hex strings in memory
+- [x] large payloads work through streaming paths without inline JSON/plaintext dumps
 
 ---
 
@@ -251,7 +251,7 @@ This plan is written for multiple agents working in parallel.
 - [x] add oversize signature input rejection tests
 - [x] add oversize buffered message/stdin rejection tests
 - [x] add real swtpm tests for native create/sign/verify/export after concurrency changes
-- [ ] add real swtpm tests for seed/prf large operational paths after streaming changes
+- [x] add real swtpm tests for seed/prf large operational paths after streaming changes
 - [x] add tests for ssh-add policy gating
 - [x] add tests for decrypt plaintext policy
 
@@ -262,7 +262,7 @@ This plan is written for multiple agents working in parallel.
 - [x] `cargo test` passes
 - [x] `cargo build` passes
 - [x] `cargo check` passes
-- [x] `nix shell nixpkgs#swtpm nixpkgs#tpm2-tools -c cargo test --features real-tpm-tests --test real_tpm_cli -- --nocapture` passes
+- [x] `nix shell nixpkgs#swtpm nixpkgs#tpm2-tools nixpkgs#openssh -c cargo test --features real-tpm-tests --test real_tpm_cli -- --nocapture` passes
 
 ---
 
@@ -340,7 +340,7 @@ cargo test
 Run from `tpm2-derive/`:
 
 ```bash
-nix shell nixpkgs#swtpm nixpkgs#tpm2-tools -c cargo test --features real-tpm-tests --test real_tpm_cli -- --nocapture
+nix shell nixpkgs#swtpm nixpkgs#tpm2-tools nixpkgs#openssh -c cargo test --features real-tpm-tests --test real_tpm_cli -- --nocapture
 ```
 
 ## Rule
@@ -352,10 +352,10 @@ nix shell nixpkgs#swtpm nixpkgs#tpm2-tools -c cargo test --features real-tpm-tes
 
 # Exit criteria for the hardening wave
 
-- [x] #9 zeroization/secret lifetime is materially improved in real secret paths
+- [ ] #9 zeroization/secret lifetime is materially improved in real secret paths
 - [x] #10 native handle allocation/setup/sign concurrency issues are fixed
-- [ ] #11 unbounded reads are removed or bounded, with streaming added for large-path operations
-- [x] secret-egress behavior is consistent and explicit
+- [x] #11 unbounded reads are removed or bounded, with streaming added for large-path operations
+- [ ] secret-egress behavior is consistent and explicit
 - [x] every implemented hardening change has tests
 - [x] changed operational paths are validated with real `tpm2-tools` on `swtpm`, not just mocks
 - [x] real swtpm integration coverage validates the hardened paths

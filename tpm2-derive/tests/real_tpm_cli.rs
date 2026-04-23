@@ -2,14 +2,14 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use serde_json::Value;
-use support::{
-    RealTpmHarness, hex_decode, hex_encode, normalize_openssh_public_key, run_cli, run_cli_json,
-};
+use sha2::Digest as _;
+use support::{RealTpmHarness, hex_decode, hex_encode, normalize_openssh_public_key, run_cli_json};
 use tpm2_derive::backend::{ProcessCommandRunner, default_probe};
 use tpm2_derive::error::Error;
 use tpm2_derive::model::{
@@ -195,6 +195,64 @@ fn native_identity_library_round_trip_covers_create_sign_verify_and_export() {
 
     let public_key = fs::read_to_string(&public_key_path).expect("read exported public key");
     assert!(public_key.starts_with("ecdsa-sha2-nistp256 "));
+}
+
+#[test]
+fn native_identity_stream_hashes_large_messages_against_real_swtpm() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity = create_identity(
+        &harness,
+        "native-stream-real",
+        Algorithm::P256,
+        ModePreference::Native,
+        vec![UseCase::Sign, UseCase::Verify],
+        DerivationOverrides::default(),
+    );
+    assert_eq!(identity.mode.resolved, Mode::Native);
+
+    let message = vec![0x6d; 256 * 1024 + 31];
+    let message_path = write_workspace_file(&harness, "native-stream-message.bin", &message);
+    let signature_path = harness.workspace_path("native-stream-message.sig");
+
+    let (sign_result, _diagnostics) = sign::execute_with_defaults(
+        &identity,
+        &tpm2_derive::model::SignRequest {
+            identity: identity.name.clone(),
+            input: path_input(&message_path),
+            format: Format::Der,
+            output: Some(signature_path.clone()),
+        },
+        &DerivationOverrides::default(),
+    )
+    .expect("native sign large streaming payload");
+    let SignOperationResult::Native(native_sign) = sign_result else {
+        panic!("expected native sign result");
+    };
+
+    assert_eq!(native_sign.input_bytes, message.len());
+    assert_eq!(
+        native_sign.digest_algorithm,
+        tpm2_derive::ops::native::DigestAlgorithm::Sha256
+    );
+
+    let (verify_result, _diagnostics) = verify::execute_with_defaults(
+        &identity,
+        &VerifyRequest {
+            identity: identity.name.clone(),
+            input: path_input(&message_path),
+            signature: path_input(&signature_path),
+            format: InputFormat::Der,
+        },
+        &DerivationOverrides::default(),
+    )
+    .expect("native verify large streaming payload");
+
+    assert!(verify_result.verified);
+    assert_eq!(verify_result.input_bytes, message.len());
+    assert_eq!(
+        verify_result.digest_hex,
+        hex_encode(&sha2::Sha256::digest(&message))
+    );
 }
 
 #[test]
@@ -484,63 +542,143 @@ fn decrypt_cli_requires_explicit_plaintext_egress_with_real_swtpm() {
 }
 
 #[test]
-fn encrypt_and_decrypt_cli_reject_oversized_buffered_inputs_with_real_swtpm() {
+fn seed_and_prf_stream_encrypt_large_payloads_against_real_swtpm() {
     let harness = RealTpmHarness::start().expect("start swtpm harness");
-    let identity = create_identity(
-        &harness,
-        "seed-buffer-limit-cli",
-        Algorithm::Ed25519,
-        ModePreference::Seed,
-        vec![UseCase::Encrypt, UseCase::Decrypt],
-        DerivationOverrides::default(),
-    );
+    let runner = ProcessCommandRunner;
 
-    let oversized_bytes = (8 * 1024 * 1024 + 1) as u64;
-    let encrypt_input = harness.workspace_path("oversized-encrypt.bin");
-    fs::File::create(&encrypt_input)
-        .expect("create oversized encrypt input")
-        .set_len(oversized_bytes)
-        .expect("size oversized encrypt input");
+    for (name, requested_mode, derivation) in [
+        (
+            "seed-stream-encrypt-real",
+            ModePreference::Seed,
+            DerivationOverrides::default(),
+        ),
+        (
+            "prf-stream-encrypt-real",
+            ModePreference::Prf,
+            DerivationOverrides {
+                org: Some("com.example.tests".to_string()),
+                purpose: Some("stream-encrypt".to_string()),
+                context: BTreeMap::from([("tenant".to_string(), "alpha".to_string())]),
+            },
+        ),
+    ] {
+        let identity = create_identity(
+            &harness,
+            name,
+            Algorithm::P256,
+            requested_mode,
+            vec![UseCase::Encrypt, UseCase::Decrypt],
+            derivation.clone(),
+        );
+        let plaintext = vec![0x73; 256 * 1024 + 23];
+        let ciphertext_path = harness.workspace_path(&format!("{name}.ciphertext.bin"));
+        let decrypted_path = harness.workspace_path(&format!("{name}.plaintext.bin"));
 
-    let state_dir = harness.state_dir().display().to_string();
-    let encrypt_error = run_cli(vec![
-        "tpm2-derive".to_string(),
-        "--json".to_string(),
-        "encrypt".to_string(),
-        "--with".to_string(),
-        identity.name.clone(),
-        "--input".to_string(),
-        encrypt_input.display().to_string(),
-        "--state-dir".to_string(),
-        state_dir.clone(),
-    ])
-    .expect_err("oversized encrypt input should fail before TPM work");
-    assert!(encrypt_error.contains("encrypt input"));
-    assert!(encrypt_error.contains("limit"));
+        let mut plaintext_reader = Cursor::new(&plaintext);
+        let mut ciphertext_writer =
+            fs::File::create(&ciphertext_path).expect("ciphertext output file");
+        let encrypt_result = encrypt::encrypt_stream_with_defaults(
+            &identity,
+            &mut plaintext_reader,
+            &mut ciphertext_writer,
+            &DerivationOverrides::default(),
+            &runner,
+        )
+        .expect("stream encrypt large payload");
+        drop(ciphertext_writer);
 
-    let decrypt_input = harness.workspace_path("oversized-decrypt.hex");
-    fs::File::create(&decrypt_input)
-        .expect("create oversized decrypt input")
-        .set_len(oversized_bytes)
-        .expect("size oversized decrypt input");
-    let decrypt_output = harness.workspace_path("oversized-decrypt.out");
+        let ciphertext = fs::read(&ciphertext_path).expect("ciphertext bytes");
+        assert_eq!(encrypt_result.input_bytes, plaintext.len());
+        assert_eq!(encrypt_result.ciphertext_bytes, ciphertext.len());
+        assert_eq!(encrypt_result.encoding, "binary");
+        assert!(ciphertext.starts_with(b"TPM2ENC1"));
 
-    let decrypt_error = run_cli(vec![
-        "tpm2-derive".to_string(),
-        "--json".to_string(),
-        "decrypt".to_string(),
-        "--with".to_string(),
-        identity.name.clone(),
-        "--input".to_string(),
-        decrypt_input.display().to_string(),
-        "--output".to_string(),
-        decrypt_output.display().to_string(),
-        "--state-dir".to_string(),
-        state_dir,
-    ])
-    .expect_err("oversized decrypt input should fail before TPM work");
-    assert!(decrypt_error.contains("decrypt input"));
-    assert!(decrypt_error.contains("limit"));
+        let mut ciphertext_reader =
+            fs::File::open(&ciphertext_path).expect("ciphertext input file");
+        let mut plaintext_writer =
+            fs::File::create(&decrypted_path).expect("plaintext output file");
+        let decrypt_result = encrypt::decrypt_stream_with_defaults(
+            &identity,
+            &mut ciphertext_reader,
+            &mut plaintext_writer,
+            &DerivationOverrides::default(),
+            &runner,
+        )
+        .expect("stream decrypt large payload");
+        drop(plaintext_writer);
+
+        assert_eq!(decrypt_result.ciphertext_bytes, ciphertext.len());
+        assert_eq!(decrypt_result.plaintext_bytes, plaintext.len());
+        assert_eq!(decrypt_result.encoding, "binary");
+        assert_eq!(
+            fs::read(&decrypted_path).expect("decrypted bytes"),
+            plaintext
+        );
+    }
+}
+
+#[test]
+fn seed_stream_hashes_large_p256_and_secp256k1_messages_against_real_swtpm() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+
+    for (name, algorithm) in [
+        ("seed-stream-p256-real", Algorithm::P256),
+        ("seed-stream-secp256k1-real", Algorithm::Secp256k1),
+    ] {
+        let identity = create_identity(
+            &harness,
+            name,
+            algorithm,
+            ModePreference::Seed,
+            vec![UseCase::Sign, UseCase::Verify],
+            DerivationOverrides::default(),
+        );
+        assert_eq!(identity.mode.resolved, Mode::Seed);
+
+        let message = vec![0x4f; 256 * 1024 + 19];
+        let message_path = write_workspace_file(&harness, &format!("{name}-message.bin"), &message);
+        let signature_path = harness.workspace_path(&format!("{name}.sig.der"));
+
+        let (sign_result, _diagnostics) = sign::execute_with_defaults(
+            &identity,
+            &tpm2_derive::model::SignRequest {
+                identity: identity.name.clone(),
+                input: path_input(&message_path),
+                format: Format::Der,
+                output: Some(signature_path.clone()),
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect("seed sign large streaming payload");
+        let SignOperationResult::Derived(derived_sign) = sign_result else {
+            panic!("expected derived sign result");
+        };
+
+        assert_eq!(derived_sign.input_bytes, message.len());
+        assert_eq!(
+            derived_sign.digest_hex,
+            hex_encode(&sha2::Sha256::digest(&message))
+        );
+
+        let (verify_result, _diagnostics) = verify::execute_with_defaults(
+            &identity,
+            &VerifyRequest {
+                identity: identity.name.clone(),
+                input: path_input(&message_path),
+                signature: path_input(&signature_path),
+                format: InputFormat::Der,
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect("seed verify large streaming payload");
+
+        assert!(verify_result.verified);
+        assert_eq!(verify_result.input_bytes, message.len());
+        assert_eq!(
+            verify_result.digest_hex,
+            hex_encode(&sha2::Sha256::digest(&message))
+        );
+    }
 }
 
 #[test]

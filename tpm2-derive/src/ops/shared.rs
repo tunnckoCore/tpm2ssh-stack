@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretBox;
+use sha2::{Digest as _, Sha256};
 
 use crate::backend::{CommandOutput, CommandRunner};
 use crate::crypto::{
@@ -29,11 +30,18 @@ pub(crate) const IDENTITY_JSON_BYTES_LIMIT: usize = 256 * 1024;
 pub(crate) const BUFFERED_MESSAGE_INPUT_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 pub(crate) const VERIFY_SIGNATURE_INPUT_BYTES_LIMIT: usize = 64 * 1024;
 pub(crate) const BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+pub(crate) const SHA256_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(crate) type SecretBytes = SecretBox<Vec<u8>>;
 
 pub(crate) fn secret_bytes(bytes: Vec<u8>) -> SecretBytes {
     SecretBox::new(Box::new(bytes))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct Sha256InputDigest {
+    pub digest: [u8; 32],
+    pub input_bytes: usize,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -279,6 +287,28 @@ pub(crate) fn ensure_bytes_within_limit(label: &str, len: usize, max_bytes: usiz
     Ok(())
 }
 
+pub(crate) fn with_input_reader<T, F>(input: &InputSource, label: &str, operation: F) -> Result<T>
+where
+    F: FnOnce(&mut dyn Read) -> Result<T>,
+{
+    match input {
+        InputSource::Stdin => {
+            let stdin = std::io::stdin();
+            let mut handle = stdin.lock();
+            operation(&mut handle)
+        }
+        InputSource::Path { path } => {
+            let mut file = fs::File::open(path).map_err(|error| {
+                Error::State(format!(
+                    "failed to open {label} '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            operation(&mut file)
+        }
+    }
+}
+
 pub(crate) fn load_input_bytes_with_limit(
     input: &InputSource,
     label: &str,
@@ -353,6 +383,35 @@ where
     Ok(buffer)
 }
 
+pub(crate) fn stream_sha256_input(input: &InputSource, label: &str) -> Result<Sha256InputDigest> {
+    with_input_reader(input, label, |reader| stream_sha256_reader(reader, label))
+}
+
+fn stream_sha256_reader(reader: &mut dyn Read, label: &str) -> Result<Sha256InputDigest> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; SHA256_STREAM_BUFFER_BYTES];
+    let mut input_bytes = 0usize;
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| Error::State(format!("failed to read {label}: {error}")))?;
+        if read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..read]);
+        input_bytes = input_bytes.checked_add(read).ok_or_else(|| {
+            Error::Validation(format!("{label} exceeded the maximum supported size"))
+        })?;
+    }
+
+    Ok(Sha256InputDigest {
+        digest: hasher.finalize().into(),
+        input_bytes,
+    })
+}
+
 pub(crate) fn encode_textual_output_bytes(format: Format, bytes: &[u8]) -> Result<Vec<u8>> {
     match format {
         Format::Hex => Ok(hex_encode(bytes).into_bytes()),
@@ -400,7 +459,10 @@ pub(crate) fn output_format_extension(format: Format) -> &'static str {
     }
 }
 
-pub(crate) fn write_output_file(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn with_output_file<T, F>(path: &Path, operation: F) -> Result<T>
+where
+    F: FnOnce(&mut fs::File) -> Result<T>,
+{
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -467,23 +529,43 @@ pub(crate) fn write_output_file(path: &Path, data: &[u8]) -> Result<()> {
             })?;
     }
 
-    use std::io::Write as _;
-    if let Err(error) = file.write_all(data) {
+    let result = operation(&mut file);
+    if let Err(error) = file.flush() {
         let _ = fs::remove_file(&temp_path);
         return Err(Error::State(format!(
-            "failed to write output to '{}': {error}",
+            "failed to flush output to '{}': {error}",
             temp_path.display()
         )));
     }
     drop(file);
 
-    fs::rename(&temp_path, path).map_err(|error| {
-        let _ = fs::remove_file(&temp_path);
-        Error::State(format!(
-            "failed to move output into place '{}' -> '{}': {error}",
-            temp_path.display(),
-            path.display()
-        ))
+    match result {
+        Ok(value) => {
+            fs::rename(&temp_path, path).map_err(|error| {
+                let _ = fs::remove_file(&temp_path);
+                Error::State(format!(
+                    "failed to move output into place '{}' -> '{}': {error}",
+                    temp_path.display(),
+                    path.display()
+                ))
+            })?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn write_output_file(path: &Path, data: &[u8]) -> Result<()> {
+    with_output_file(path, |file| {
+        file.write_all(data).map_err(|error| {
+            Error::State(format!(
+                "failed to write output file '{}': {error}",
+                path.display()
+            ))
+        })
     })
 }
 
@@ -697,9 +779,11 @@ fn validate_non_empty(field: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    use std::fs;
     use std::io::Cursor;
 
     use secrecy::ExposeSecret;
+    use tempfile::tempdir;
 
     fn assert_secret_bytes(_: &SecretBytes) {}
 
@@ -727,5 +811,48 @@ mod tests {
         assert!(
             matches!(error, Error::Validation(message) if message.contains("stdin input") && message.contains("4-byte limit"))
         );
+    }
+
+    #[test]
+    fn stream_sha256_reader_hashes_large_inputs_incrementally() {
+        let payload = vec![0x5a; SHA256_STREAM_BUFFER_BYTES * 3 + 17];
+        let mut reader = Cursor::new(payload.clone());
+
+        let digest = stream_sha256_reader(&mut reader, "test payload").expect("stream digest");
+
+        assert_eq!(digest.input_bytes, payload.len());
+        let expected: [u8; 32] = Sha256::digest(&payload).into();
+        assert_eq!(digest.digest, expected);
+    }
+
+    #[test]
+    fn with_output_file_writes_atomically() {
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("output.bin");
+
+        with_output_file(&path, |file| {
+            file.write_all(b"streamed output")
+                .map_err(|error| Error::State(format!("failed to write streamed output: {error}")))
+        })
+        .expect("write output file");
+
+        assert_eq!(fs::read(&path).expect("output bytes"), b"streamed output");
+    }
+
+    #[test]
+    fn load_input_bytes_with_limit_rejects_oversized_input() {
+        let payload = vec![0x33; 9];
+        let tempdir = tempdir().expect("tempdir");
+        let path = tempdir.path().join("input.bin");
+        fs::write(&path, &payload).expect("input bytes");
+
+        let error = load_input_bytes_with_limit(
+            &InputSource::Path { path },
+            "test payload",
+            payload.len() - 1,
+        )
+        .expect_err("oversized input should fail");
+
+        assert!(matches!(error, Error::Validation(message) if message.contains("byte limit")));
     }
 }

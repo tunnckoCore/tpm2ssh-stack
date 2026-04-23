@@ -1,8 +1,8 @@
 use std::fs;
 
 use ed25519_dalek::{Signature as Ed25519Signature, SigningKey as Ed25519SigningKey};
+use k256::ecdsa::signature::hazmat::PrehashVerifier as _;
 use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
-use p256::ecdsa::signature::Verifier as _;
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePublicKey as _;
 use serde::Serialize;
@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 use super::shared::{
     BUFFERED_MESSAGE_INPUT_BYTES_LIMIT, VERIFY_SIGNATURE_INPUT_BYTES_LIMIT,
     classify_native_command_failure, decode_input_bytes, ensure_derivation_overrides_allowed,
-    load_input_bytes_with_limit,
+    load_input_bytes_with_limit, stream_sha256_input,
 };
 #[cfg(test)]
 use super::sign::{
@@ -58,12 +58,6 @@ pub struct VerifyOperationResult {
     pub signature_format: VerifySignatureFormat,
 }
 
-struct LoadedVerifyRequest {
-    input_bytes: Vec<u8>,
-    signature_bytes: Vec<u8>,
-    signature_input_format: InputFormat,
-}
-
 pub fn execute_with_defaults(
     identity: &Identity,
     request: &VerifyRequest,
@@ -90,7 +84,7 @@ where
     }
 }
 
-fn load_verify_request(request: &VerifyRequest) -> Result<LoadedVerifyRequest> {
+fn ensure_single_verify_stdin_source(request: &VerifyRequest) -> Result<()> {
     if matches!(request.input, InputSource::Stdin)
         && matches!(request.signature, InputSource::Stdin)
     {
@@ -100,29 +94,24 @@ fn load_verify_request(request: &VerifyRequest) -> Result<LoadedVerifyRequest> {
         ));
     }
 
-    let input_bytes = load_input_bytes_with_limit(
-        &request.input,
-        "verify input",
-        BUFFERED_MESSAGE_INPUT_BYTES_LIMIT,
-    )?;
+    Ok(())
+}
+
+fn load_verify_signature(request: &VerifyRequest, label: &str) -> Result<(Vec<u8>, InputFormat)> {
     let raw_signature_input = load_input_bytes_with_limit(
         &request.signature,
-        "verify signature",
+        label,
         VERIFY_SIGNATURE_INPUT_BYTES_LIMIT,
     )?;
     let (signature_bytes, signature_input_format) =
-        decode_input_bytes(request.format, &raw_signature_input, "verify signature")?;
+        decode_input_bytes(request.format, &raw_signature_input, label)?;
     if signature_bytes.is_empty() {
         return Err(Error::Validation(
             "verify signature must not be empty".to_string(),
         ));
     }
 
-    Ok(LoadedVerifyRequest {
-        input_bytes,
-        signature_bytes,
-        signature_input_format,
-    })
+    Ok((signature_bytes, signature_input_format))
 }
 
 fn verify_derived_identity<R>(
@@ -141,15 +130,37 @@ where
         )));
     }
 
-    let loaded = load_verify_request(request)?;
-    let LoadedVerifyRequest {
-        input_bytes,
-        signature_bytes,
-        signature_input_format,
-    } = loaded;
+    ensure_single_verify_stdin_source(request)?;
+    let (signature_bytes, signature_input_format) =
+        load_verify_signature(request, "verify signature")?;
+
+    enum PreparedVerifyInput {
+        Ed25519 {
+            input_bytes: Vec<u8>,
+            digest: Vec<u8>,
+        },
+        Prehashed(super::shared::Sha256InputDigest),
+    }
+
+    let prepared = match identity.algorithm {
+        Algorithm::Ed25519 => {
+            let input_bytes = load_input_bytes_with_limit(
+                &request.input,
+                "verify input",
+                BUFFERED_MESSAGE_INPUT_BYTES_LIMIT,
+            )?;
+            let digest = Sha256::digest(&input_bytes).to_vec();
+            PreparedVerifyInput::Ed25519 {
+                input_bytes,
+                digest,
+            }
+        }
+        Algorithm::P256 | Algorithm::Secp256k1 => {
+            PreparedVerifyInput::Prehashed(stream_sha256_input(&request.input, "verify input")?)
+        }
+    };
 
     let derived = derive_identity_key_material_with_defaults(identity, derivation, runner)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
     let diagnostics = vec![Diagnostic::info(
         "derived-verifier-material",
         format!(
@@ -160,8 +171,11 @@ where
         ),
     )];
 
-    match identity.algorithm {
-        Algorithm::Ed25519 => verify_seed_ed25519(
+    match prepared {
+        PreparedVerifyInput::Ed25519 {
+            input_bytes,
+            digest,
+        } => verify_seed_ed25519(
             request,
             identity,
             &input_bytes,
@@ -171,26 +185,29 @@ where
             signature_input_format,
             diagnostics,
         ),
-        Algorithm::P256 => verify_seed_p256(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            derived.expose_secret(),
-            signature_input_format,
-            diagnostics,
-        ),
-        Algorithm::Secp256k1 => verify_seed_secp256k1(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            derived.expose_secret(),
-            signature_input_format,
-            diagnostics,
-        ),
+        PreparedVerifyInput::Prehashed(digest) => match identity.algorithm {
+            Algorithm::P256 => verify_seed_p256_prehash(
+                request,
+                identity,
+                &signature_bytes,
+                &digest.digest,
+                digest.input_bytes,
+                derived.expose_secret(),
+                signature_input_format,
+                diagnostics,
+            ),
+            Algorithm::Secp256k1 => verify_seed_secp256k1_prehash(
+                request,
+                identity,
+                &signature_bytes,
+                &digest.digest,
+                digest.input_bytes,
+                derived.expose_secret(),
+                signature_input_format,
+                diagnostics,
+            ),
+            Algorithm::Ed25519 => unreachable!("ed25519 uses buffered input"),
+        },
     }
 }
 
@@ -216,14 +233,11 @@ where
         )));
     }
 
-    let loaded = load_verify_request(request)?;
-    let LoadedVerifyRequest {
-        input_bytes,
-        signature_bytes,
-        signature_input_format,
-    } = loaded;
+    ensure_single_verify_stdin_source(request)?;
+    let digest = stream_sha256_input(&request.input, "verify input")?;
+    let (signature_bytes, signature_input_format) =
+        load_verify_signature(request, "verify signature")?;
 
-    let digest = Sha256::digest(&input_bytes).to_vec();
     let public_key_der = export_native_public_key_der_with_runner(identity, runner)?;
     let verifying_key = load_p256_verifying_key(&public_key_der)?;
     let (signature, signature_format) = if request.format == InputFormat::Der {
@@ -231,7 +245,9 @@ where
     } else {
         parse_p256_verify_signature(&signature_bytes)?
     };
-    let verified = verifying_key.verify(&input_bytes, &signature).is_ok();
+    let verified = verifying_key
+        .verify_prehash(&digest.digest, &signature)
+        .is_ok();
 
     Ok((
         VerifyOperationResult {
@@ -240,8 +256,8 @@ where
             mode: Mode::Native,
             verified,
             digest_algorithm: crate::ops::native::DigestAlgorithm::Sha256,
-            digest_hex: hex_encode(&digest),
-            input_bytes: input_bytes.len(),
+            digest_hex: hex_encode(&digest.digest),
+            input_bytes: digest.input_bytes,
             signature_input_format,
             signature_bytes: signature_bytes.len(),
             signature_format,
@@ -274,22 +290,47 @@ where
         )));
     }
 
-    let loaded = load_verify_request(request)?;
-    let LoadedVerifyRequest {
-        input_bytes,
-        signature_bytes,
-        signature_input_format,
-    } = loaded;
+    ensure_single_verify_stdin_source(request)?;
+    let (signature_bytes, signature_input_format) =
+        load_verify_signature(request, "verify signature")?;
+
+    enum PreparedVerifyInput {
+        Ed25519 {
+            input_bytes: Vec<u8>,
+            digest: Vec<u8>,
+        },
+        Prehashed(super::shared::Sha256InputDigest),
+    }
+
+    let prepared = match identity.algorithm {
+        Algorithm::Ed25519 => {
+            let input_bytes = load_input_bytes_with_limit(
+                &request.input,
+                "verify input",
+                BUFFERED_MESSAGE_INPUT_BYTES_LIMIT,
+            )?;
+            let digest = Sha256::digest(&input_bytes).to_vec();
+            PreparedVerifyInput::Ed25519 {
+                input_bytes,
+                digest,
+            }
+        }
+        Algorithm::P256 | Algorithm::Secp256k1 => {
+            PreparedVerifyInput::Prehashed(stream_sha256_input(&request.input, "verify input")?)
+        }
+    };
 
     let seed_request = seed_verify_open_request(identity)?;
     let seed_plan = plan_open(&seed_request)?;
-    let digest = Sha256::digest(&input_bytes).to_vec();
     let derived = open_and_derive(backend, deriver, &seed_request)?;
     let diagnostics =
         seed_verify_diagnostics(identity, &seed_plan.warnings, derived.expose_secret().len());
 
-    match identity.algorithm {
-        Algorithm::Ed25519 => verify_seed_ed25519(
+    match prepared {
+        PreparedVerifyInput::Ed25519 {
+            input_bytes,
+            digest,
+        } => verify_seed_ed25519(
             request,
             identity,
             &input_bytes,
@@ -299,26 +340,29 @@ where
             signature_input_format,
             diagnostics,
         ),
-        Algorithm::P256 => verify_seed_p256(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            derived.expose_secret(),
-            signature_input_format,
-            diagnostics,
-        ),
-        Algorithm::Secp256k1 => verify_seed_secp256k1(
-            request,
-            identity,
-            &input_bytes,
-            &signature_bytes,
-            &digest,
-            derived.expose_secret(),
-            signature_input_format,
-            diagnostics,
-        ),
+        PreparedVerifyInput::Prehashed(digest) => match identity.algorithm {
+            Algorithm::P256 => verify_seed_p256_prehash(
+                request,
+                identity,
+                &signature_bytes,
+                &digest.digest,
+                digest.input_bytes,
+                derived.expose_secret(),
+                signature_input_format,
+                diagnostics,
+            ),
+            Algorithm::Secp256k1 => verify_seed_secp256k1_prehash(
+                request,
+                identity,
+                &signature_bytes,
+                &digest.digest,
+                digest.input_bytes,
+                derived.expose_secret(),
+                signature_input_format,
+                diagnostics,
+            ),
+            Algorithm::Ed25519 => unreachable!("ed25519 uses buffered input"),
+        },
     }
 }
 
@@ -368,12 +412,12 @@ fn verify_seed_ed25519(
     ))
 }
 
-fn verify_seed_p256(
+fn verify_seed_p256_prehash(
     request: &VerifyRequest,
     identity: &Identity,
-    input_bytes: &[u8],
     signature_bytes: &[u8],
     digest: &[u8],
+    input_bytes: usize,
     derived_seed: &[u8],
     signature_input_format: InputFormat,
     diagnostics: Vec<Diagnostic>,
@@ -392,7 +436,7 @@ fn verify_seed_p256(
     } else {
         parse_p256_verify_signature(signature_bytes)?
     };
-    let verified = verifying_key.verify(input_bytes, &signature).is_ok();
+    let verified = verifying_key.verify_prehash(digest, &signature).is_ok();
 
     Ok((
         VerifyOperationResult {
@@ -402,7 +446,7 @@ fn verify_seed_p256(
             verified,
             digest_algorithm: crate::ops::native::DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
-            input_bytes: input_bytes.len(),
+            input_bytes,
             signature_input_format,
             signature_bytes: signature_bytes.len(),
             signature_format,
@@ -411,12 +455,12 @@ fn verify_seed_p256(
     ))
 }
 
-fn verify_seed_secp256k1(
+fn verify_seed_secp256k1_prehash(
     request: &VerifyRequest,
     identity: &Identity,
-    input_bytes: &[u8],
     signature_bytes: &[u8],
     digest: &[u8],
+    input_bytes: usize,
     derived_seed: &[u8],
     signature_input_format: InputFormat,
     diagnostics: Vec<Diagnostic>,
@@ -435,8 +479,7 @@ fn verify_seed_secp256k1(
     } else {
         parse_k256_verify_signature(signature_bytes)?
     };
-    let verified =
-        k256::ecdsa::signature::Verifier::verify(verifying_key, input_bytes, &signature).is_ok();
+    let verified = verifying_key.verify_prehash(digest, &signature).is_ok();
 
     Ok((
         VerifyOperationResult {
@@ -446,7 +489,7 @@ fn verify_seed_secp256k1(
             verified,
             digest_algorithm: crate::ops::native::DigestAlgorithm::Sha256,
             digest_hex: hex_encode(digest),
-            input_bytes: input_bytes.len(),
+            input_bytes,
             signature_input_format,
             signature_bytes: signature_bytes.len(),
             signature_format,
