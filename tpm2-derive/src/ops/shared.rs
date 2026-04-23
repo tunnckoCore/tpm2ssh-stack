@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use secrecy::SecretBox;
@@ -172,15 +172,18 @@ pub(crate) fn resolve_prf_executor(identity: &Identity) -> Result<TpmPrfExecutor
     let metadata_parent = identity
         .metadata
         .get(PRF_PARENT_CONTEXT_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(identity, path));
+        .map(|path| resolve_state_path(identity, path))
+        .transpose()?;
     let metadata_public = identity
         .metadata
         .get(PRF_PUBLIC_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(identity, path));
+        .map(|path| resolve_state_path(identity, path))
+        .transpose()?;
     let metadata_private = identity
         .metadata
         .get(PRF_PRIVATE_PATH_METADATA_KEY)
-        .map(|path| resolve_state_path(identity, path));
+        .map(|path| resolve_state_path(identity, path))
+        .transpose()?;
 
     if let (Some(parent_context_path), Some(public_path), Some(private_path)) =
         (metadata_parent, metadata_public, metadata_private)
@@ -200,10 +203,27 @@ pub(crate) fn resolve_prf_executor(identity: &Identity) -> Result<TpmPrfExecutor
         let public_path = object_dir.join(public);
         let private_path = object_dir.join(private);
         if parent_context_path.is_file() && public_path.is_file() && private_path.is_file() {
+            let allowed_root = identity
+                .storage
+                .state_layout
+                .objects_dir
+                .join(&identity.name);
             return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadableObject {
-                parent_context_path,
-                public_path,
-                private_path,
+                parent_context_path: validate_existing_state_path_within_allowed_root(
+                    identity,
+                    &parent_context_path,
+                    &allowed_root,
+                )?,
+                public_path: validate_existing_state_path_within_allowed_root(
+                    identity,
+                    &public_path,
+                    &allowed_root,
+                )?,
+                private_path: validate_existing_state_path_within_allowed_root(
+                    identity,
+                    &private_path,
+                    &allowed_root,
+                )?,
             }));
         }
     }
@@ -212,6 +232,7 @@ pub(crate) fn resolve_prf_executor(identity: &Identity) -> Result<TpmPrfExecutor
         .metadata
         .get(PRF_CONTEXT_PATH_METADATA_KEY)
         .map(|path| resolve_state_path(identity, path))
+        .transpose()?
     {
         return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
             context_path,
@@ -221,8 +242,17 @@ pub(crate) fn resolve_prf_executor(identity: &Identity) -> Result<TpmPrfExecutor
     for file_name in ["prf-root.ctx", "root.ctx", "key.ctx"] {
         let candidate = object_dir.join(file_name);
         if candidate.is_file() {
+            let allowed_root = identity
+                .storage
+                .state_layout
+                .objects_dir
+                .join(&identity.name);
             return Ok(TpmPrfExecutor::v1(TpmPrfKeyHandle::LoadedContext {
-                context_path: candidate,
+                context_path: validate_existing_state_path_within_allowed_root(
+                    identity,
+                    &candidate,
+                    &allowed_root,
+                )?,
             }));
         }
     }
@@ -249,13 +279,73 @@ fn base_context(effective: &EffectiveDerivationInputs) -> CryptoDerivationContex
     context
 }
 
-fn resolve_state_path(identity: &Identity, value: &str) -> PathBuf {
+fn resolve_state_path(identity: &Identity, value: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        identity.storage.state_layout.root_dir.join(path)
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Error::State(format!(
+            "identity '{}' metadata path '{}' must stay within the identity object state",
+            identity.name, value
+        )));
     }
+
+    let resolved = identity.storage.state_layout.root_dir.join(path);
+    let allowed_root = identity
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&identity.name);
+    if !resolved.starts_with(&allowed_root) {
+        return Err(Error::State(format!(
+            "identity '{}' metadata path '{}' must stay within '{}'",
+            identity.name,
+            value,
+            allowed_root.display()
+        )));
+    }
+
+    if resolved.exists() {
+        validate_existing_state_path_within_allowed_root(identity, &resolved, &allowed_root)
+    } else {
+        Ok(resolved)
+    }
+}
+
+fn validate_existing_state_path_within_allowed_root(
+    identity: &Identity,
+    path: &Path,
+    allowed_root: &Path,
+) -> Result<PathBuf> {
+    let canonical_root = fs::canonicalize(allowed_root).map_err(|error| {
+        Error::State(format!(
+            "failed to resolve canonical state root '{}' for identity '{}': {error}",
+            allowed_root.display(),
+            identity.name
+        ))
+    })?;
+    let canonical_path = fs::canonicalize(path).map_err(|error| {
+        Error::State(format!(
+            "failed to resolve canonical metadata path '{}' for identity '{}': {error}",
+            path.display(),
+            identity.name
+        ))
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(Error::State(format!(
+            "identity '{}' metadata path '{}' resolved outside '{}'",
+            identity.name,
+            path.display(),
+            canonical_root.display()
+        )));
+    }
+
+    Ok(canonical_path)
 }
 
 fn temporary_workspace_root(kind: &str, _identity: &str) -> Result<PathBuf> {
@@ -785,6 +875,10 @@ mod tests {
     use secrecy::ExposeSecret;
     use tempfile::tempdir;
 
+    use crate::model::{
+        Algorithm, Identity, IdentityModeResolution, Mode, ModePreference, StateLayout, UseCase,
+    };
+
     fn assert_secret_bytes(_: &SecretBytes) {}
 
     #[test]
@@ -854,5 +948,37 @@ mod tests {
         .expect_err("oversized input should fail");
 
         assert!(matches!(error, Error::Validation(message) if message.contains("byte limit")));
+    }
+
+    #[test]
+    fn resolve_prf_executor_rejects_absolute_metadata_paths() {
+        let tempdir = tempdir().expect("tempdir");
+        let state_layout = StateLayout::new(tempdir.path().to_path_buf());
+        state_layout.ensure_dirs().expect("state dirs");
+        let mut identity = Identity::new(
+            "prf-escape".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign],
+            IdentityModeResolution {
+                requested: ModePreference::Prf,
+                resolved: Mode::Prf,
+                reasons: vec!["prf requested".to_string()],
+            },
+            state_layout,
+        );
+        identity.metadata.insert(
+            PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+            "/tmp/prf-root.ctx".to_string(),
+        );
+
+        let error =
+            resolve_prf_executor(&identity).expect_err("absolute metadata path should be rejected");
+        assert!(matches!(
+            error,
+            Error::State(message)
+                if message.contains("must stay within the identity object state")
+                    || message.contains("must stay within '")
+        ));
+        assert_eq!(identity.mode.resolved, Mode::Prf);
     }
 }

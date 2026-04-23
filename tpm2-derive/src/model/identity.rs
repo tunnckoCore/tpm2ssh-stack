@@ -184,6 +184,22 @@ impl Identity {
             ))
         })?;
 
+        if identity.name != name {
+            return Err(Error::State(format!(
+                "identity file '{}' declared name '{}' but was loaded as '{}'; recreate the identity instead of repointing persisted state",
+                identity_path.display(),
+                identity.name,
+                name,
+            )));
+        }
+        UseCase::validate_for_mode(&identity.uses, identity.mode.resolved).map_err(|error| {
+            Error::State(format!(
+                "identity '{}' from '{}' failed mode/use validation: {error}",
+                name,
+                identity_path.display()
+            ))
+        })?;
+
         identity.storage.state_layout = state_layout;
         identity.storage.identity_path = identity_path;
 
@@ -372,6 +388,82 @@ mod tests {
             .expect_err("oversized identity JSON should fail closed");
         assert!(
             matches!(error, Error::Validation(message) if message.contains("identity 'oversized'") && message.contains("limit"))
+        );
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn load_named_rejects_repointed_identity_name() {
+        let root_dir = unique_temp_path("identity-repoint-name");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("create state layout");
+        let identity = Identity::new(
+            "prod-signer".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+            IdentityModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            state_layout.clone(),
+        );
+        identity.persist().expect("persist identity");
+
+        let identity_path = state_layout.identity_path("prod-signer");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&identity_path).expect("identity json"))
+                .expect("parse identity json");
+        value["name"] = serde_json::Value::String("other-identity".to_string());
+        fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&value).expect("json bytes"),
+        )
+        .expect("rewrite identity json");
+
+        let error = Identity::load_named("prod-signer", Some(root_dir.clone()))
+            .expect_err("repointed identity name should fail");
+        assert!(
+            matches!(error, Error::State(message) if message.contains("recreate the identity instead of repointing persisted state"))
+        );
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn load_named_rejects_invalid_mode_use_combinations() {
+        let root_dir = unique_temp_path("identity-invalid-uses");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("create state layout");
+        let identity = Identity::new(
+            "prod-signer".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign, UseCase::Verify],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            state_layout.clone(),
+        );
+        identity.persist().expect("persist identity");
+
+        let identity_path = state_layout.identity_path("prod-signer");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&identity_path).expect("identity json"))
+                .expect("parse identity json");
+        value["uses"] = serde_json::json!(["sign", "ssh"]);
+        fs::write(
+            &identity_path,
+            serde_json::to_vec_pretty(&value).expect("json bytes"),
+        )
+        .expect("rewrite identity json");
+
+        let error = Identity::load_named("prod-signer", Some(root_dir.clone()))
+            .expect_err("invalid use bits should fail");
+        assert!(
+            matches!(error, Error::State(message) if message.contains("failed mode/use validation"))
         );
 
         fs::remove_dir_all(root_dir).expect("cleanup");

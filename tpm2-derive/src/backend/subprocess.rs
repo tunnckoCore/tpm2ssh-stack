@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -112,6 +113,7 @@ pub fn resolve_trusted_program_path(program: &str) -> std::io::Result<PathBuf> {
     ))
 }
 
+#[cfg(any(test, feature = "real-tpm-tests"))]
 fn resolve_program_override(program: &str) -> std::io::Result<Option<PathBuf>> {
     let override_var = program_override_var(program);
     let Some(path) = std::env::var_os(&override_var) else {
@@ -132,6 +134,12 @@ fn resolve_program_override(program: &str) -> std::io::Result<Option<PathBuf>> {
     ))
 }
 
+#[cfg(not(any(test, feature = "real-tpm-tests")))]
+fn resolve_program_override(_program: &str) -> std::io::Result<Option<PathBuf>> {
+    Ok(None)
+}
+
+#[cfg(any(test, feature = "real-tpm-tests"))]
 fn program_override_var(program: &str) -> String {
     format!(
         "TPM2_DERIVE_{}_BIN",
@@ -173,7 +181,13 @@ impl CommandRunner for ProcessCommandRunner {
             }
         };
 
-        match Command::new(&program).args(&invocation.args).output() {
+        let mut command = Command::new(&program);
+        command.env_clear();
+        if let Some(tcti) = trusted_tpm2tools_tcti_env() {
+            command.env("TPM2TOOLS_TCTI", tcti);
+        }
+
+        match command.args(&invocation.args).output() {
             Ok(output) => CommandOutput {
                 exit_code: output.status.code(),
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -188,6 +202,16 @@ impl CommandRunner for ProcessCommandRunner {
             },
         }
     }
+}
+
+#[cfg(any(test, feature = "real-tpm-tests"))]
+fn trusted_tpm2tools_tcti_env() -> Option<OsString> {
+    std::env::var_os("TPM2TOOLS_TCTI")
+}
+
+#[cfg(not(any(test, feature = "real-tpm-tests")))]
+fn trusted_tpm2tools_tcti_env() -> Option<OsString> {
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

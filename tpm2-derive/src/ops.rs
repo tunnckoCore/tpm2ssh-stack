@@ -21,7 +21,9 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
@@ -104,7 +106,7 @@ where
     } else {
         match identity.mode.resolved {
             Mode::Native => {
-                let _setup_guard = acquire_native_setup_lock(&identity);
+                let _setup_guard = acquire_native_setup_lock(&identity)?;
                 ensure_identity_does_not_exist(&identity)?;
                 let materialized = materialize_native_setup(&mut identity, runner)?;
                 if let Err(error) = identity.persist() {
@@ -1205,6 +1207,16 @@ where
     let _allocation_guard = native_handle_allocation_lock()
         .lock()
         .expect("native handle allocation lock poisoned");
+    #[cfg(unix)]
+    let _allocation_process_guard = acquire_process_file_lock(
+        &identity
+            .storage
+            .state_layout
+            .root_dir
+            .join("locks")
+            .join("native-handle-allocation.lock"),
+        "native handle allocation",
+    )?;
 
     for _attempt in 0..NATIVE_SETUP_HANDLE_RETRY_LIMIT {
         let persistent_handle = allocate_native_persistent_handle(runner)?;
@@ -1428,6 +1440,8 @@ impl NativeSetupLocks {
 
 struct NativeSetupGuard {
     key: PathBuf,
+    #[cfg(unix)]
+    process_guard: ProcessFileLockGuard,
 }
 
 impl Drop for NativeSetupGuard {
@@ -1436,6 +1450,18 @@ impl Drop for NativeSetupGuard {
         let mut active = locks.active.lock().expect("native setup lock poisoned");
         active.remove(&self.key);
         locks.ready.notify_all();
+    }
+}
+
+#[cfg(unix)]
+struct ProcessFileLockGuard {
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessFileLockGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -1450,7 +1476,7 @@ enum NativeSetupAttemptError {
     Fatal(Error),
 }
 
-fn acquire_native_setup_lock(identity: &Identity) -> NativeSetupGuard {
+fn acquire_native_setup_lock(identity: &Identity) -> Result<NativeSetupGuard> {
     let key = identity.storage.identity_path.clone();
     let locks = NativeSetupLocks::global();
     let mut active = locks.active.lock().expect("native setup lock poisoned");
@@ -1461,11 +1487,68 @@ fn acquire_native_setup_lock(identity: &Identity) -> NativeSetupGuard {
             .expect("native setup lock poisoned while waiting");
     }
     active.insert(key.clone());
-    NativeSetupGuard { key }
+
+    #[cfg(unix)]
+    let process_guard = match acquire_process_file_lock(
+        &identity
+            .storage
+            .state_layout
+            .root_dir
+            .join("locks")
+            .join(format!("native-setup-{}.lock", identity.name)),
+        "native setup",
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            active.remove(&key);
+            locks.ready.notify_all();
+            return Err(error);
+        }
+    };
+
+    Ok(NativeSetupGuard {
+        key,
+        #[cfg(unix)]
+        process_guard,
+    })
 }
 
 fn native_handle_allocation_lock() -> &'static Mutex<()> {
     NATIVE_HANDLE_ALLOCATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(unix)]
+fn acquire_process_file_lock(path: &Path, label: &str) -> Result<ProcessFileLockGuard> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        Error::State(format!(
+            "failed to create {label} lock directory '{}': {error}",
+            parent.display()
+        ))
+    })?;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let file = options.open(path).map_err(|error| {
+        Error::State(format!(
+            "failed to open {label} lock file '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let flock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if flock_result != 0 {
+        return Err(Error::State(format!(
+            "failed to acquire {label} lock '{}': {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(ProcessFileLockGuard { _file: file })
 }
 
 pub(crate) fn resolve_native_key_locator(identity: &Identity) -> Result<NativeKeyLocator> {
@@ -1475,7 +1558,7 @@ pub(crate) fn resolve_native_key_locator(identity: &Identity) -> Result<NativeKe
             "native.serialized_handle_path",
             "native.serialized-handle-path",
         ],
-    ) {
+    )? {
         if path.is_file() {
             return Ok(NativeKeyLocator::SerializedHandle { path });
         }
@@ -1703,13 +1786,66 @@ fn native_handle_path(identity: &Identity) -> PathBuf {
     native_state_dir(identity).join(format!("{}.handle", native_key_id(identity)))
 }
 
-pub(crate) fn metadata_path(identity: &Identity, keys: &[&str]) -> Option<PathBuf> {
-    let value = metadata_value(identity, keys)?;
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Some(path)
+pub(crate) fn metadata_path(identity: &Identity, keys: &[&str]) -> Result<Option<PathBuf>> {
+    let Some(value) = metadata_value(identity, keys) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(&value);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Error::State(format!(
+            "identity '{}' metadata path '{}' must stay within the identity object state",
+            identity.name, value
+        )));
+    }
+
+    let resolved = identity.storage.state_layout.root_dir.join(path);
+    let allowed_root = identity
+        .storage
+        .state_layout
+        .objects_dir
+        .join(&identity.name);
+    if !resolved.starts_with(&allowed_root) {
+        return Err(Error::State(format!(
+            "identity '{}' metadata path '{}' must stay within '{}'",
+            identity.name,
+            value,
+            allowed_root.display()
+        )));
+    }
+
+    if resolved.exists() {
+        let canonical_root = fs::canonicalize(&allowed_root).map_err(|error| {
+            Error::State(format!(
+                "failed to resolve canonical state root '{}' for identity '{}': {error}",
+                allowed_root.display(),
+                identity.name
+            ))
+        })?;
+        let canonical_path = fs::canonicalize(&resolved).map_err(|error| {
+            Error::State(format!(
+                "failed to resolve canonical metadata path '{}' for identity '{}': {error}",
+                resolved.display(),
+                identity.name
+            ))
+        })?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(Error::State(format!(
+                "identity '{}' metadata path '{}' resolved outside '{}'",
+                identity.name,
+                resolved.display(),
+                canonical_root.display()
+            )));
+        }
+        Ok(Some(canonical_path))
     } else {
-        Some(identity.storage.state_layout.root_dir.join(path))
+        Ok(Some(resolved))
     }
 }
 
@@ -2037,34 +2173,14 @@ fn secret_key_export_default_suffix(format: Format) -> &'static str {
 }
 
 fn write_public_key_output(path: &Path, public_key: &[u8]) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|error| {
+    shared::with_output_file(path, |file| {
+        file.write_all(public_key).map_err(|error| {
             Error::State(format!(
-                "failed to create export directory '{}': {error}",
-                parent.display()
+                "failed to write public key export to '{}': {error}",
+                path.display()
             ))
-        })?;
-    }
-
-    fs::write(path, public_key).map_err(|error| {
-        Error::State(format!(
-            "failed to write public key export to '{}': {error}",
-            path.display()
-        ))
-    })?;
-
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-        Error::State(format!(
-            "failed to set permissions on '{}': {error}",
-            path.display()
-        ))
-    })?;
-
-    Ok(())
+        })
+    })
 }
 
 fn remove_path_if_present(path: &Path) {
@@ -2462,6 +2578,40 @@ mod tests {
         assert!(
             matches!(error, Error::State(message) if message.contains("serialized handle state") && message.contains("raw persistent handle"))
         );
+
+        fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
+    }
+
+    #[test]
+    fn resolve_native_key_locator_rejects_absolute_metadata_paths() {
+        let root_dir = unique_temp_path("native-locator-absolute-path");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let mut identity = Identity::new(
+            "prod-signer".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            state_layout,
+        );
+        identity.metadata.insert(
+            "native.serialized_handle_path".to_string(),
+            "/tmp/escape.handle".to_string(),
+        );
+
+        let error = resolve_native_key_locator(&identity)
+            .expect_err("absolute metadata path should be rejected");
+        assert!(matches!(
+            error,
+            Error::State(message)
+                if message.contains("must stay within the identity object state")
+                    || message.contains("must stay within '")
+        ));
 
         fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
     }
@@ -3022,6 +3172,34 @@ mod tests {
         let exported = fs::read_to_string(&result.artifact.path).expect("pem output");
         assert!(exported.starts_with("-----BEGIN PUBLIC KEY-----\n"));
         assert!(exported.ends_with("-----END PUBLIC KEY-----\n"));
+
+        fs::remove_dir_all(root_dir).expect("temporary native export state should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_native_public_key_rejects_symlink_output_path() {
+        let root_dir = unique_temp_path("export-native-public-key-symlink");
+        let (identity, _) = persisted_native_export_profile(&root_dir);
+
+        let target_path = root_dir.join("custom").join("target.pub");
+        fs::create_dir_all(target_path.parent().expect("target parent")).expect("target dir");
+        fs::write(&target_path, b"sentinel").expect("target file");
+        let symlink_path = root_dir.join("custom").join("symlink.pub");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("symlink");
+
+        let error = export_native_public_key_with_runner(
+            &identity,
+            Some(symlink_path.as_path()),
+            Format::Pem,
+            &FakeNativeExportRunner::success(example_spki_der()),
+        )
+        .expect_err("symlink output path should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("must not be a symlink"))
+        );
+        assert_eq!(fs::read(&target_path).expect("target bytes"), b"sentinel");
 
         fs::remove_dir_all(root_dir).expect("temporary native export state should be removed");
     }

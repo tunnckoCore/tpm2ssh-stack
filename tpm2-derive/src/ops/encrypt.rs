@@ -20,8 +20,9 @@ use super::seed::{
     seed_profile_from_profile,
 };
 use super::shared::{
-    encrypt_command_spec, ensure_derivation_overrides_allowed, execute_prf_derivation_with_runner,
-    resolve_effective_derivation_inputs,
+    BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT, encrypt_command_spec,
+    ensure_derivation_overrides_allowed, execute_prf_derivation_with_runner,
+    read_reader_bytes_with_limit, resolve_effective_derivation_inputs,
 };
 
 const NONCE_LEN: usize = 12;
@@ -30,6 +31,7 @@ const FRAME_LENGTH_BYTES: usize = 4;
 const AEAD_TAG_BYTES: usize = 16;
 const STREAM_FRAME_PLAINTEXT_BYTES: usize = 64 * 1024;
 const STREAM_ENVELOPE_MAGIC: [u8; 8] = *b"TPM2ENC1";
+const STREAM_FINAL_FRAME_BYTES: usize = FRAME_LENGTH_BYTES + AEAD_TAG_BYTES;
 
 pub(crate) const INLINE_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 
@@ -544,6 +546,19 @@ where
         })?;
     }
 
+    let final_nonce = frame_nonce(&nonce_prefix, chunk_index);
+    let final_frame = cipher
+        .encrypt(Nonce::from_slice(&final_nonce), &[] as &[u8])
+        .map_err(|error| Error::Internal(format!("AEAD encrypt failed: {error}")))?;
+    write_all(
+        output,
+        &0u32.to_le_bytes(),
+        "stream ciphertext final frame length",
+    )?;
+    write_all(output, &final_frame, "stream ciphertext final frame")?;
+    debug_assert_eq!(final_frame.len(), AEAD_TAG_BYTES);
+    ciphertext_bytes = checked_add(ciphertext_bytes, STREAM_FINAL_FRAME_BYTES, "ciphertext")?;
+
     Ok(StreamIoStats {
         plaintext_bytes,
         ciphertext_bytes,
@@ -569,10 +584,11 @@ where
         reader.consume(STREAM_ENVELOPE_MAGIC.len());
         decrypt_stream_envelope_to_writer(key, &mut reader, output)
     } else {
-        let mut legacy = Vec::new();
-        reader
-            .read_to_end(&mut legacy)
-            .map_err(|error| Error::State(format!("failed to read ciphertext stream: {error}")))?;
+        let legacy = read_reader_bytes_with_limit(
+            &mut reader,
+            "legacy ciphertext stream",
+            BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT,
+        )?;
         let plaintext = aead_decrypt_legacy(key, &legacy)?;
         write_all(output, &plaintext, "legacy plaintext output")?;
         Ok(StreamIoStats {
@@ -602,7 +618,56 @@ where
     let mut ciphertext_bytes = STREAM_ENVELOPE_MAGIC.len() + STORED_NONCE_PREFIX_LEN;
     let mut chunk_index = 0u32;
 
-    while let Some(frame_length) = read_frame_length(reader)? {
+    loop {
+        let Some(frame_length) = read_frame_length(reader)? else {
+            return Err(Error::Validation(
+                "ciphertext stream ended before the final authentication frame".to_string(),
+            ));
+        };
+
+        if frame_length == 0 {
+            let mut final_frame = [0u8; AEAD_TAG_BYTES];
+            reader.read_exact(&mut final_frame).map_err(|error| {
+                Error::Validation(format!(
+                    "ciphertext stream ended before the final authentication frame was fully read: {error}"
+                ))
+            })?;
+            let nonce = frame_nonce(&nonce_prefix, chunk_index);
+            let final_plaintext = cipher
+                .decrypt(Nonce::from_slice(&nonce), final_frame.as_ref())
+                .map_err(|_| {
+                    Error::Validation(
+                        "AEAD decryption failed: invalid ciphertext or key".to_string(),
+                    )
+                })?;
+            if !final_plaintext.is_empty() {
+                return Err(Error::Validation(
+                    "ciphertext final authentication frame must decrypt to an empty payload"
+                        .to_string(),
+                ));
+            }
+            ciphertext_bytes =
+                checked_add(ciphertext_bytes, STREAM_FINAL_FRAME_BYTES, "ciphertext")?;
+
+            let mut trailing = [0u8; 1];
+            let trailing_bytes = reader.read(&mut trailing).map_err(|error| {
+                Error::State(format!(
+                    "failed to inspect trailing ciphertext bytes after the final authentication frame: {error}"
+                ))
+            })?;
+            if trailing_bytes != 0 {
+                return Err(Error::Validation(
+                    "ciphertext stream contains trailing bytes after the final authentication frame"
+                        .to_string(),
+                ));
+            }
+
+            return Ok(StreamIoStats {
+                plaintext_bytes,
+                ciphertext_bytes,
+            });
+        }
+
         let frame_plaintext_bytes = usize::try_from(frame_length).map_err(|_| {
             Error::Validation("ciphertext frame length exceeded implementation limits".to_string())
         })?;
@@ -611,11 +676,6 @@ where
                 "ciphertext frame declared {} plaintext bytes; the maximum supported frame size is {} bytes",
                 frame_plaintext_bytes, STREAM_FRAME_PLAINTEXT_BYTES
             )));
-        }
-        if frame_plaintext_bytes == 0 {
-            return Err(Error::Validation(
-                "ciphertext frame length must not be zero".to_string(),
-            ));
         }
 
         let sealed_len = checked_add(frame_plaintext_bytes, AEAD_TAG_BYTES, "ciphertext frame")?;
@@ -643,11 +703,6 @@ where
             Error::Validation("ciphertext exceeded the maximum supported chunk count".to_string())
         })?;
     }
-
-    Ok(StreamIoStats {
-        plaintext_bytes,
-        ciphertext_bytes,
-    })
 }
 
 fn read_frame_length(reader: &mut impl Read) -> Result<Option<u32>> {
@@ -1016,6 +1071,58 @@ mod tests {
         assert_eq!(stats.ciphertext_bytes, ciphertext.len());
         assert_eq!(stats.plaintext_bytes, plaintext.len());
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn stream_decrypt_rejects_oversized_legacy_ciphertext() {
+        let key = [0x44; 32];
+        let ciphertext = vec![0x99; BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT + 1];
+        let mut output = Vec::new();
+
+        let error = decrypt_reader_to_writer(&key, &mut Cursor::new(&ciphertext), &mut output)
+            .expect_err("oversized legacy ciphertext should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("legacy ciphertext stream") && message.contains("byte limit"))
+        );
+    }
+
+    #[test]
+    fn stream_decrypt_rejects_truncated_stream_ciphertext() {
+        let state_root = tempdir().expect("state root");
+        let identity = seed_identity(state_root.path());
+        let backend = FakeSeedBackend::new(&[0x33; 32]);
+        let runner = RecordingPrfRunner::new(b"unused");
+        let plaintext = vec![0x7a; STREAM_FRAME_PLAINTEXT_BYTES + 17];
+        let mut ciphertext = Vec::new();
+
+        encrypt_stream(
+            &identity,
+            &mut Cursor::new(&plaintext),
+            &mut ciphertext,
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect("stream encrypt");
+        ciphertext.truncate(ciphertext.len() - STREAM_FINAL_FRAME_BYTES);
+
+        let mut output = Vec::new();
+        let error = decrypt_stream(
+            &identity,
+            &mut Cursor::new(&ciphertext),
+            &mut output,
+            &DerivationOverrides::default(),
+            &runner,
+            &backend,
+            &HkdfSha256SeedDeriver,
+        )
+        .expect_err("truncated stream ciphertext should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("final authentication frame"))
+        );
     }
 
     #[test]

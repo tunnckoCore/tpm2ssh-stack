@@ -73,7 +73,15 @@ pub fn default_state_root() -> PathBuf {
             .join("tpm2-derive");
     }
 
-    PathBuf::from(".tpm2-derive")
+    #[cfg(unix)]
+    {
+        return PathBuf::from("/dev/null").join("tpm2-derive-state-dir-required");
+    }
+
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(".").join("tpm2-derive-state-dir-required")
+    }
 }
 
 #[cfg(test)]

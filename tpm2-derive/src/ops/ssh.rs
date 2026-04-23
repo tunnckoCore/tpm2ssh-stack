@@ -46,6 +46,7 @@ impl SshAddClient for ProcessSshAddClient {
         })?;
 
         let mut child = Command::new(program)
+            .env_clear()
             .args(["-q", "-"])
             .env("SSH_AUTH_SOCK", socket)
             .stdin(Stdio::piped())
@@ -442,6 +443,12 @@ fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
                 path.display()
             )));
         }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return Err(Error::Validation(format!(
+                "ssh-add requires socket '{}' to not be writable by group or other users",
+                path.display()
+            )));
+        }
 
         if let Some(parent) = path.parent() {
             let parent_metadata = fs::metadata(parent).map_err(|error| {
@@ -638,6 +645,22 @@ mod tests {
 
         let resolved = resolve_socket(Some(&socket_path)).expect("socket should validate");
         assert_eq!(resolved, socket_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_socket_rejects_group_accessible_socket_permissions() {
+        let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
+            .expect("chmod socket");
+
+        let error =
+            resolve_socket(Some(&socket_path)).expect_err("group-accessible socket should fail");
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("writable by group or other users"))
+        );
     }
 
     #[cfg(unix)]

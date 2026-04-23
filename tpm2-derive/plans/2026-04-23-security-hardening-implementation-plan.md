@@ -154,7 +154,7 @@ This plan is written for multiple agents working in parallel.
 - [x] wrap unavoidable temporary secret buffers in zeroizing containers
 - [x] zeroize temporary key/scalar/symmetric-key buffers after use
 - [x] minimize secret-bearing `String` creation in export and ssh-add flows
-- [ ] audit temp-file secret lifetime and shorten it where practical
+- [x] audit temp-file secret lifetime and shorten it where practical
 
 ### Acceptance checks
 

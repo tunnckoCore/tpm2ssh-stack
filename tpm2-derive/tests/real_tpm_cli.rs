@@ -580,6 +580,109 @@ fn decrypt_cli_requires_explicit_plaintext_egress_with_real_swtpm() {
 }
 
 #[test]
+fn decrypt_rejects_oversized_legacy_ciphertext_with_real_swtpm() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity = create_identity(
+        &harness,
+        "seed-legacy-decrypt-limit",
+        Algorithm::Ed25519,
+        ModePreference::Seed,
+        vec![UseCase::Encrypt, UseCase::Decrypt],
+        DerivationOverrides::default(),
+    );
+
+    let oversized_bytes = (8 * 1024 * 1024 + 1) as u64;
+    let ciphertext_path = harness.workspace_path("oversized-legacy.ciphertext.bin");
+    fs::File::create(&ciphertext_path)
+        .expect("create oversized legacy ciphertext")
+        .set_len(oversized_bytes)
+        .expect("size oversized legacy ciphertext");
+    let output_path = harness.workspace_path("oversized-legacy.plaintext.bin");
+
+    let result = run_cli_json(vec![
+        "tpm2-derive".to_string(),
+        "--json".to_string(),
+        "decrypt".to_string(),
+        "--with".to_string(),
+        identity.name.clone(),
+        "--input".to_string(),
+        ciphertext_path.display().to_string(),
+        "--output".to_string(),
+        output_path.display().to_string(),
+        "--state-dir".to_string(),
+        harness.state_dir().display().to_string(),
+    ]);
+
+    assert_eq!(result["ok"], Value::Bool(false));
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("legacy ciphertext stream")
+    );
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("limit")
+    );
+}
+
+#[test]
+fn stream_decrypt_rejects_truncated_ciphertext_with_real_swtpm() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let runner = ProcessCommandRunner;
+    let identity = create_identity(
+        &harness,
+        "seed-stream-truncate-real",
+        Algorithm::P256,
+        ModePreference::Seed,
+        vec![UseCase::Encrypt, UseCase::Decrypt],
+        DerivationOverrides::default(),
+    );
+    let plaintext = vec![0x73; 256 * 1024 + 23];
+    let ciphertext_path = harness.workspace_path("truncated-stream.ciphertext.bin");
+    let decrypted_path = harness.workspace_path("truncated-stream.plaintext.bin");
+
+    let mut plaintext_reader = Cursor::new(&plaintext);
+    let mut ciphertext_writer = fs::File::create(&ciphertext_path).expect("ciphertext file");
+    encrypt::encrypt_stream_with_defaults(
+        &identity,
+        &mut plaintext_reader,
+        &mut ciphertext_writer,
+        &DerivationOverrides::default(),
+        &runner,
+    )
+    .expect("stream encrypt");
+    drop(ciphertext_writer);
+
+    let original_len = fs::metadata(&ciphertext_path)
+        .expect("ciphertext metadata")
+        .len();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&ciphertext_path)
+        .expect("open ciphertext for truncate")
+        .set_len(original_len - 20)
+        .expect("truncate final authentication frame");
+
+    let mut ciphertext_reader = fs::File::open(&ciphertext_path).expect("ciphertext input");
+    let mut plaintext_writer = fs::File::create(&decrypted_path).expect("plaintext file");
+    let error = encrypt::decrypt_stream_with_defaults(
+        &identity,
+        &mut ciphertext_reader,
+        &mut plaintext_writer,
+        &DerivationOverrides::default(),
+        &runner,
+    )
+    .expect_err("truncated stream ciphertext should fail");
+
+    assert!(
+        matches!(error, Error::Validation(message) if message.contains("final authentication frame"))
+    );
+}
+
+#[test]
 fn seed_and_prf_stream_encrypt_large_payloads_against_real_swtpm() {
     let harness = RealTpmHarness::start().expect("start swtpm harness");
     let runner = ProcessCommandRunner;
