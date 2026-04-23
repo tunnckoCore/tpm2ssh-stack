@@ -22,7 +22,6 @@ impl NativeAlgorithmCapability {
         let mut supported = Vec::new();
         if self.sign {
             supported.push(UseCase::Sign);
-            supported.push(UseCase::Ssh);
             if self.verify {
                 supported.push(UseCase::Verify);
             }
@@ -41,7 +40,7 @@ impl NativeAlgorithmCapability {
             UseCase::All => false,
             UseCase::Sign => self.sign,
             UseCase::Verify => self.sign && self.verify,
-            UseCase::Ssh => self.sign,
+            UseCase::Ssh => false,
             UseCase::Encrypt => self.encrypt,
             UseCase::Decrypt => self.decrypt,
             UseCase::ExportSecret => false,
@@ -154,4 +153,29 @@ pub struct CapabilityReport {
     pub recommended_mode: Option<Mode>,
     pub recommendation_reasons: Vec<String>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NativeAlgorithmCapability, NativeCapabilitySummary, mode_supported_uses};
+    use crate::model::{Algorithm, Mode, UseCase};
+
+    #[test]
+    fn native_supported_uses_exclude_ssh() {
+        let native = NativeCapabilitySummary {
+            algorithms: vec![NativeAlgorithmCapability {
+                algorithm: Algorithm::P256,
+                sign: true,
+                verify: true,
+                encrypt: false,
+                decrypt: false,
+            }],
+        };
+
+        assert_eq!(
+            mode_supported_uses(Mode::Native, Some(Algorithm::P256), &native),
+            vec![UseCase::Sign, UseCase::Verify]
+        );
+        assert!(!native.supports_use(Algorithm::P256, UseCase::Ssh));
+    }
 }

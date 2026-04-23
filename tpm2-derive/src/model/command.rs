@@ -109,6 +109,7 @@ pub struct DecryptRequest {
     pub identity: String,
     pub input: InputSource,
     pub output: Option<PathBuf>,
+    pub allow_plaintext_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -181,6 +182,8 @@ pub struct SshAddRequest {
     pub comment: Option<String>,
     pub socket: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
+    pub reason: Option<String>,
+    pub confirm: bool,
     pub derivation: DerivationOverrides,
 }
 

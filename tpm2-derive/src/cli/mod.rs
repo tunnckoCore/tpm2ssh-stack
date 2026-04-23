@@ -216,6 +216,8 @@ fn run_ssh_add(json: bool, args: SshAddArgs) -> Result<String> {
         comment: args.comment.clone(),
         socket: args.socket.clone(),
         state_dir: args.state_dir.clone(),
+        reason: args.reason.clone(),
+        confirm: args.confirm,
         derivation: derivation_overrides(args.derivation.clone()),
     };
 
@@ -310,6 +312,22 @@ fn run_decrypt(json: bool, args: DecryptArgs) -> Result<String> {
             );
         }
     };
+
+    if args.output.is_none() && !args.allow_plaintext_output {
+        let error = Error::Validation(
+            "decrypt requires --output or --allow-plaintext-output because decrypted plaintext is secret-bearing"
+                .to_string(),
+        );
+        return failure(
+            json,
+            command,
+            ErrorEnvelope {
+                code: error.code().as_str().to_string(),
+                message: error.to_string(),
+            },
+            Vec::new(),
+        );
+    }
 
     let raw_input = load_input_bytes(&parse_input_source(&args.input), "decrypt input")?;
     // Try to interpret as hex first (the format we emit), otherwise use raw bytes.
@@ -667,6 +685,7 @@ fn build_placeholder_request(operation: &str, identity: String) -> serde_json::V
             identity,
             input: InputSource::Stdin,
             output: None,
+            allow_plaintext_output: false,
         })
         .unwrap_or_default(),
         "export" => serde_json::to_value(ExportRequest {
@@ -685,6 +704,8 @@ fn build_placeholder_request(operation: &str, identity: String) -> serde_json::V
             comment: None,
             socket: None,
             state_dir: None,
+            reason: None,
+            confirm: false,
             derivation: DerivationOverrides::default(),
         })
         .unwrap_or_default(),
@@ -1561,6 +1582,49 @@ mod tests {
             diagnostic.code == "seed-verifier-derived"
                 && diagnostic.message.contains(SEED_SIGNING_KEY_NAMESPACE)
         }));
+    }
+
+    #[test]
+    fn decrypt_requires_explicit_plaintext_egress_choice() {
+        let state_root = tempdir().expect("state root");
+        let identity = Identity::new(
+            "seed-box".to_string(),
+            Algorithm::Ed25519,
+            vec![UseCase::Encrypt, UseCase::Decrypt],
+            IdentityModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            StateLayout::new(state_root.path().to_path_buf()),
+        );
+        identity.persist().expect("persist identity");
+
+        let ciphertext_path = state_root.path().join("ciphertext.hex");
+        fs::write(&ciphertext_path, "0011").expect("ciphertext placeholder");
+
+        let output = run(Cli::try_parse_from([
+            "tpm2-derive",
+            "--json",
+            "decrypt",
+            "--with",
+            &identity.name,
+            "--input",
+            &ciphertext_path.display().to_string(),
+            "--state-dir",
+            &state_root.path().display().to_string(),
+        ])
+        .expect("cli parse"))
+        .expect("structured failure output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
+
+        assert_eq!(value["ok"], Value::Bool(false));
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .expect("error message")
+                .contains("--allow-plaintext-output")
+        );
     }
 
     fn hex_decode_test(hex: &str) -> Vec<u8> {

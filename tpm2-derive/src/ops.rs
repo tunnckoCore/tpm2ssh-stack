@@ -843,6 +843,36 @@ fn export_format_name(format: ExportFormat) -> &'static str {
     }
 }
 
+pub(crate) fn enforce_secret_egress_policy(
+    identity: &Identity,
+    action: &str,
+    subject: &str,
+    confirm: bool,
+    reason: Option<&str>,
+) -> Result<()> {
+    if !identity.uses.contains(&UseCase::ExportSecret) {
+        return Err(Error::PolicyRefusal(format!(
+            "identity '{}' is not configured with use=export-secret, which is required for {action}",
+            identity.name
+        )));
+    }
+
+    if !confirm {
+        return Err(Error::Validation(format!(
+            "{action} requires --confirm because {subject} leaves TPM-only protection",
+        )));
+    }
+
+    let reason = reason.unwrap_or_default().trim();
+    if reason.is_empty() {
+        return Err(Error::Validation(format!(
+            "{action} requires --reason to record why {subject} is leaving TPM-only protection",
+        )));
+    }
+
+    Ok(())
+}
+
 fn enforce_secret_export_policy(
     identity: &Identity,
     request: &ExportRequest,
@@ -855,29 +885,13 @@ fn enforce_secret_export_policy(
         )));
     }
 
-    if !identity.uses.contains(&UseCase::ExportSecret) {
-        return Err(Error::PolicyRefusal(format!(
-            "identity '{}' is not configured with use=export-secret, which is required for {:?} export",
-            identity.name, kind
-        )));
-    }
-
-    if !request.confirm {
-        return Err(Error::Validation(format!(
-            "{:?} export requires --confirm because secret key material leaves TPM-only protection",
-            kind
-        )));
-    }
-
-    let reason = request.reason.as_deref().unwrap_or_default().trim();
-    if reason.is_empty() {
-        return Err(Error::Validation(format!(
-            "{:?} export requires --reason to record why secret key material is being exported",
-            kind
-        )));
-    }
-
-    Ok(())
+    enforce_secret_egress_policy(
+        identity,
+        &format!("{:?} export", kind),
+        "secret key material",
+        request.confirm,
+        request.reason.as_deref(),
+    )
 }
 
 fn resolve_secret_export_output_path(
@@ -1512,9 +1526,8 @@ fn native_key_uses(identity: &Identity) -> Result<Vec<NativeKeyUse>> {
         .map(|use_case| match use_case {
             UseCase::Sign => Ok(NativeKeyUse::Sign),
             UseCase::Verify => Ok(NativeKeyUse::Verify),
-            UseCase::Ssh => Ok(NativeKeyUse::Sign),
             unsupported => Err(Error::Unsupported(format!(
-                "native setup is currently wired only for sign/verify-backed uses, but identity '{}' requested {:?}",
+                "native setup is currently wired only for truthful sign/verify uses, but identity '{}' requested {:?}",
                 identity.name, unsupported
             ))),
         })

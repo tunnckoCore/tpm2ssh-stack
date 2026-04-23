@@ -7,8 +7,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "tpm2-derive",
     version,
     about = "TPM-backed identity operations with native, PRF, and seed modes",
-    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, and the operational subcommands ('sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path supports PRF- and seed-backed identities and intentionally rejects native identities.",
-    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod\n  tpm2-derive export --with prod-signer --kind public-key --format pem --output prod-signer.pem\n  tpm2-derive export --with wallet-seed --kind public-key --format eth --output wallet.address\n  tpm2-derive export --with app-prf --kind secret-key --format der --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format pem --confirm --reason \"hardware migration\" --output app-prf.json"
+    long_about = "TPM-backed identity operations with native, PRF, and seed modes.\n\nUse 'inspect' to see what the local TPM can do, 'identity' to provision persistent state, and the operational subcommands ('sign', 'verify', 'encrypt', 'decrypt', 'export', 'ssh-add') to use an existing identity.\n\nImportant: SSH in this project does not imply Ed25519 only. P-256 is also a valid SSH/OpenSSH identity algorithm here. The direct 'tpm2-derive ssh-add' path is treated as secret egress: it supports PRF- and seed-backed identities only, requires use=ssh plus use=export-secret, and requires --confirm with --reason. Likewise, 'decrypt' does not emit plaintext inline by default; choose --output or explicitly opt in with --allow-plaintext-output.",
+    after_help = "Examples:\n  tpm2-derive inspect --algorithm p256 --use sign --use verify\n  tpm2-derive identity prod-signer --algorithm p256 --mode native --use sign --use verify\n  tpm2-derive identity app-prf --algorithm p256 --mode prf --use all --org com.example --purpose app\n  tpm2-derive sign --with prod-signer --input message.bin --format base64 --output message.sig\n  tpm2-derive verify --with prod-signer --input message.bin --signature message.sig --format base64\n  tpm2-derive decrypt --with app-prf --input ciphertext.hex --output plaintext.bin\n  tpm2-derive ssh-add --with app-prf --org com.example --context account=prod --confirm --reason \"load deployment key into agent\"\n  tpm2-derive export --with prod-signer --kind public-key --format pem --output prod-signer.pem\n  tpm2-derive export --with wallet-seed --kind public-key --format eth --output wallet.address\n  tpm2-derive export --with app-prf --kind secret-key --format der --confirm --reason \"hardware migration\" --output app-prf.key\n  tpm2-derive export --with app-prf --kind keypair --format pem --confirm --reason \"hardware migration\" --output app-prf.json"
 )]
 pub struct Cli {
     #[arg(
@@ -179,7 +179,9 @@ pub struct EncryptArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Decrypt data previously encrypted with the encrypt command")]
+#[command(
+    about = "Decrypt data previously encrypted with the encrypt command; --output is required unless inline plaintext output is explicitly allowed"
+)]
 pub struct DecryptArgs {
     #[arg(long = "with", help = "Existing identity name to use")]
     pub identity: String,
@@ -191,8 +193,17 @@ pub struct DecryptArgs {
         help = "Input file to decrypt, or '-' for stdin"
     )]
     pub input: String,
-    #[arg(long, help = "Output file for plaintext; defaults to stdout")]
+    #[arg(
+        long,
+        help = "Output file for plaintext; required unless --allow-plaintext-output is set"
+    )]
     pub output: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        help = "Explicitly allow inline plaintext output in the structured command response/stdout",
+        conflicts_with = "output"
+    )]
+    pub allow_plaintext_output: bool,
     #[arg(
         long,
         help = "Override the state root directory instead of the default local state path"
@@ -237,7 +248,7 @@ pub struct ExportArgs {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Add a PRF- or seed-derived private key to ssh-agent")]
+#[command(about = "Add a PRF- or seed-derived private key to ssh-agent as gated secret egress")]
 pub struct SshAddArgs {
     #[arg(long = "with", help = "Existing identity name to use")]
     pub identity: String,
@@ -255,6 +266,16 @@ pub struct SshAddArgs {
         help = "Override the state root directory instead of the default local state path"
     )]
     pub state_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Operator-provided reason required because ssh-add injects private key material into a software agent"
+    )]
+    pub reason: Option<String>,
+    #[arg(
+        long,
+        help = "Acknowledge that ssh-add exports private key material into a software ssh-agent"
+    )]
+    pub confirm: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -430,13 +451,46 @@ mod tests {
     }
 
     #[test]
-    fn ssh_add_parses_flat_command() {
-        let cli = Cli::try_parse_from(["tpm2-derive", "ssh-add", "--with", "seed-user"])
-            .expect("cli should parse");
+    fn ssh_add_parses_secret_egress_flags() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "ssh-add",
+            "--with",
+            "seed-user",
+            "--confirm",
+            "--reason",
+            "load deploy key into agent",
+        ])
+        .expect("cli should parse");
 
         match cli.command {
-            Command::SshAdd(args) => assert_eq!(args.identity, "seed-user"),
+            Command::SshAdd(args) => {
+                assert_eq!(args.identity, "seed-user");
+                assert!(args.confirm);
+                assert_eq!(args.reason.as_deref(), Some("load deploy key into agent"));
+            }
             other => panic!("expected ssh-add command, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decrypt_parses_allow_plaintext_output_flag() {
+        let cli = Cli::try_parse_from([
+            "tpm2-derive",
+            "decrypt",
+            "--with",
+            "seed-user",
+            "--allow-plaintext-output",
+        ])
+        .expect("decrypt cli should parse");
+
+        match cli.command {
+            Command::Decrypt(args) => {
+                assert_eq!(args.identity, "seed-user");
+                assert!(args.allow_plaintext_output);
+                assert!(args.output.is_none());
+            }
+            other => panic!("expected decrypt command, found {other:?}"),
         }
     }
 
@@ -593,7 +647,8 @@ mod tests {
 
         assert!(help.contains("identity"));
         assert!(help.contains("ssh-add"));
-        assert!(help.contains("supports PRF- and seed-backed identities"));
+        assert!(help.contains("requires use=ssh plus use=export-secret"));
+        assert!(help.contains("--allow-plaintext-output"));
         assert!(!help.contains("\n  derive\n"));
         assert!(!help.contains("seed-backed slice"));
         assert!(!help.contains("\n  keygen\n"));

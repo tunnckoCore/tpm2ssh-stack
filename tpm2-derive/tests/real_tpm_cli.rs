@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use serde_json::Value;
-use support::{RealTpmHarness, hex_decode, hex_encode, normalize_openssh_public_key};
+use support::{RealTpmHarness, hex_decode, hex_encode, normalize_openssh_public_key, run_cli_json};
 use tpm2_derive::backend::{ProcessCommandRunner, default_probe};
 use tpm2_derive::error::Error;
 use tpm2_derive::model::{
@@ -48,6 +48,79 @@ fn inspect_reports_real_swtpm_capabilities_via_library_api() {
     assert!(p256.verify);
     assert!(!p256.encrypt);
     assert!(!p256.decrypt);
+    assert_eq!(
+        report.native.supported_uses(Algorithm::P256),
+        vec![UseCase::Sign, UseCase::Verify]
+    );
+}
+
+#[test]
+fn ssh_add_requires_secret_egress_policy_with_real_swtpm() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity_without_export = create_identity(
+        &harness,
+        "seed-ssh-policy",
+        Algorithm::Ed25519,
+        ModePreference::Seed,
+        vec![UseCase::Sign, UseCase::Ssh],
+        DerivationOverrides::default(),
+    );
+
+    let missing_use = ssh::add_with_defaults(
+        &identity_without_export,
+        &SshAddRequest {
+            identity: identity_without_export.name.clone(),
+            comment: Some("seed@test".to_string()),
+            socket: None,
+            state_dir: Some(harness.state_dir().to_path_buf()),
+            reason: Some("load deployment key into agent".to_string()),
+            confirm: true,
+            derivation: DerivationOverrides::default(),
+        },
+    )
+    .expect_err("ssh-add should require export-secret");
+    assert!(
+        matches!(missing_use, Error::PolicyRefusal(message) if message.contains("use=export-secret"))
+    );
+
+    let identity = create_identity(
+        &harness,
+        "seed-ssh-policy-confirm",
+        Algorithm::Ed25519,
+        ModePreference::Seed,
+        vec![UseCase::Sign, UseCase::Ssh, UseCase::ExportSecret],
+        DerivationOverrides::default(),
+    );
+
+    let missing_confirm = ssh::add_with_defaults(
+        &identity,
+        &SshAddRequest {
+            identity: identity.name.clone(),
+            comment: Some("seed@test".to_string()),
+            socket: None,
+            state_dir: Some(harness.state_dir().to_path_buf()),
+            reason: Some("load deployment key into agent".to_string()),
+            confirm: false,
+            derivation: DerivationOverrides::default(),
+        },
+    )
+    .expect_err("ssh-add should require confirm");
+    assert!(matches!(missing_confirm, Error::Validation(message) if message.contains("--confirm")));
+
+    let missing_reason = ssh::add_with_defaults(
+        &identity,
+        &SshAddRequest {
+            identity: identity.name.clone(),
+            comment: Some("seed@test".to_string()),
+            socket: None,
+            state_dir: Some(harness.state_dir().to_path_buf()),
+            reason: None,
+            confirm: true,
+            derivation: DerivationOverrides::default(),
+        },
+    )
+    .expect_err("ssh-add should require reason");
+    assert!(matches!(missing_reason, Error::Validation(message) if message.contains("--reason")));
 }
 
 #[test]
@@ -319,6 +392,96 @@ fn native_sign_fails_closed_when_serialized_handle_file_is_removed() {
 }
 
 #[test]
+fn decrypt_cli_requires_explicit_plaintext_egress_with_real_swtpm() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity = create_identity(
+        &harness,
+        "seed-decrypt-cli",
+        Algorithm::Ed25519,
+        ModePreference::Seed,
+        vec![UseCase::Encrypt, UseCase::Decrypt],
+        DerivationOverrides::default(),
+    );
+
+    let runner = ProcessCommandRunner;
+    let plaintext = b"seed decrypt cli coverage";
+    let encrypted = encrypt::encrypt_with_defaults(
+        &identity,
+        plaintext,
+        &DerivationOverrides::default(),
+        &runner,
+    )
+    .expect("seed encrypt with real TPM-sealed seed");
+    let ciphertext_path = write_workspace_file(
+        &harness,
+        "seed-decrypt-cli.ciphertext.hex",
+        encrypted
+            .ciphertext
+            .as_deref()
+            .expect("inline seed ciphertext")
+            .as_bytes(),
+    );
+
+    let state_dir = harness.state_dir().display().to_string();
+    let ciphertext_arg = ciphertext_path.display().to_string();
+
+    let refusal = run_cli_json(vec![
+        "tpm2-derive".to_string(),
+        "--json".to_string(),
+        "decrypt".to_string(),
+        "--with".to_string(),
+        identity.name.clone(),
+        "--input".to_string(),
+        ciphertext_arg.clone(),
+        "--state-dir".to_string(),
+        state_dir.clone(),
+    ]);
+    assert_eq!(refusal["ok"], Value::Bool(false));
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("--allow-plaintext-output")
+    );
+
+    let inline = run_cli_json(vec![
+        "tpm2-derive".to_string(),
+        "--json".to_string(),
+        "decrypt".to_string(),
+        "--with".to_string(),
+        identity.name.clone(),
+        "--input".to_string(),
+        ciphertext_arg.clone(),
+        "--state-dir".to_string(),
+        state_dir.clone(),
+        "--allow-plaintext-output".to_string(),
+    ]);
+    assert_eq!(inline["ok"], Value::Bool(true));
+    assert_eq!(
+        inline["result"]["plaintext"],
+        Value::String(hex_encode(plaintext))
+    );
+
+    let output_path = harness.workspace_path("seed-decrypt-cli.plaintext.bin");
+    let file_output = run_cli_json(vec![
+        "tpm2-derive".to_string(),
+        "--json".to_string(),
+        "decrypt".to_string(),
+        "--with".to_string(),
+        identity.name.clone(),
+        "--input".to_string(),
+        ciphertext_arg,
+        "--state-dir".to_string(),
+        state_dir,
+        "--output".to_string(),
+        output_path.display().to_string(),
+    ]);
+    assert_eq!(file_output["ok"], Value::Bool(true));
+    assert!(file_output["result"]["plaintext"].is_null());
+    assert_eq!(fs::read(&output_path).expect("plaintext file"), plaintext);
+}
+
+#[test]
 fn seed_identity_library_round_trip_covers_encrypt_export_and_ssh_add() {
     let mut harness = RealTpmHarness::start().expect("start swtpm harness");
     let identity = create_identity(
@@ -492,6 +655,8 @@ fn seed_identity_library_round_trip_covers_encrypt_export_and_ssh_add() {
             comment: Some("seed@test".to_string()),
             socket: Some(socket.clone()),
             state_dir: Some(harness.state_dir().to_path_buf()),
+            reason: Some("load seed key into deployment agent".to_string()),
+            confirm: true,
             derivation: DerivationOverrides::default(),
         },
     )
@@ -724,6 +889,8 @@ fn prf_identity_library_round_trip_covers_derivation_overrides_encrypt_export_an
             comment: Some("prf@test".to_string()),
             socket: Some(socket.clone()),
             state_dir: Some(harness.state_dir().to_path_buf()),
+            reason: Some("load prf key into deployment agent".to_string()),
+            confirm: true,
             derivation: override_inputs.clone(),
         },
     )

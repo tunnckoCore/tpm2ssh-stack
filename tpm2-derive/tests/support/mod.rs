@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
+
+use clap::Parser as _;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
@@ -502,4 +504,22 @@ pub fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+pub fn run_cli<I, T>(args: I) -> Result<String, String>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = tpm2_derive::cli::Cli::try_parse_from(args).map_err(|error| error.to_string())?;
+    tpm2_derive::run_cli(cli).map_err(|error| error.to_string())
+}
+
+pub fn run_cli_json<I, T>(args: I) -> serde_json::Value
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let output = run_cli(args).expect("cli command should execute");
+    serde_json::from_str(&output).expect("cli output should be valid json")
 }

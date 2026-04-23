@@ -90,18 +90,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_native_allows_sign_verify_encrypt_decrypt_and_ssh() {
+    fn validate_native_allows_sign_verify_encrypt_and_decrypt() {
         UseCase::validate_for_mode(
             &[
                 UseCase::Sign,
                 UseCase::Verify,
                 UseCase::Encrypt,
                 UseCase::Decrypt,
-                UseCase::Ssh,
             ],
             Mode::Native,
         )
         .expect("native should allow its declared identity surface");
+    }
+
+    #[test]
+    fn validate_native_rejects_ssh() {
+        let error = UseCase::validate_for_mode(&[UseCase::Sign, UseCase::Ssh], Mode::Native)
+            .expect_err("native should reject ssh until a truthful runtime path exists");
+        assert!(matches!(error, Error::PolicyRefusal(_)));
     }
 
     #[test]
@@ -131,9 +137,9 @@ mod tests {
     // ── Setup-time enforcement tests ────────────────────────────────
 
     #[test]
-    fn setup_allows_native_mode_with_sign_and_ssh_use() {
+    fn setup_rejects_native_mode_with_ssh_use() {
         let root_dir = unique_temp_path("setup-native-ssh");
-        let result = ops::resolve_identity(
+        let error = ops::resolve_identity(
             &HeuristicProbe,
             &request(
                 "test-native-ssh",
@@ -143,9 +149,13 @@ mod tests {
                 root_dir.clone(),
             ),
         )
-        .expect("native sign+ssh should be allowed as a signing-backed intent bit");
+        .expect_err("native sign+ssh should be rejected until a truthful native ssh path exists");
 
-        assert_eq!(result.identity.mode.resolved, Mode::Native);
+        assert!(matches!(
+            error,
+            Error::CapabilityMismatch(_) | Error::PolicyRefusal(_)
+        ));
+        assert!(error.to_string().contains("Ssh") || error.to_string().contains("ssh"));
         let _ = std::fs::remove_dir_all(root_dir);
     }
 
@@ -294,10 +304,7 @@ mod tests {
         )
         .expect("native --use all should expand to supported native uses");
 
-        assert_eq!(
-            result.identity.uses,
-            vec![UseCase::Sign, UseCase::Verify, UseCase::Ssh]
-        );
+        assert_eq!(result.identity.uses, vec![UseCase::Sign, UseCase::Verify]);
     }
 
     #[test]

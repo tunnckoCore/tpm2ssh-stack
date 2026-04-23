@@ -133,7 +133,12 @@ tpm2-derive export \
   --format eth \
   --output wallet.address
 
-tpm2-derive ssh-add --with app-prf --org com.example --context account=prod
+tpm2-derive ssh-add \
+  --with app-prf \
+  --org com.example \
+  --context account=prod \
+  --confirm \
+  --reason "load deployment key into agent"
 ```
 
 Create an export-enabled seed identity:
@@ -187,8 +192,9 @@ nix shell nixpkgs#swtpm nixpkgs#tpm2-tools -c cargo test --features real-tpm-tes
 
 ## Notes
 
-- `--use all` expands according to the resolved mode and the native capability matrix.
-- `ssh-add` is intentionally separate from `use=ssh` and rejects native identities.
+- `--use all` expands according to the resolved mode and the native capability matrix; native `--use all` intentionally stays limited to the truthful native runtime surface.
+- `ssh-add` is secret egress: it requires `use=ssh` plus `use=export-secret`, requires `--confirm` with `--reason`, and rejects native identities.
+- `decrypt` no longer emits plaintext inline by default; use `--output` or explicitly opt into `--allow-plaintext-output`.
 - There is no standalone `derive` command anymore; use the operational commands for actual work, and use `export` when you intentionally need key material artifacts from an existing identity with derivation overrides/default merges.
 - The old raw-byte `derive --format hex|base64 --length N` workflow is intentionally gone from the public CLI.
 - `export --kind public-key --format hex|base64` emits raw public key bytes (Ed25519 raw key bytes; secp curves as uncompressed SEC1 bytes), not SPKI-wrapped bytes.

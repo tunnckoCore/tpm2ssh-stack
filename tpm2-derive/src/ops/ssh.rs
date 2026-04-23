@@ -133,6 +133,13 @@ where
 
     ensure_ssh_use(identity)?;
     UseCase::validate_for_mode(&identity.uses, identity.mode.resolved)?;
+    super::enforce_secret_egress_policy(
+        identity,
+        "ssh-add",
+        "private key material",
+        request.confirm,
+        request.reason.as_deref(),
+    )?;
     add_derived_identity(
         identity,
         request,
@@ -555,7 +562,7 @@ mod tests {
         Identity::new(
             "seed-ssh".to_string(),
             Algorithm::Ed25519,
-            vec![UseCase::Sign, UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh, UseCase::ExportSecret],
             IdentityModeResolution {
                 requested: ModePreference::Seed,
                 resolved: Mode::Seed,
@@ -569,7 +576,7 @@ mod tests {
         let mut identity = Identity::new(
             "prf-ssh".to_string(),
             Algorithm::P256,
-            vec![UseCase::Sign, UseCase::Ssh],
+            vec![UseCase::Sign, UseCase::Ssh, UseCase::ExportSecret],
             IdentityModeResolution {
                 requested: ModePreference::Prf,
                 resolved: Mode::Prf,
@@ -638,6 +645,8 @@ mod tests {
                 comment: Some("seed@test".to_string()),
                 socket: Some(socket_path),
                 state_dir: Some(temp.path().to_path_buf()),
+                reason: Some("seed ssh-agent use".to_string()),
+                confirm: true,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"unused"),
@@ -668,6 +677,8 @@ mod tests {
                 comment: Some("prf@test".to_string()),
                 socket: Some(socket_path),
                 state_dir: Some(temp.path().to_path_buf()),
+                reason: Some("prf ssh-agent use".to_string()),
+                confirm: true,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"tpm-prf-material"),
@@ -699,6 +710,91 @@ mod tests {
         assert!(private_key.contains("BEGIN OPENSSH PRIVATE KEY"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ssh_add_requires_export_secret_use() {
+        let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut identity = seed_identity(temp.path());
+        identity
+            .uses
+            .retain(|use_case| !matches!(use_case, UseCase::ExportSecret));
+
+        let error = add_with_backend(
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
+                comment: Some("seed@test".to_string()),
+                socket: Some(socket_path),
+                state_dir: Some(temp.path().to_path_buf()),
+                reason: Some("seed ssh-agent use".to_string()),
+                confirm: true,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x44; 32]),
+            &HkdfSha256SeedDeriver,
+            &RecordingSshAddClient::default(),
+        )
+        .expect_err("ssh-add should require export-secret");
+
+        assert!(
+            matches!(error, Error::PolicyRefusal(message) if message.contains("use=export-secret"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_add_requires_confirm_and_reason() {
+        let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let identity = seed_identity(temp.path());
+
+        let missing_confirm = add_with_backend(
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
+                comment: Some("seed@test".to_string()),
+                socket: Some(socket_path.clone()),
+                state_dir: Some(temp.path().to_path_buf()),
+                reason: Some("seed ssh-agent use".to_string()),
+                confirm: false,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x44; 32]),
+            &HkdfSha256SeedDeriver,
+            &RecordingSshAddClient::default(),
+        )
+        .expect_err("ssh-add should require confirm");
+        assert!(
+            matches!(missing_confirm, Error::Validation(message) if message.contains("--confirm"))
+        );
+
+        let missing_reason = add_with_backend(
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
+                comment: Some("seed@test".to_string()),
+                socket: Some(socket_path),
+                state_dir: Some(temp.path().to_path_buf()),
+                reason: None,
+                confirm: true,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x44; 32]),
+            &HkdfSha256SeedDeriver,
+            &RecordingSshAddClient::default(),
+        )
+        .expect_err("ssh-add should require reason");
+        assert!(
+            matches!(missing_reason, Error::Validation(message) if message.contains("--reason"))
+        );
+    }
+
     #[test]
     fn ssh_add_native_rejection_is_explicit() {
         let temp = tempdir().expect("tempdir");
@@ -720,6 +816,8 @@ mod tests {
                 comment: None,
                 socket: Some(temp.path().join("agent.sock")),
                 state_dir: Some(temp.path().to_path_buf()),
+                reason: Some("native ssh-agent use".to_string()),
+                confirm: true,
                 derivation: DerivationOverrides::default(),
             },
             &RecordingPrfRunner::new(b"unused"),

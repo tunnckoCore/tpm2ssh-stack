@@ -62,7 +62,6 @@ impl UseCase {
                 UseCase::Verify,
                 UseCase::Encrypt,
                 UseCase::Decrypt,
-                UseCase::Ssh,
             ],
             Mode::Prf | Mode::Seed => &[
                 UseCase::Sign,

@@ -534,4 +534,19 @@ mod tests {
 
         assert!(reason.contains("Verify"));
     }
+
+    #[test]
+    fn native_mode_truthfully_rejects_ssh_requests() {
+        let report = report(native_summary(true, true), true, true);
+
+        assert!(!report_supports_mode(
+            &report,
+            Algorithm::P256,
+            &[UseCase::Ssh],
+            Mode::Native,
+        ));
+
+        let reason = mode_rejection_reason(&report, Algorithm::P256, &[UseCase::Ssh], Mode::Native);
+        assert!(reason.contains("Ssh") || reason.contains("ssh"));
+    }
 }
