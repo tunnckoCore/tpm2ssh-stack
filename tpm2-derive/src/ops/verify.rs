@@ -23,8 +23,8 @@ use crate::ops::seed::{
     SeedSoftwareDeriver, SoftwareSeedDerivationRequest, open_and_derive, plan_open,
     seed_profile_from_profile,
 };
-#[cfg(test)]
 use secrecy::ExposeSecret;
+use zeroize::Zeroizing;
 
 use super::shared::{
     BUFFERED_MESSAGE_INPUT_BYTES_LIMIT, VERIFY_SIGNATURE_INPUT_BYTES_LIMIT,
@@ -154,7 +154,7 @@ where
         "derived-verifier-material",
         format!(
             "derived {} bytes of {:?} verifier material from {:?} backing using the effective derivation inputs",
-            derived.len(),
+            derived.expose_secret().len(),
             identity.algorithm,
             identity.mode.resolved,
         ),
@@ -167,7 +167,7 @@ where
             &input_bytes,
             &signature_bytes,
             &digest,
-            &derived,
+            derived.expose_secret(),
             signature_input_format,
             diagnostics,
         ),
@@ -177,7 +177,7 @@ where
             &input_bytes,
             &signature_bytes,
             &digest,
-            &derived,
+            derived.expose_secret(),
             signature_input_format,
             diagnostics,
         ),
@@ -187,7 +187,7 @@ where
             &input_bytes,
             &signature_bytes,
             &digest,
-            &derived,
+            derived.expose_secret(),
             signature_input_format,
             diagnostics,
         ),
@@ -337,6 +337,7 @@ fn verify_seed_ed25519(
             "seed verify ed25519 derivation produced a non-32-byte seed unexpectedly".to_string(),
         )
     })?;
+    let seed_bytes = Zeroizing::new(seed_bytes);
     let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
     let (signature, signature_format) = match request.format {
         InputFormat::Der => return Err(Error::Validation(
@@ -379,7 +380,7 @@ fn verify_seed_p256(
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let scalar_bytes =
         crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+    let signing_key = P256SigningKey::from_bytes((&*scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
             "failed to materialize p256 seed verifying key for identity '{}': {error}",
             identity.name
@@ -422,7 +423,7 @@ fn verify_seed_secp256k1(
 ) -> Result<(VerifyOperationResult, Vec<Diagnostic>)> {
     let scalar_bytes =
         crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+    let signing_key = K256SigningKey::from_bytes((&*scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
             "failed to materialize secp256k1 seed verifying key for identity '{}': {error}",
             identity.name

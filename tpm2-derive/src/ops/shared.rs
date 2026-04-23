@@ -4,6 +4,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use secrecy::SecretBox;
+
 use crate::backend::{CommandOutput, CommandRunner};
 use crate::crypto::{
     DerivationContext as CryptoDerivationContext, DerivationDomain, DerivationSpec,
@@ -27,6 +29,12 @@ pub(crate) const IDENTITY_JSON_BYTES_LIMIT: usize = 256 * 1024;
 pub(crate) const BUFFERED_MESSAGE_INPUT_BYTES_LIMIT: usize = 8 * 1024 * 1024;
 pub(crate) const VERIFY_SIGNATURE_INPUT_BYTES_LIMIT: usize = 64 * 1024;
 pub(crate) const BUFFERED_ENCRYPT_DECRYPT_BYTES_LIMIT: usize = 8 * 1024 * 1024;
+
+pub(crate) type SecretBytes = SecretBox<Vec<u8>>;
+
+pub(crate) fn secret_bytes(bytes: Vec<u8>) -> SecretBytes {
+    SecretBox::new(Box::new(bytes))
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct EffectiveDerivationInputs {
@@ -121,7 +129,7 @@ pub(crate) fn execute_prf_derivation_with_runner<R>(
     spec: DerivationSpec,
     runner: &R,
     workspace_kind: &str,
-) -> Result<Vec<u8>>
+) -> Result<SecretBytes>
 where
     R: CommandRunner,
 {
@@ -138,7 +146,9 @@ where
     });
 
     match (execution, cleanup) {
-        (Ok(result), Ok(())) => Ok(result.response.output.expose_secret().to_vec()),
+        (Ok(result), Ok(())) => Ok(secret_bytes(
+            result.response.output.expose_secret().to_vec(),
+        )),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
@@ -699,4 +709,21 @@ fn validate_non_empty(field: &str, value: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use secrecy::ExposeSecret;
+
+    fn assert_secret_bytes(_: &SecretBytes) {}
+
+    #[test]
+    fn secret_bytes_wraps_derived_material_in_secret_storage() {
+        let secret = secret_bytes(vec![0x12, 0x34, 0x56]);
+
+        assert_secret_bytes(&secret);
+        assert_eq!(secret.expose_secret().as_slice(), &[0x12, 0x34, 0x56]);
+    }
 }

@@ -28,9 +28,11 @@ use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey as Ed25519EncodePrivateKey;
 use k256::elliptic_curve::sec1::ToEncodedPoint as _;
 use secrecy::ExposeSecret;
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
 use tempfile::Builder as TempfileBuilder;
+use zeroize::Zeroizing;
 
 use ssh_key::{
     PublicKey as SshPublicKey,
@@ -414,10 +416,16 @@ where
                 &request.derivation,
                 runner,
             )?;
-            let public_key_der =
-                crate::ops::keygen::public_key_spki_der_from_material(identity, &material)?;
-            let (rendered_public_key, artifact_format) =
-                render_derived_public_key_export(identity, format, &public_key_der, &material)?;
+            let public_key_der = crate::ops::keygen::public_key_spki_der_from_material(
+                identity,
+                material.expose_secret(),
+            )?;
+            let (rendered_public_key, artifact_format) = render_derived_public_key_export(
+                identity,
+                format,
+                &public_key_der,
+                material.expose_secret(),
+            )?;
             let destination =
                 resolve_public_key_output_path(identity, request.output.as_deref(), format)?;
             write_public_key_output(&destination, &rendered_public_key)?;
@@ -481,15 +489,20 @@ where
         seed_deriver,
     )?;
     let format = resolve_secret_key_export_format(request.format)?;
-    let secret_key_bytes = crate::ops::keygen::normalized_secret_key_bytes(identity, &material)?;
-    let (rendered_secret_key, artifact_format) =
-        render_secret_key_export(identity, format, &secret_key_bytes, &material)?;
+    let secret_key_bytes =
+        crate::ops::keygen::normalized_secret_key_bytes(identity, material.expose_secret())?;
+    let (rendered_secret_key, artifact_format) = render_secret_key_export(
+        identity,
+        format,
+        secret_key_bytes.as_ref(),
+        material.expose_secret(),
+    )?;
     let destination = resolve_secret_export_output_path(
         identity,
         request.output.as_deref(),
         secret_key_export_default_suffix(format),
     )?;
-    write_secret_output(&destination, &rendered_secret_key)?;
+    write_secret_output(&destination, rendered_secret_key.as_ref())?;
 
     Ok(ExportResult {
         identity: identity.name.clone(),
@@ -548,14 +561,10 @@ where
         seed_deriver,
     )?;
     let format = resolve_keypair_export_format(request.format)?;
-    let payload = format!(
-        "{}\n",
-        serde_json::to_string_pretty(&render_keypair_json(identity, format, &material)?)
-            .map_err(crate::error::Error::from)?
-    );
+    let payload = render_keypair_json_bytes(identity, format, material.expose_secret())?;
     let destination =
         resolve_secret_export_output_path(identity, request.output.as_deref(), "keypair.json")?;
-    write_secret_output(&destination, payload.as_bytes())?;
+    write_secret_output(&destination, payload.as_ref())?;
 
     Ok(ExportResult {
         identity: identity.name.clone(),
@@ -574,7 +583,7 @@ fn render_secret_key_export(
     format: Format,
     secret_key_bytes: &[u8],
     material: &[u8],
-) -> Result<(Vec<u8>, ExportFormat)> {
+) -> Result<(Zeroizing<Vec<u8>>, ExportFormat)> {
     match format {
         Format::Der => match identity.algorithm {
             Algorithm::Ed25519 => {
@@ -585,7 +594,10 @@ fn render_secret_key_export(
                 let der = signing_key.to_pkcs8_der().map_err(|error| {
                     Error::Internal(format!("failed to render pkcs8 DER: {error}"))
                 })?;
-                Ok((der.as_bytes().to_vec(), ExportFormat::Pkcs8Der))
+                Ok((
+                    Zeroizing::new(der.as_bytes().to_vec()),
+                    ExportFormat::Pkcs8Der,
+                ))
             }
             Algorithm::P256 => {
                 let secret_key =
@@ -595,7 +607,7 @@ fn render_secret_key_export(
                 let der = secret_key.to_sec1_der().map_err(|error| {
                     Error::Internal(format!("failed to render sec1 DER: {error}"))
                 })?;
-                Ok((der.to_vec(), ExportFormat::Sec1Der))
+                Ok((Zeroizing::new(der.to_vec()), ExportFormat::Sec1Der))
             }
             Algorithm::Secp256k1 => {
                 let secret_key =
@@ -607,7 +619,7 @@ fn render_secret_key_export(
                 let der = secret_key.to_sec1_der().map_err(|error| {
                     Error::Internal(format!("failed to render sec1 DER: {error}"))
                 })?;
-                Ok((der.to_vec(), ExportFormat::Sec1Der))
+                Ok((Zeroizing::new(der.to_vec()), ExportFormat::Sec1Der))
             }
         },
         Format::Pem => match identity.algorithm {
@@ -615,7 +627,7 @@ fn render_secret_key_export(
                 let (der, actual_format) =
                     render_secret_key_export(identity, Format::Der, secret_key_bytes, material)?;
                 Ok((
-                    pem_wrap("PRIVATE KEY", &der).into_bytes(),
+                    Zeroizing::new(pem_wrap("PRIVATE KEY", der.as_ref()).into_bytes()),
                     match actual_format {
                         ExportFormat::Pkcs8Der => ExportFormat::Pkcs8Pem,
                         other => other,
@@ -626,126 +638,193 @@ fn render_secret_key_export(
                 let (der, _) =
                     render_secret_key_export(identity, Format::Der, secret_key_bytes, material)?;
                 Ok((
-                    pem_wrap("EC PRIVATE KEY", &der).into_bytes(),
+                    Zeroizing::new(pem_wrap("EC PRIVATE KEY", der.as_ref()).into_bytes()),
                     ExportFormat::Sec1Pem,
                 ))
             }
         },
         Format::Openssh => Ok((
-            crate::ops::ssh::openssh_private_key_from_material(identity, material, &identity.name)?
-                .into_bytes(),
+            Zeroizing::new(
+                crate::ops::ssh::openssh_private_key_from_material(
+                    identity,
+                    material,
+                    &identity.name,
+                )?
+                .as_bytes()
+                .to_vec(),
+            ),
             ExportFormat::Openssh,
         )),
-        Format::Hex => Ok((hex_encode(secret_key_bytes).into_bytes(), ExportFormat::Hex)),
+        Format::Hex => Ok((
+            Zeroizing::new(hex_encode(secret_key_bytes).into_bytes()),
+            ExportFormat::Hex,
+        )),
         Format::Base64 => Ok((
-            shared::base64_encode(secret_key_bytes).into_bytes(),
+            Zeroizing::new(shared::base64_encode(secret_key_bytes).into_bytes()),
             ExportFormat::Base64,
         )),
-        Format::Eth => Ok((hex_encode(secret_key_bytes).into_bytes(), ExportFormat::Hex)),
+        Format::Eth => Ok((
+            Zeroizing::new(hex_encode(secret_key_bytes).into_bytes()),
+            ExportFormat::Hex,
+        )),
     }
 }
 
-fn render_keypair_json(
+#[derive(Serialize)]
+struct KeypairJsonField<'a> {
+    format: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'a str>,
+    value: &'a str,
+}
+
+#[derive(Serialize)]
+struct KeypairJsonPayload<'a> {
+    identity: &'a str,
+    mode: Mode,
+    algorithm: Algorithm,
+    private_key: KeypairJsonField<'a>,
+    public_key: KeypairJsonField<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<KeypairJsonField<'a>>,
+}
+
+fn render_keypair_json_bytes(
     identity: &Identity,
     format: Format,
     material: &[u8],
-) -> Result<serde_json::Value> {
+) -> Result<Zeroizing<Vec<u8>>> {
     let secret_key_bytes = crate::ops::keygen::normalized_secret_key_bytes(identity, material)?;
     let public_key_der = crate::ops::keygen::public_key_spki_der_from_material(identity, material)?;
     let raw_public = raw_public_key_bytes_from_material(identity, material)?;
 
-    let (private_key, public_key) = match format {
+    let mut secret_text_guard = None::<Zeroizing<String>>;
+    let mut secret_bytes_guard = None::<Zeroizing<Vec<u8>>>;
+    let private_format;
+    let private_encoding;
+    let public_format;
+    let public_encoding;
+    let public_text;
+    let address_text;
+
+    match format {
         Format::Der => {
-            let (private_bytes, private_format) =
-                render_secret_key_export(identity, Format::Der, &secret_key_bytes, material)?;
-            (
-                serde_json::json!({
-                    "format": export_format_name(private_format),
-                    "encoding": "base64",
-                    "value": shared::base64_encode(&private_bytes),
-                }),
-                serde_json::json!({
-                    "format": "spki-der",
-                    "encoding": "base64",
-                    "value": shared::base64_encode(&public_key_der),
-                }),
-            )
+            let (private_bytes, private_export_format) = render_secret_key_export(
+                identity,
+                Format::Der,
+                secret_key_bytes.as_ref(),
+                material,
+            )?;
+            secret_text_guard = Some(Zeroizing::new(shared::base64_encode(
+                private_bytes.as_ref(),
+            )));
+            secret_bytes_guard = Some(private_bytes);
+            private_format = export_format_name(private_export_format);
+            private_encoding = Some("base64");
+            public_format = "spki-der";
+            public_encoding = Some("base64");
+            public_text = shared::base64_encode(&public_key_der);
+            address_text = None;
         }
         Format::Pem => {
-            let (private_bytes, private_format) =
-                render_secret_key_export(identity, Format::Pem, &secret_key_bytes, material)?;
-            (
-                serde_json::json!({
-                    "format": export_format_name(private_format),
-                    "value": String::from_utf8(private_bytes).map_err(|error| Error::State(format!("failed to render keypair private PEM as UTF-8: {error}")))?,
-                }),
-                serde_json::json!({
-                    "format": "spki-pem",
-                    "value": spki_der_to_pem(&public_key_der),
-                }),
-            )
+            let (private_bytes, private_export_format) = render_secret_key_export(
+                identity,
+                Format::Pem,
+                secret_key_bytes.as_ref(),
+                material,
+            )?;
+            secret_bytes_guard = Some(private_bytes);
+            private_format = export_format_name(private_export_format);
+            private_encoding = None;
+            public_format = "spki-pem";
+            public_encoding = None;
+            public_text = spki_der_to_pem(&public_key_der);
+            address_text = None;
         }
-        Format::Openssh => (
-            serde_json::json!({
-                "format": "openssh",
-                "value": crate::ops::ssh::openssh_private_key_from_material(identity, material, &identity.name)?,
-            }),
-            serde_json::json!({
-                "format": "openssh",
-                "value": crate::ops::ssh::openssh_public_key_from_material(identity, material)?,
-            }),
-        ),
-        Format::Hex => (
-            serde_json::json!({
-                "format": "hex",
-                "value": hex_encode(&secret_key_bytes),
-            }),
-            serde_json::json!({
-                "format": "hex",
-                "value": hex_encode(&raw_public),
-            }),
-        ),
-        Format::Base64 => (
-            serde_json::json!({
-                "format": "base64",
-                "value": shared::base64_encode(&secret_key_bytes),
-            }),
-            serde_json::json!({
-                "format": "base64",
-                "value": shared::base64_encode(&raw_public),
-            }),
-        ),
+        Format::Openssh => {
+            secret_text_guard = Some(crate::ops::ssh::openssh_private_key_from_material(
+                identity,
+                material,
+                &identity.name,
+            )?);
+            private_format = "openssh";
+            private_encoding = None;
+            public_format = "openssh";
+            public_encoding = None;
+            public_text = crate::ops::ssh::openssh_public_key_from_material(identity, material)?;
+            address_text = None;
+        }
+        Format::Hex => {
+            secret_text_guard = Some(Zeroizing::new(hex_encode(secret_key_bytes.as_ref())));
+            private_format = "hex";
+            private_encoding = None;
+            public_format = "hex";
+            public_encoding = None;
+            public_text = hex_encode(&raw_public);
+            address_text = None;
+        }
+        Format::Base64 => {
+            secret_text_guard = Some(Zeroizing::new(shared::base64_encode(
+                secret_key_bytes.as_ref(),
+            )));
+            private_format = "base64";
+            private_encoding = None;
+            public_format = "base64";
+            public_encoding = None;
+            public_text = shared::base64_encode(&raw_public);
+            address_text = None;
+        }
         Format::Eth => {
             ensure_ethereum_address_algorithm(identity)?;
-            (
-                serde_json::json!({
-                    "format": "hex",
-                    "value": hex_encode(&secret_key_bytes),
-                }),
-                serde_json::json!({
-                    "format": "hex",
-                    "value": hex_encode(&raw_public),
-                }),
-            )
+            secret_text_guard = Some(Zeroizing::new(hex_encode(secret_key_bytes.as_ref())));
+            private_format = "hex";
+            private_encoding = None;
+            public_format = "hex";
+            public_encoding = None;
+            public_text = hex_encode(&raw_public);
+            address_text = Some(ethereum_address_from_raw_public_bytes(&raw_public)?);
         }
-    };
-
-    let mut payload = serde_json::json!({
-        "identity": identity.name.clone(),
-        "mode": identity.mode.resolved,
-        "algorithm": identity.algorithm,
-        "private_key": private_key,
-        "public_key": public_key,
-    });
-
-    if format == Format::Eth {
-        payload["address"] = serde_json::json!({
-            "format": "eth",
-            "value": ethereum_address_from_raw_public_bytes(&raw_public)?,
-        });
     }
 
-    Ok(payload)
+    let private_value = if let Some(private_text) = &secret_text_guard {
+        private_text.as_str()
+    } else {
+        let private_bytes = secret_bytes_guard
+            .as_ref()
+            .ok_or_else(|| Error::Internal("missing secret key export bytes".to_string()))?;
+        std::str::from_utf8(private_bytes.as_ref()).map_err(|error| {
+            Error::State(format!(
+                "failed to render keypair private key as UTF-8: {error}"
+            ))
+        })?
+    };
+
+    let payload = KeypairJsonPayload {
+        identity: &identity.name,
+        mode: identity.mode.resolved,
+        algorithm: identity.algorithm,
+        private_key: KeypairJsonField {
+            format: private_format,
+            encoding: private_encoding,
+            value: private_value,
+        },
+        public_key: KeypairJsonField {
+            format: public_format,
+            encoding: public_encoding,
+            value: &public_text,
+        },
+        address: address_text.as_deref().map(|value| KeypairJsonField {
+            format: "eth",
+            encoding: None,
+            value,
+        }),
+    };
+
+    let mut rendered = Zeroizing::new(Vec::new());
+    serde_json::to_writer_pretty(&mut *rendered, &payload).map_err(crate::error::Error::from)?;
+    rendered.push(b'\n');
+
+    Ok(rendered)
 }
 
 fn export_format_name(format: ExportFormat) -> &'static str {
@@ -980,33 +1059,34 @@ fn seed_public_key_derivation_spec(identity: &Identity) -> Result<DerivationSpec
     shared::identity_key_spec(identity.algorithm, &effective)
 }
 
-fn seed_secret_bytes(identity: &Identity, derived_secret: &[u8]) -> Result<[u8; 32]> {
-    derived_secret.try_into().map_err(|_| {
+fn seed_secret_bytes(identity: &Identity, derived_secret: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let seed_bytes: [u8; 32] = derived_secret.try_into().map_err(|_| {
         Error::Internal(format!(
             "seed public-key derivation for identity '{}' unexpectedly produced {} bytes instead of 32",
             identity.name,
             derived_secret.len()
         ))
-    })
+    })?;
+    Ok(Zeroizing::new(seed_bytes))
 }
 
 fn seed_valid_ec_scalar_bytes<F>(
     identity: &Identity,
     derived_secret: &[u8],
     is_valid: F,
-) -> Result<[u8; 32]>
+) -> Result<Zeroizing<[u8; 32]>>
 where
     F: Fn(&[u8]) -> bool,
 {
     let seed_bytes = seed_secret_bytes(identity, derived_secret)?;
-    if is_valid(&seed_bytes) {
+    if is_valid(seed_bytes.as_ref()) {
         return Ok(seed_bytes);
     }
 
     for counter in 1..=SEED_SCALAR_RETRY_LIMIT {
-        let candidate = seed_scalar_retry_bytes(&seed_bytes, identity.algorithm, counter);
+        let candidate = seed_scalar_retry_bytes(&*seed_bytes, identity.algorithm, counter);
         if is_valid(&candidate) {
-            return Ok(candidate);
+            return Ok(Zeroizing::new(candidate));
         }
     }
 
@@ -1016,7 +1096,7 @@ where
     )))
 }
 
-fn seed_scalar_retry_bytes(seed_bytes: &[u8; 32], algorithm: Algorithm, counter: u32) -> [u8; 32] {
+fn seed_scalar_retry_bytes(seed_bytes: &[u8], algorithm: Algorithm, counter: u32) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(SEED_SCALAR_RETRY_DOMAIN);
     hasher.update(match algorithm {
@@ -1034,13 +1114,14 @@ fn seed_scalar_retry_bytes(seed_bytes: &[u8; 32], algorithm: Algorithm, counter:
 pub fn seed_valid_ec_scalar_bytes_standalone(
     derived_secret: &[u8],
     algorithm: Algorithm,
-) -> Result<[u8; 32]> {
+) -> Result<Zeroizing<[u8; 32]>> {
     let seed_bytes: [u8; 32] = derived_secret.try_into().map_err(|_| {
         Error::Internal(format!(
             "seed derivation unexpectedly produced {} bytes instead of 32",
             derived_secret.len()
         ))
     })?;
+    let seed_bytes = Zeroizing::new(seed_bytes);
 
     let is_valid: Box<dyn Fn(&[u8]) -> bool> = match algorithm {
         Algorithm::P256 => {
@@ -1052,14 +1133,14 @@ pub fn seed_valid_ec_scalar_bytes_standalone(
         Algorithm::Ed25519 => return Ok(seed_bytes),
     };
 
-    if is_valid(&seed_bytes) {
+    if is_valid(seed_bytes.as_ref()) {
         return Ok(seed_bytes);
     }
 
     for counter in 1..=SEED_SCALAR_RETRY_LIMIT {
-        let candidate = seed_scalar_retry_bytes(&seed_bytes, algorithm, counter);
+        let candidate = seed_scalar_retry_bytes(seed_bytes.as_ref(), algorithm, counter);
         if is_valid(&candidate) {
-            return Ok(candidate);
+            return Ok(Zeroizing::new(candidate));
         }
     }
 
@@ -1789,7 +1870,7 @@ fn raw_public_key_bytes_from_material(identity: &Identity, material: &[u8]) -> R
             Ok(signing_key.verifying_key().as_bytes().to_vec())
         }
         Algorithm::P256 => {
-            let secret_key = p256::SecretKey::from_slice(&secret_key).map_err(|error| {
+            let secret_key = p256::SecretKey::from_slice(secret_key.as_ref()).map_err(|error| {
                 Error::Internal(format!(
                     "failed to materialize p256 public key for identity '{}': {error}",
                     identity.name
@@ -1802,7 +1883,7 @@ fn raw_public_key_bytes_from_material(identity: &Identity, material: &[u8]) -> R
                 .to_vec())
         }
         Algorithm::Secp256k1 => {
-            let secret_key = k256::SecretKey::from_slice(&secret_key).map_err(|error| {
+            let secret_key = k256::SecretKey::from_slice(secret_key.as_ref()).map_err(|error| {
                 Error::Internal(format!(
                     "failed to materialize secp256k1 public key for identity '{}': {error}",
                     identity.name
@@ -3998,6 +4079,66 @@ mod tests {
         );
         identity.persist().expect("persist seed identity");
         identity
+    }
+
+    fn assert_zeroizing_array(_: &Zeroizing<[u8; 32]>) {}
+
+    fn assert_zeroizing_vec(_: &Zeroizing<Vec<u8>>) {}
+
+    #[test]
+    fn seed_valid_ec_scalar_bytes_standalone_retries_invalid_p256_seed_in_zeroizing_storage() {
+        let invalid_scalar = [0_u8; 32];
+
+        let scalar = seed_valid_ec_scalar_bytes_standalone(&invalid_scalar, Algorithm::P256)
+            .expect("scalar should be retried");
+
+        assert_zeroizing_array(&scalar);
+        assert_ne!(scalar.as_ref(), &invalid_scalar);
+        assert!(p256::SecretKey::from_slice(scalar.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn render_keypair_json_bytes_preserves_openssh_secret_and_public_formats() {
+        let root_dir = unique_temp_path("render-keypair-json-openssh");
+        let identity = persisted_seed_export_identity(
+            &root_dir,
+            Algorithm::Ed25519,
+            vec![UseCase::Sign, UseCase::ExportSecret, UseCase::Ssh],
+        );
+        let material = [0x24_u8; 32];
+
+        let payload = render_keypair_json_bytes(&identity, Format::Openssh, &material)
+            .expect("rendered keypair json");
+
+        assert_zeroizing_vec(&payload);
+        let payload: serde_json::Value =
+            serde_json::from_slice(payload.as_ref()).expect("parse keypair json");
+        assert_eq!(
+            payload["mode"],
+            serde_json::Value::String("seed".to_string())
+        );
+        assert_eq!(
+            payload["private_key"]["format"],
+            serde_json::Value::String("openssh".to_string())
+        );
+        assert_eq!(
+            payload["public_key"]["format"],
+            serde_json::Value::String("openssh".to_string())
+        );
+        assert!(
+            payload["private_key"]["value"]
+                .as_str()
+                .expect("private key")
+                .contains("BEGIN OPENSSH PRIVATE KEY")
+        );
+        assert!(
+            payload["public_key"]["value"]
+                .as_str()
+                .expect("public key")
+                .starts_with("ssh-ed25519 ")
+        );
+
+        fs::remove_dir_all(root_dir).expect("cleanup");
     }
 
     #[derive(Clone)]

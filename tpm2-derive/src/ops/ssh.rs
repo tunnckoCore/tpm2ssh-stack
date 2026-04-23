@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use p256::SecretKey;
+use secrecy::ExposeSecret;
 use ssh_key::{
     LineEnding, PrivateKey, PublicKey as SshPublicKey,
     private::{EcdsaKeypair, Ed25519Keypair, KeypairData},
@@ -16,6 +17,7 @@ use ssh_key::{
         KeyData as SshKeyData,
     },
 };
+use zeroize::Zeroizing;
 
 use crate::backend::{CommandRunner, ProcessCommandRunner, resolve_trusted_program_path};
 use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
@@ -222,8 +224,10 @@ where
     )?;
 
     match identity.algorithm {
-        Algorithm::Ed25519 => derive_ed25519_private_key(identity, &material, comment),
-        Algorithm::P256 => derive_p256_private_key(identity, &material, comment),
+        Algorithm::Ed25519 => {
+            derive_ed25519_private_key(identity, material.expose_secret(), comment)
+        }
+        Algorithm::P256 => derive_p256_private_key(identity, material.expose_secret(), comment),
         Algorithm::Secp256k1 => Err(Error::Unsupported(format!(
             "identity '{}' resolved to {:?} mode, but ssh-add does not derive {:?} private keys yet",
             identity.name, identity.mode.resolved, identity.algorithm
@@ -253,7 +257,7 @@ fn derive_p256_private_key(
     comment: &str,
 ) -> Result<PrivateKey> {
     let scalar = normalized_secret_key_bytes(identity, material)?;
-    let secret_key = SecretKey::from_slice(&scalar).map_err(|error| {
+    let secret_key = SecretKey::from_slice(scalar.as_ref()).map_err(|error| {
         Error::Internal(format!(
             "failed to construct a p256 private key for identity '{}': {error}",
             identity.name
@@ -280,7 +284,7 @@ pub(crate) fn openssh_private_key_from_material(
     identity: &Identity,
     material: &[u8],
     comment: &str,
-) -> Result<String> {
+) -> Result<Zeroizing<String>> {
     let private_key = match identity.algorithm {
         Algorithm::Ed25519 => derive_ed25519_private_key(identity, material, comment)?,
         Algorithm::P256 => derive_p256_private_key(identity, material, comment)?,
@@ -292,15 +296,12 @@ pub(crate) fn openssh_private_key_from_material(
         }
     };
 
-    private_key
-        .to_openssh(LineEnding::LF)
-        .map(|value| value.to_string())
-        .map_err(|error| {
-            Error::Internal(format!(
-                "failed to render OpenSSH private key for identity '{}': {error}",
-                identity.name
-            ))
-        })
+    private_key.to_openssh(LineEnding::LF).map_err(|error| {
+        Error::Internal(format!(
+            "failed to render OpenSSH private key for identity '{}': {error}",
+            identity.name
+        ))
+    })
 }
 
 pub(crate) fn openssh_public_key_from_material(
@@ -324,7 +325,7 @@ pub(crate) fn openssh_public_key_from_material(
         }
         Algorithm::P256 => {
             let scalar = normalized_secret_key_bytes(identity, material)?;
-            let secret_key = SecretKey::from_slice(&scalar).map_err(|error| {
+            let secret_key = SecretKey::from_slice(scalar.as_ref()).map_err(|error| {
                 Error::Internal(format!(
                     "failed to construct a p256 private key for identity '{}': {error}",
                     identity.name
@@ -683,6 +684,19 @@ mod tests {
                 .starts_with("ecdsa-sha2-nistp256 ")
         );
         assert_eq!(client.keys().len(), 1);
+    }
+
+    fn assert_zeroizing_string(_: &Zeroizing<String>) {}
+
+    #[test]
+    fn openssh_private_key_from_material_returns_zeroizing_secret_text() {
+        let temp = tempdir().expect("tempdir");
+        let identity = seed_identity(temp.path());
+        let private_key = openssh_private_key_from_material(&identity, &[0x22; 32], "seed@test")
+            .expect("openssh private key");
+
+        assert_zeroizing_string(&private_key);
+        assert!(private_key.contains("BEGIN OPENSSH PRIVATE KEY"));
     }
 
     #[test]

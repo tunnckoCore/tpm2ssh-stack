@@ -5,8 +5,8 @@
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use p256::pkcs8::EncodePublicKey as _;
-use secrecy::ExposeSecret;
 use sha2::{Digest as _, Sha256};
+use zeroize::Zeroizing;
 
 use crate::backend::CommandRunner;
 use crate::error::{Error, Result};
@@ -18,7 +18,8 @@ use super::seed::{
     seed_profile_from_profile,
 };
 use super::shared::{
-    execute_prf_derivation_with_runner, identity_key_spec, resolve_effective_derivation_inputs,
+    SecretBytes, execute_prf_derivation_with_runner, identity_key_spec,
+    resolve_effective_derivation_inputs,
 };
 
 const KEYGEN_SCALAR_RETRY_DOMAIN: &[u8] = b"tpm2-derive\0keygen-scalar-retry\0v1";
@@ -28,7 +29,7 @@ pub(crate) fn derive_identity_key_material_with_defaults<R>(
     identity: &Identity,
     derivation: &DerivationOverrides,
     prf_runner: &R,
-) -> Result<Vec<u8>>
+) -> Result<SecretBytes>
 where
     R: CommandRunner,
 {
@@ -50,7 +51,7 @@ pub(crate) fn derive_identity_key_material<R, B, D>(
     prf_runner: &R,
     seed_backend: &B,
     seed_deriver: &D,
-) -> Result<Vec<u8>>
+) -> Result<SecretBytes>
 where
     R: CommandRunner,
     B: SeedBackend,
@@ -69,15 +70,21 @@ where
     }
 }
 
-pub(crate) fn normalized_secret_key_bytes(identity: &Identity, derived: &[u8]) -> Result<[u8; 32]> {
+pub(crate) fn normalized_secret_key_bytes(
+    identity: &Identity,
+    derived: &[u8],
+) -> Result<Zeroizing<[u8; 32]>> {
     match identity.algorithm {
-        Algorithm::Ed25519 => derived.try_into().map_err(|_| {
-            Error::Internal(format!(
-                "derived ed25519 key material for identity '{}' produced {} bytes instead of 32",
-                identity.name,
-                derived.len()
-            ))
-        }),
+        Algorithm::Ed25519 => {
+            let seed: [u8; 32] = derived.try_into().map_err(|_| {
+                Error::Internal(format!(
+                    "derived ed25519 key material for identity '{}' produced {} bytes instead of 32",
+                    identity.name,
+                    derived.len()
+                ))
+            })?;
+            Ok(Zeroizing::new(seed))
+        }
         Algorithm::P256 => valid_ec_scalar(identity, derived, |candidate| {
             p256::SecretKey::from_slice(candidate).is_ok()
         }),
@@ -108,7 +115,7 @@ pub(crate) fn public_key_spki_der_from_material(
         }
         Algorithm::P256 => {
             let scalar = normalized_secret_key_bytes(identity, derived)?;
-            let secret_key = p256::SecretKey::from_slice(&scalar).map_err(|error| {
+            let secret_key = p256::SecretKey::from_slice(scalar.as_ref()).map_err(|error| {
                 Error::Internal(format!(
                     "failed to materialize p256 secret key for identity '{}': {error}",
                     identity.name
@@ -128,7 +135,7 @@ pub(crate) fn public_key_spki_der_from_material(
         }
         Algorithm::Secp256k1 => {
             let scalar = normalized_secret_key_bytes(identity, derived)?;
-            let secret_key = k256::SecretKey::from_slice(&scalar).map_err(|error| {
+            let secret_key = k256::SecretKey::from_slice(scalar.as_ref()).map_err(|error| {
                 Error::Internal(format!(
                     "failed to materialize secp256k1 secret key for identity '{}': {error}",
                     identity.name
@@ -153,7 +160,8 @@ pub(crate) fn keypair_hex_from_material(
     identity: &Identity,
     derived: &[u8],
 ) -> Result<(String, String)> {
-    let secret_key_hex = hex_encode(&normalized_secret_key_bytes(identity, derived)?);
+    let secret_key_bytes = normalized_secret_key_bytes(identity, derived)?;
+    let secret_key_hex = hex_encode(secret_key_bytes.as_ref());
     let public_key_hex = hex_encode(&public_key_spki_der_from_material(identity, derived)?);
     Ok((secret_key_hex, public_key_hex))
 }
@@ -163,7 +171,7 @@ fn derive_seed_identity_key_material<B, D>(
     spec: crate::crypto::DerivationSpec,
     backend: &B,
     deriver: &D,
-) -> Result<Vec<u8>>
+) -> Result<SecretBytes>
 where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
@@ -178,12 +186,14 @@ where
         confirm_software_derivation: true,
     };
 
-    Ok(open_and_derive(backend, deriver, &request)?
-        .expose_secret()
-        .to_vec())
+    open_and_derive(backend, deriver, &request)
 }
 
-fn valid_ec_scalar<F>(identity: &Identity, derived: &[u8], is_valid: F) -> Result<[u8; 32]>
+fn valid_ec_scalar<F>(
+    identity: &Identity,
+    derived: &[u8],
+    is_valid: F,
+) -> Result<Zeroizing<[u8; 32]>>
 where
     F: Fn(&[u8]) -> bool,
 {
@@ -194,14 +204,15 @@ where
             derived.len()
         ))
     })?;
-    if is_valid(&seed) {
+    let seed = Zeroizing::new(seed);
+    if is_valid(seed.as_ref()) {
         return Ok(seed);
     }
 
     for counter in 1..=KEYGEN_SCALAR_RETRY_LIMIT {
-        let candidate = scalar_retry_bytes(&seed, identity.algorithm, counter);
+        let candidate = scalar_retry_bytes(seed.as_ref(), identity.algorithm, counter);
         if is_valid(&candidate) {
-            return Ok(candidate);
+            return Ok(Zeroizing::new(candidate));
         }
     }
 
@@ -211,7 +222,7 @@ where
     )))
 }
 
-fn scalar_retry_bytes(seed: &[u8; 32], algorithm: Algorithm, counter: u32) -> [u8; 32] {
+fn scalar_retry_bytes(seed: &[u8], algorithm: Algorithm, counter: u32) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(KEYGEN_SCALAR_RETRY_DOMAIN);
     hasher.update(match algorithm {
@@ -231,4 +242,54 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::model::{IdentityModeResolution, ModePreference, StateLayout, UseCase};
+
+    fn test_identity(algorithm: Algorithm) -> Identity {
+        Identity::new(
+            format!("{algorithm:?}-keygen-test"),
+            algorithm,
+            vec![UseCase::Sign],
+            IdentityModeResolution {
+                requested: ModePreference::Seed,
+                resolved: Mode::Seed,
+                reasons: vec!["seed requested".to_string()],
+            },
+            StateLayout::new(std::env::temp_dir().join(format!(
+                "tpm2-derive-keygen-test-{algorithm:?}-{}",
+                std::process::id()
+            ))),
+        )
+    }
+
+    fn assert_zeroizing_array(_: &Zeroizing<[u8; 32]>) {}
+
+    #[test]
+    fn normalized_secret_key_bytes_preserves_ed25519_seed_in_zeroizing_storage() {
+        let identity = test_identity(Algorithm::Ed25519);
+        let derived = [0x42_u8; 32];
+
+        let normalized = normalized_secret_key_bytes(&identity, &derived).expect("normalized");
+
+        assert_zeroizing_array(&normalized);
+        assert_eq!(normalized.as_ref(), &derived);
+    }
+
+    #[test]
+    fn normalized_secret_key_bytes_retries_invalid_p256_scalar() {
+        let identity = test_identity(Algorithm::P256);
+        let invalid_scalar = [0_u8; 32];
+
+        let normalized =
+            normalized_secret_key_bytes(&identity, &invalid_scalar).expect("normalized");
+
+        assert_zeroizing_array(&normalized);
+        assert_ne!(normalized.as_ref(), &invalid_scalar);
+        assert!(p256::SecretKey::from_slice(normalized.as_ref()).is_ok());
+    }
 }

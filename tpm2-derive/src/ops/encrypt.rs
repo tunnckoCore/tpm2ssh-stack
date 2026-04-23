@@ -6,6 +6,7 @@ use chacha20poly1305::{
 };
 use rand::RngCore;
 use secrecy::ExposeSecret;
+use zeroize::Zeroizing;
 
 use crate::backend::CommandRunner;
 use crate::error::{Error, Result};
@@ -68,7 +69,7 @@ where
 
     let key_material =
         derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
-    let ciphertext = aead_encrypt(&key_material, plaintext)?;
+    let ciphertext = aead_encrypt(&*key_material, plaintext)?;
 
     Ok(EncryptResult {
         identity: identity.name.clone(),
@@ -128,7 +129,7 @@ where
 
     let key_material =
         derive_symmetric_key(identity, derivation, prf_runner, seed_backend, seed_deriver)?;
-    let plaintext = aead_decrypt(&key_material, ciphertext)?;
+    let plaintext = aead_decrypt(&*key_material, ciphertext)?;
 
     Ok(DecryptResult {
         identity: identity.name.clone(),
@@ -148,7 +149,7 @@ fn derive_symmetric_key<R, B, D>(
     prf_runner: &R,
     seed_backend: &B,
     seed_deriver: &D,
-) -> Result<[u8; 32]>
+) -> Result<Zeroizing<[u8; 32]>>
 where
     R: CommandRunner,
     B: SeedBackend,
@@ -169,7 +170,7 @@ fn derive_seed_symmetric_key<B, D>(
     derivation: &DerivationOverrides,
     backend: &B,
     deriver: &D,
-) -> Result<[u8; 32]>
+) -> Result<Zeroizing<[u8; 32]>>
 where
     B: SeedBackend,
     D: SeedSoftwareDeriver,
@@ -196,14 +197,14 @@ fn derive_prf_symmetric_key<R>(
     identity: &Identity,
     derivation: &DerivationOverrides,
     runner: &R,
-) -> Result<[u8; 32]>
+) -> Result<Zeroizing<[u8; 32]>>
 where
     R: CommandRunner,
 {
     let effective = resolve_effective_derivation_inputs(identity, derivation)?;
     let spec = encrypt_command_spec(&effective)?;
     let material = execute_prf_derivation_with_runner(identity, spec, runner, "encrypt")?;
-    to_key_bytes(&material)
+    to_key_bytes(material.expose_secret())
 }
 
 fn aead_encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -238,13 +239,14 @@ fn aead_decrypt(key: &[u8; 32], envelope: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
-fn to_key_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
-    bytes.try_into().map_err(|_| {
+fn to_key_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let key: [u8; 32] = bytes.try_into().map_err(|_| {
         Error::Internal(format!(
             "symmetric key derivation produced {} bytes instead of 32",
             bytes.len()
         ))
-    })
+    })?;
+    Ok(Zeroizing::new(key))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

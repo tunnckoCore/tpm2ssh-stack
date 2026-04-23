@@ -30,8 +30,8 @@ use crate::ops::seed::{
     SeedSoftwareDeriver, SoftwareSeedDerivationRequest, open_and_derive, plan_open,
     seed_profile_from_profile,
 };
-#[cfg(test)]
 use secrecy::ExposeSecret;
+use zeroize::Zeroizing;
 
 use super::shared::{
     BUFFERED_MESSAGE_INPUT_BYTES_LIMIT, classify_native_command_failure,
@@ -205,16 +205,18 @@ where
         "derived-signer-material",
         format!(
             "derived {} bytes of {:?} signing key material from {:?} backing using the effective derivation inputs",
-            derived.len(),
+            derived.expose_secret().len(),
             identity.algorithm,
             identity.mode.resolved,
         ),
     )];
 
     let (signature_bytes, signature_format) = match identity.algorithm {
-        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, &derived)?,
-        Algorithm::P256 => sign_seed_p256(&input_bytes, &derived, identity)?,
-        Algorithm::Secp256k1 => sign_seed_secp256k1(&input_bytes, &derived, identity)?,
+        Algorithm::Ed25519 => sign_seed_ed25519(&input_bytes, derived.expose_secret())?,
+        Algorithm::P256 => sign_seed_p256(&input_bytes, derived.expose_secret(), identity)?,
+        Algorithm::Secp256k1 => {
+            sign_seed_secp256k1(&input_bytes, derived.expose_secret(), identity)?
+        }
     };
 
     let (output_path, signature) =
@@ -310,6 +312,7 @@ pub(crate) fn sign_seed_ed25519(
             "seed sign ed25519 derivation produced a non-32-byte seed unexpectedly".to_string(),
         )
     })?;
+    let seed_bytes = Zeroizing::new(seed_bytes);
     let signing_key = Ed25519SigningKey::from_bytes(&seed_bytes);
     let signature = signing_key.sign(input_bytes);
     Ok((signature.to_bytes().to_vec(), SeedSignatureFormat::Raw))
@@ -322,7 +325,7 @@ pub(crate) fn sign_seed_p256(
 ) -> Result<(Vec<u8>, SeedSignatureFormat)> {
     let scalar_bytes =
         crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = P256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+    let signing_key = P256SigningKey::from_bytes((&*scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
             "failed to materialize p256 seed signing key for identity '{}': {error}",
             identity.name
@@ -344,7 +347,7 @@ pub(crate) fn sign_seed_secp256k1(
 ) -> Result<(Vec<u8>, SeedSignatureFormat)> {
     let scalar_bytes =
         crate::ops::seed_valid_ec_scalar_bytes_standalone(derived_seed, identity.algorithm)?;
-    let signing_key = K256SigningKey::from_bytes((&scalar_bytes).into()).map_err(|error| {
+    let signing_key = K256SigningKey::from_bytes((&*scalar_bytes).into()).map_err(|error| {
         Error::Internal(format!(
             "failed to materialize secp256k1 seed signing key for identity '{}': {error}",
             identity.name
