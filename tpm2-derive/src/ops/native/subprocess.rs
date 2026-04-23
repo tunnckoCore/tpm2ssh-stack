@@ -4,7 +4,7 @@ use p256::ecdsa::Signature as P256Signature;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::model::Diagnostic;
+use crate::model::{Diagnostic, validate_identity_name_policy};
 
 use super::{
     DigestAlgorithm, NativeEcPoint, NativeIdentityCreateRequest, NativeKeyRef, NativeKeySemantics,
@@ -98,7 +98,7 @@ pub struct NativeSetupArtifacts {
 
 impl NativeSetupArtifacts {
     pub fn key_ref(&self, identity: &str) -> Result<NativeKeyRef> {
-        validate_identifier("identity", identity)?;
+        validate_identity_name_policy(identity, "identity")?;
         validate_identifier("key_id", &self.key_id)?;
         validate_non_empty_path(&self.scratch_dir)?;
 
@@ -880,6 +880,43 @@ mod tests {
             format,
             digest_algorithm: DigestAlgorithm::Sha256,
             digest: vec![0xabu8; 32],
+        }
+    }
+
+    #[test]
+    fn setup_artifacts_reject_invalid_identity_names() {
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let error = setup_artifacts()
+                .key_ref(invalid)
+                .expect_err("invalid native identity names should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains("^[a-zA-Z0-9_-]+$"))
+            );
+        }
+    }
+
+    #[test]
+    fn setup_plan_rejects_invalid_identity_names() {
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let mut request = setup_request(vec![NativeKeyUse::Sign, NativeKeyUse::Verify]);
+            request.identity = invalid.to_string();
+            let error = plan_setup(&request, &setup_artifacts())
+                .expect_err("invalid native setup identity names should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains("^[a-zA-Z0-9_-]+$"))
+            );
         }
     }
 

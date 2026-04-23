@@ -42,8 +42,8 @@ Scope for this follow-up wave:
 
 ### Checklist
 
-- [ ] enforce `[a-zA-Z0-9_-]` consistently for identity/profile validators
-- [ ] add focused rejection tests for `.`, `/`, `\\`, whitespace, and mixed-invalid names
+- [x] enforce `[a-zA-Z0-9_-]` consistently for identity/profile validators
+- [x] add focused rejection tests for `.`, `/`, `\\`, whitespace, and mixed-invalid names
 
 ---
 

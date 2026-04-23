@@ -14,8 +14,26 @@ use crate::model::{Algorithm, Mode, ModePreference, StateLayout, UseCase};
 use crate::ops::shared::{IDENTITY_JSON_BYTES_LIMIT, read_path_string_with_limit};
 
 pub const IDENTITY_SCHEMA_VERSION: u32 = 2;
+pub const IDENTITY_NAME_POLICY_PATTERN: &str = "^[a-zA-Z0-9_-]+$";
 
 static NEXT_TEMP_IDENTITY_ID: AtomicU64 = AtomicU64::new(0);
+
+pub fn validate_identity_name_policy(name: &str, field: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::Validation(format!("{field} must not be empty")));
+    }
+
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(Error::Validation(format!(
+            "{field} must match {IDENTITY_NAME_POLICY_PATTERN}"
+        )));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct IdentityModeResolution {
@@ -145,6 +163,7 @@ impl Identity {
     }
 
     pub fn persist(&self) -> Result<()> {
+        validate_identity_name_policy(&self.name, "identity name")?;
         self.storage.state_layout.ensure_dirs()?;
         write_json_atomically(&self.storage.identity_path, self)
     }
@@ -154,6 +173,8 @@ impl Identity {
     }
 
     pub fn load_from_layout(name: &str, state_layout: StateLayout) -> Result<Self> {
+        validate_identity_name_policy(name, "identity name")?;
+
         let identity_path = state_layout.identity_path(name);
         let contents = read_path_string_with_limit(
             &identity_path,
@@ -183,6 +204,8 @@ impl Identity {
                 identity_path.display()
             ))
         })?;
+
+        validate_identity_name_policy(&identity.name, "identity name")?;
 
         if identity.name != name {
             return Err(Error::State(format!(
@@ -275,6 +298,66 @@ mod tests {
             "tpm2-derive-{label}-{}-{sequence}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn validate_identity_name_policy_rejects_invalid_names() {
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let error = validate_identity_name_policy(invalid, "identity name")
+                .expect_err("invalid identity names should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains(IDENTITY_NAME_POLICY_PATTERN))
+            );
+        }
+    }
+
+    #[test]
+    fn persist_rejects_invalid_identity_name() {
+        let root_dir = unique_temp_path("identity-invalid-persist");
+        let state_layout = StateLayout::new(root_dir.clone());
+        let identity = Identity::new(
+            ".".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign],
+            IdentityModeResolution {
+                requested: ModePreference::Auto,
+                resolved: Mode::Native,
+                reasons: vec!["test".to_string()],
+            },
+            state_layout,
+        );
+
+        let error = identity
+            .persist()
+            .expect_err("invalid identity names should not persist");
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains(IDENTITY_NAME_POLICY_PATTERN))
+        );
+    }
+
+    #[test]
+    fn load_named_rejects_invalid_requested_identity_names() {
+        let root_dir = unique_temp_path("identity-invalid-load-name");
+
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let error = Identity::load_named(invalid, Some(root_dir.clone()))
+                .expect_err("invalid identity names should fail before path resolution");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains(IDENTITY_NAME_POLICY_PATTERN))
+            );
+        }
     }
 
     #[test]

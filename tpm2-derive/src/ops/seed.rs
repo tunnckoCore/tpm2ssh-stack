@@ -13,7 +13,9 @@ use tempfile::{Builder as TempfileBuilder, NamedTempFile, TempDir};
 use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::DerivationSpec;
 use crate::error::{Error, Result};
-use crate::model::{Algorithm, Diagnostic, DiagnosticLevel, Identity, UseCase};
+use crate::model::{
+    Algorithm, Diagnostic, DiagnosticLevel, Identity, UseCase, validate_identity_name_policy,
+};
 
 pub const SEED_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const SEED_RECOVERY_BUNDLE_SCHEMA_VERSION: u32 = 1;
@@ -1184,6 +1186,7 @@ fn build_recovery_bundle(request: &SeedExportRequest, seed: &[u8]) -> SeedRecove
 
 pub fn validate_seed_profile(identity: &SeedIdentity) -> Result<()> {
     validate_profile_name(&identity.identity)?;
+    validate_profile_name(&identity.storage.object_label)?;
 
     if identity.schema_version != SEED_PROFILE_SCHEMA_VERSION {
         return Err(Error::Validation(format!(
@@ -1235,28 +1238,7 @@ fn validate_derivation_request(request: &SoftwareSeedDerivationRequest) -> Resul
 }
 
 fn validate_profile_name(identity: &str) -> Result<()> {
-    if identity.trim().is_empty() {
-        return Err(Error::Validation(
-            "identity name must not be empty".to_string(),
-        ));
-    }
-
-    if !identity
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-    {
-        return Err(Error::Validation(
-            "identity name may only contain ASCII letters, digits, '.', '_' or '-'".to_string(),
-        ));
-    }
-
-    if identity.contains("..") || identity.contains('/') || identity.contains('\\') {
-        return Err(Error::Validation(
-            "identity name must not contain path traversal or separators".to_string(),
-        ));
-    }
-
-    Ok(())
+    validate_identity_name_policy(identity, "identity name")
 }
 
 fn validate_seed_len(bytes: usize) -> Result<()> {
@@ -1495,6 +1477,33 @@ mod tests {
                 .expect("derivation spec"),
             ),
             output_bytes: 32,
+        }
+    }
+
+    #[test]
+    fn validate_seed_profile_rejects_invalid_names() {
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let mut identity = seed_profile();
+            identity.identity = invalid.to_string();
+            let error = validate_seed_profile(&identity)
+                .expect_err("invalid seed identity names should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains("^[a-zA-Z0-9_-]+$"))
+            );
+
+            let mut identity = seed_profile();
+            identity.storage.object_label = invalid.to_string();
+            let error = validate_seed_profile(&identity)
+                .expect_err("invalid seed object labels should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains("^[a-zA-Z0-9_-]+$"))
+            );
         }
     }
 

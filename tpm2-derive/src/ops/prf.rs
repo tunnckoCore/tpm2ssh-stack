@@ -10,6 +10,7 @@ use tempfile::{Builder as TempfileBuilder, TempDir};
 use crate::backend::{CommandInvocation, CommandOutput, CommandRunner, ProcessCommandRunner};
 use crate::crypto::{DerivationSpec, DerivationVersion, OutputKind};
 use crate::error::{Error, Result};
+use crate::model::validate_identity_name_policy;
 
 pub const PRF_CONTEXT_PATH_METADATA_KEY: &str = "prf.context-path";
 pub const PRF_PARENT_CONTEXT_PATH_METADATA_KEY: &str = "prf.parent-context-path";
@@ -39,11 +40,7 @@ impl PrfRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.identity.trim().is_empty() {
-            return Err(Error::Validation(
-                "identity must not be empty for PRF operations".to_string(),
-            ));
-        }
+        validate_identity_name_policy(&self.identity, "identity")?;
 
         let _ = self.derivation.canonical_bytes()?;
         Ok(())
@@ -759,29 +756,7 @@ fn preview(value: &str) -> String {
 }
 
 fn validate_identity_name(identity: &str) -> Result<()> {
-    if identity.trim().is_empty() {
-        return Err(Error::Validation(
-            "identity must not be empty for PRF operations".to_string(),
-        ));
-    }
-
-    if !identity
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-    {
-        return Err(Error::Validation(
-            "identity may only contain ASCII letters, digits, '.', '_' or '-' for PRF operations"
-                .to_string(),
-        ));
-    }
-
-    if identity.contains("..") || identity.contains('/') || identity.contains('\\') {
-        return Err(Error::Validation(
-            "identity must not contain path traversal or separators for PRF operations".to_string(),
-        ));
-    }
-
-    Ok(())
+    validate_identity_name_policy(identity, "identity")
 }
 
 fn path_arg(path: &Path) -> String {
@@ -790,16 +765,62 @@ fn path_arg(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     use super::{
-        PrfProtocolVersion, PrfRequest, RawPrfOutput, TpmPrfCommandKind, TpmPrfExecutor,
-        TpmPrfHashAlgorithm, TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner, finalize,
-        plan_tpm_prf_in,
+        PrfProtocolVersion, PrfRequest, PrfRootLayout, RawPrfOutput, TpmPrfCommandKind,
+        TpmPrfExecutor, TpmPrfHashAlgorithm, TpmPrfKeyHandle, execute_tpm_prf_plan_with_runner,
+        finalize, plan_tpm_prf_in,
     };
     use crate::backend::{CommandInvocation, CommandOutput, CommandRunner};
     use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
+    use crate::error::Error;
+
+    #[test]
+    fn request_rejects_invalid_identity_names() {
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let error = PrfRequest::new(
+                invalid,
+                DerivationSpec::V1(
+                    DerivationSpecV1::passkey_provider(
+                        "io.github.example",
+                        "example.com",
+                        "cred-123",
+                        32,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .expect_err("invalid PRF identity names should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains("^[a-zA-Z0-9_-]+$"))
+            );
+        }
+    }
+
+    #[test]
+    fn prf_layout_rejects_invalid_identity_names() {
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let error = PrfRootLayout::for_profile(Path::new("/tmp/prf-objects"), invalid)
+                .expect_err("invalid PRF layout names should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains("^[a-zA-Z0-9_-]+$"))
+            );
+        }
+    }
 
     #[test]
     fn request_tpm_input_is_canonical_and_non_empty() {

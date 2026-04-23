@@ -49,7 +49,7 @@ use crate::model::{
     Algorithm, CapabilityReport, DerivationOverrides, ExportArtifact, ExportFormat, ExportKind,
     ExportRequest, ExportResult, Format, Identity, IdentityCreateRequest, IdentityCreateResult,
     IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode, StateLayout, UseCase,
-    expand_mode_requested_uses,
+    expand_mode_requested_uses, validate_identity_name_policy,
 };
 use crate::ops::native::subprocess::{
     NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
@@ -2296,28 +2296,7 @@ fn resolve_mode(
 }
 
 fn validate_profile_name(identity: &str) -> Result<()> {
-    if identity.trim().is_empty() {
-        return Err(Error::Validation(
-            "identity name must not be empty".to_string(),
-        ));
-    }
-
-    if !identity
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        return Err(Error::Validation(
-            "identity name may contain only ASCII letters, numbers, '.', '-', and '_'".to_string(),
-        ));
-    }
-
-    if identity.contains("..") {
-        return Err(Error::Validation(
-            "identity name must not contain '..'".to_string(),
-        ));
-    }
-
-    Ok(())
+    validate_identity_name_policy(identity, "identity name")
 }
 
 fn normalize_uses(mut uses: Vec<UseCase>) -> Vec<UseCase> {
@@ -2363,6 +2342,23 @@ mod tests {
             .join(identity)
             .join("native")
             .join(format!("{identity}-signing-key.handle"))
+    }
+
+    #[test]
+    fn load_identity_rejects_invalid_identity_names() {
+        for invalid in [
+            ".",
+            "nested/name",
+            r"nested\name",
+            "white space",
+            "mix./ bad",
+        ] {
+            let error = load_identity(invalid, None)
+                .expect_err("invalid identity names should fail closed");
+            assert!(
+                matches!(error, Error::Validation(message) if message.contains("^[a-zA-Z0-9_-]+$"))
+            );
+        }
     }
 
     #[test]

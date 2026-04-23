@@ -1,6 +1,7 @@
 pub mod subprocess;
 
 use crate::error::{Error, Result};
+use crate::model::validate_identity_name_policy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -143,7 +144,7 @@ pub struct NativeKeyRef {
 
 impl Validate for NativeKeyRef {
     fn validate(&self) -> Result<()> {
-        validate_identifier("identity", &self.identity)?;
+        validate_identity_name_policy(&self.identity, "identity")?;
         validate_identifier("key_id", &self.key_id)
     }
 }
@@ -178,7 +179,7 @@ pub struct NativeIdentityCreateRequest {
 
 impl Validate for NativeIdentityCreateRequest {
     fn validate(&self) -> Result<()> {
-        validate_identifier("identity", &self.identity)?;
+        validate_identity_name_policy(&self.identity, "identity")?;
         validate_optional_label("key_label", self.key_label.as_deref())?;
         validate_native_key_shape(self.algorithm, self.curve)?;
         validate_non_empty_unique_uses(&self.allowed_uses)?;
