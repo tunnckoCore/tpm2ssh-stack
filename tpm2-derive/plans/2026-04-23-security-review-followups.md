@@ -22,9 +22,9 @@ Scope for this follow-up wave:
 
 ### Checklist
 
-- [ ] reject symlinked ancestor path components
-- [ ] pin and use only the verified socket path
-- [ ] add regression coverage for ancestor symlink and swap attempts
+- [x] reject symlinked ancestor path components
+- [x] pin and use only the verified socket path
+- [x] add regression coverage for ancestor symlink and swap attempts
 
 ---
 

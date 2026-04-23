@@ -204,13 +204,14 @@ where
             ))
         })?);
 
-    client.add_private_key(&socket, &private_key_openssh)?;
+    socket.revalidate()?;
+    client.add_private_key(socket.path(), &private_key_openssh)?;
 
     Ok(SshAddResult {
         identity: identity.name.clone(),
         mode: identity.mode.resolved,
         algorithm: identity.algorithm,
-        socket,
+        socket: socket.path().to_path_buf(),
         comment,
         public_key_openssh,
     })
@@ -398,81 +399,228 @@ fn default_comment(identity: &Identity) -> String {
     format!("{}@tpm2-derive", identity.name)
 }
 
-fn resolve_socket(explicit_socket: Option<&Path>) -> Result<PathBuf> {
-    let path = if let Some(path) = explicit_socket {
-        path.to_path_buf()
-    } else {
-        match env::var_os("SSH_AUTH_SOCK") {
-            Some(value) if !value.is_empty() => PathBuf::from(value),
-            _ => {
-                return Err(Error::State(
-                    "ssh-add requires --socket or SSH_AUTH_SOCK to point at a running agent"
-                        .to_string(),
-                ));
-            }
-        }
-    };
+#[derive(Debug, Clone)]
+struct VerifiedSocketPath {
+    path: PathBuf,
+    #[cfg(unix)]
+    device_id: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    status_change_time_secs: i64,
+    #[cfg(unix)]
+    status_change_time_nanos: i64,
+}
 
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+impl VerifiedSocketPath {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(unix)]
+    fn revalidate(&self) -> Result<()> {
+        reject_symlinked_ancestor_components(&self.path)?;
+        let metadata = load_socket_metadata(&self.path)?;
+        validate_socket_metadata(&self.path, &metadata)?;
+        validate_socket_parent_directory(&self.path)?;
+        if metadata.dev() != self.device_id
+            || metadata.ino() != self.inode
+            || metadata.ctime() != self.status_change_time_secs
+            || metadata.ctime_nsec() != self.status_change_time_nanos
+        {
+            return Err(Error::Validation(format!(
+                "ssh-add socket '{}' changed after validation; refusing to export private key",
+                self.path.display()
+            )));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn revalidate(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn requested_socket_path(explicit_socket: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit_socket {
+        return Ok(path.to_path_buf());
+    }
+
+    match env::var_os("SSH_AUTH_SOCK") {
+        Some(value) if !value.is_empty() => Ok(PathBuf::from(value)),
+        _ => Err(Error::State(
+            "ssh-add requires --socket or SSH_AUTH_SOCK to point at a running agent".to_string(),
+        )),
+    }
+}
+
+fn load_socket_metadata(path: &Path) -> Result<fs::Metadata> {
+    fs::symlink_metadata(path).map_err(|error| {
         Error::State(format!(
             "ssh-add requires a valid agent socket path '{}': {error}",
             path.display()
         ))
-    })?;
+    })
+}
 
-    #[cfg(unix)]
-    {
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            return Err(Error::Validation(format!(
-                "ssh-add requires '{}' to be a direct Unix-domain socket path, not a symlink",
+#[cfg(unix)]
+fn absolute_socket_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    Ok(env::current_dir()
+        .map_err(|error| {
+            Error::State(format!(
+                "failed to resolve current directory while validating ssh-agent socket '{}': {error}",
                 path.display()
-            )));
-        }
-        if !file_type.is_socket() {
-            return Err(Error::Validation(format!(
-                "ssh-add requires '{}' to be a Unix-domain socket",
-                path.display()
-            )));
+            ))
+        })?
+        .join(path))
+}
+
+#[cfg(unix)]
+fn reject_symlinked_ancestor_components(path: &Path) -> Result<()> {
+    let absolute_path = absolute_socket_path(path)?;
+    let components: Vec<_> = absolute_path.components().collect();
+    let mut current = PathBuf::new();
+
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        if index + 1 == components.len() {
+            break;
         }
 
-        let current_uid = unsafe { libc::geteuid() };
-        if metadata.uid() != current_uid {
-            return Err(Error::Validation(format!(
-                "ssh-add requires socket '{}' to be owned by the current user",
-                path.display()
-            )));
-        }
-        if metadata.permissions().mode() & 0o022 != 0 {
-            return Err(Error::Validation(format!(
-                "ssh-add requires socket '{}' to not be writable by group or other users",
-                path.display()
-            )));
-        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            Error::State(format!(
+                "failed to inspect ssh-agent socket ancestor '{}': {error}",
+                current.display()
+            ))
+        })?;
 
-        if let Some(parent) = path.parent() {
-            let parent_metadata = fs::metadata(parent).map_err(|error| {
-                Error::State(format!(
-                    "failed to inspect ssh-agent socket parent directory '{}': {error}",
-                    parent.display()
-                ))
-            })?;
-            if parent_metadata.uid() != current_uid {
-                return Err(Error::Validation(format!(
-                    "ssh-add requires socket parent directory '{}' to be owned by the current user",
-                    parent.display()
-                )));
-            }
-            if parent_metadata.permissions().mode() & 0o022 != 0 {
-                return Err(Error::Validation(format!(
-                    "ssh-add requires socket parent directory '{}' to not be writable by group or other users",
-                    parent.display()
-                )));
-            }
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Validation(format!(
+                "ssh-add requires socket ancestor '{}' to not be a symlink",
+                current.display()
+            )));
         }
     }
 
-    Ok(path)
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_socket_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(Error::Validation(format!(
+            "ssh-add requires '{}' to be a direct Unix-domain socket path, not a symlink",
+            path.display()
+        )));
+    }
+    if !file_type.is_socket() {
+        return Err(Error::Validation(format!(
+            "ssh-add requires '{}' to be a Unix-domain socket",
+            path.display()
+        )));
+    }
+
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != current_uid {
+        return Err(Error::Validation(format!(
+            "ssh-add requires socket '{}' to be owned by the current user",
+            path.display()
+        )));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(Error::Validation(format!(
+            "ssh-add requires socket '{}' to not be writable by group or other users",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_socket_parent_directory(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let parent_metadata = fs::symlink_metadata(parent).map_err(|error| {
+            Error::State(format!(
+                "failed to inspect ssh-agent socket parent directory '{}': {error}",
+                parent.display()
+            ))
+        })?;
+        if parent_metadata.file_type().is_symlink() {
+            return Err(Error::Validation(format!(
+                "ssh-add requires socket parent directory '{}' to not be a symlink",
+                parent.display()
+            )));
+        }
+        let current_uid = unsafe { libc::geteuid() };
+        if parent_metadata.uid() != current_uid {
+            return Err(Error::Validation(format!(
+                "ssh-add requires socket parent directory '{}' to be owned by the current user",
+                parent.display()
+            )));
+        }
+        if parent_metadata.permissions().mode() & 0o022 != 0 {
+            return Err(Error::Validation(format!(
+                "ssh-add requires socket parent directory '{}' to not be writable by group or other users",
+                parent.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_socket(explicit_socket: Option<&Path>) -> Result<VerifiedSocketPath> {
+    let requested_path = requested_socket_path(explicit_socket)?;
+
+    #[cfg(unix)]
+    reject_symlinked_ancestor_components(&requested_path)?;
+
+    let requested_metadata = load_socket_metadata(&requested_path)?;
+
+    #[cfg(unix)]
+    if requested_metadata.file_type().is_symlink() {
+        return Err(Error::Validation(format!(
+            "ssh-add requires '{}' to be a direct Unix-domain socket path, not a symlink",
+            requested_path.display()
+        )));
+    }
+
+    let path = fs::canonicalize(&requested_path).map_err(|error| {
+        Error::State(format!(
+            "ssh-add requires a valid agent socket path '{}': {error}",
+            requested_path.display()
+        ))
+    })?;
+
+    let metadata = load_socket_metadata(&path)?;
+    let _ = requested_metadata;
+
+    #[cfg(unix)]
+    {
+        validate_socket_metadata(&path, &metadata)?;
+        validate_socket_parent_directory(&path)?;
+        return Ok(VerifiedSocketPath {
+            path,
+            device_id: metadata.dev(),
+            inode: metadata.ino(),
+            status_change_time_secs: metadata.ctime(),
+            status_change_time_nanos: metadata.ctime_nsec(),
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(VerifiedSocketPath { path })
+    }
 }
 
 #[cfg(test)]
@@ -491,7 +639,7 @@ mod tests {
         StateLayout, UseCase,
     };
     use crate::ops::prf::PRF_CONTEXT_PATH_METADATA_KEY;
-    use crate::ops::seed::{SeedCreateRequest, SeedMaterial};
+    use crate::ops::seed::{SeedCreateRequest, SeedMaterial, SoftwareSeedDerivationRequest};
 
     use super::*;
 
@@ -553,6 +701,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingSshAddClient {
+        sockets: RefCell<Vec<PathBuf>>,
         private_keys: RefCell<Vec<String>>,
     }
 
@@ -560,18 +709,57 @@ mod tests {
         fn keys(&self) -> Vec<String> {
             self.private_keys.borrow().clone()
         }
+
+        fn sockets(&self) -> Vec<PathBuf> {
+            self.sockets.borrow().clone()
+        }
     }
 
     impl SshAddClient for RecordingSshAddClient {
         fn add_private_key(
             &self,
-            _socket: &Path,
+            socket: &Path,
             private_key_openssh: &Zeroizing<String>,
         ) -> Result<()> {
+            self.sockets.borrow_mut().push(socket.to_path_buf());
             self.private_keys
                 .borrow_mut()
                 .push(private_key_openssh.to_string());
             Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    struct SwappingSeedDeriver {
+        socket_path: PathBuf,
+        original_listener: RefCell<Option<UnixListener>>,
+        replacement_listener: RefCell<Option<UnixListener>>,
+    }
+
+    #[cfg(unix)]
+    impl SwappingSeedDeriver {
+        fn new(socket_path: PathBuf, listener: UnixListener) -> Self {
+            Self {
+                socket_path,
+                original_listener: RefCell::new(Some(listener)),
+                replacement_listener: RefCell::new(None),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl SeedSoftwareDeriver for SwappingSeedDeriver {
+        fn derive(
+            &self,
+            _seed: &SeedMaterial,
+            _request: &SoftwareSeedDerivationRequest,
+        ) -> Result<SeedMaterial> {
+            self.original_listener.borrow_mut().take();
+            std::fs::remove_file(&self.socket_path).expect("remove original socket");
+            let replacement =
+                UnixListener::bind(&self.socket_path).expect("bind replacement socket");
+            self.replacement_listener.borrow_mut().replace(replacement);
+            Ok(SecretBox::new(Box::new(vec![0x44; 32])))
         }
     }
 
@@ -625,6 +813,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn resolve_socket_rejects_symlinked_ancestor_paths() {
+        let temp = tempdir().expect("tempdir");
+        let safe_dir = temp.path().join("safe");
+        let link_dir = temp.path().join("link");
+        std::fs::create_dir(&safe_dir).expect("safe dir");
+        let socket_path = safe_dir.join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        std::os::unix::fs::symlink(&safe_dir, &link_dir).expect("symlink ancestor");
+
+        let error = resolve_socket(Some(&link_dir.join("agent.sock")))
+            .expect_err("symlinked ancestor should be rejected");
+        assert!(matches!(error, Error::Validation(message) if message.contains("socket ancestor")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_socket_pins_canonical_path() {
+        let temp = tempdir().expect("tempdir");
+        let nested = temp.path().join("nested");
+        std::fs::create_dir(&nested).expect("nested dir");
+        let socket_path = temp.path().join("agent.sock");
+        let _listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let aliased_path = nested.join("..").join("agent.sock");
+
+        let resolved = resolve_socket(Some(&aliased_path)).expect("socket should validate");
+        assert_eq!(resolved.path(), socket_path.as_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn resolve_socket_rejects_non_socket_paths() {
         let temp = tempdir().expect("tempdir");
         let file_path = temp.path().join("not-a-socket");
@@ -644,7 +862,7 @@ mod tests {
         let _listener = UnixListener::bind(&socket_path).expect("bind socket");
 
         let resolved = resolve_socket(Some(&socket_path)).expect("socket should validate");
-        assert_eq!(resolved, socket_path);
+        assert_eq!(resolved.path(), socket_path.as_path());
     }
 
     #[cfg(unix)]
@@ -694,7 +912,7 @@ mod tests {
             &SshAddRequest {
                 identity: identity.name.clone(),
                 comment: Some("seed@test".to_string()),
-                socket: Some(socket_path),
+                socket: Some(socket_path.clone()),
                 state_dir: Some(temp.path().to_path_buf()),
                 reason: Some("seed ssh-agent use".to_string()),
                 confirm: true,
@@ -710,6 +928,8 @@ mod tests {
         assert_eq!(result.mode, Mode::Seed);
         assert_eq!(result.comment, "seed@test");
         assert!(result.public_key_openssh.starts_with("ssh-ed25519 "));
+        assert_eq!(result.socket, socket_path);
+        assert_eq!(client.sockets(), vec![result.socket.clone()]);
         assert_eq!(client.keys().len(), 1);
     }
 
@@ -726,7 +946,7 @@ mod tests {
             &SshAddRequest {
                 identity: identity.name.clone(),
                 comment: Some("prf@test".to_string()),
-                socket: Some(socket_path),
+                socket: Some(socket_path.clone()),
                 state_dir: Some(temp.path().to_path_buf()),
                 reason: Some("prf ssh-agent use".to_string()),
                 confirm: true,
@@ -745,7 +965,43 @@ mod tests {
                 .public_key_openssh
                 .starts_with("ecdsa-sha2-nistp256 ")
         );
+        assert_eq!(result.socket, socket_path);
+        assert_eq!(client.sockets(), vec![result.socket.clone()]);
         assert_eq!(client.keys().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_add_rejects_socket_swap_after_validation() {
+        let temp = tempdir().expect("tempdir");
+        let socket_path = temp.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let identity = seed_identity(temp.path());
+        let client = RecordingSshAddClient::default();
+
+        let error = add_with_backend(
+            &identity,
+            &SshAddRequest {
+                identity: identity.name.clone(),
+                comment: Some("seed@test".to_string()),
+                socket: Some(socket_path.clone()),
+                state_dir: Some(temp.path().to_path_buf()),
+                reason: Some("seed ssh-agent use".to_string()),
+                confirm: true,
+                derivation: DerivationOverrides::default(),
+            },
+            &RecordingPrfRunner::new(b"unused"),
+            &FakeSeedBackend::new(&[0x44; 32]),
+            &SwappingSeedDeriver::new(socket_path.clone(), listener),
+            &client,
+        )
+        .expect_err("socket swap after validation should fail");
+
+        assert!(
+            matches!(error, Error::Validation(message) if message.contains("changed after validation"))
+        );
+        assert!(client.sockets().is_empty());
+        assert!(client.keys().is_empty());
     }
 
     fn assert_zeroizing_string(_: &Zeroizing<String>) {}
