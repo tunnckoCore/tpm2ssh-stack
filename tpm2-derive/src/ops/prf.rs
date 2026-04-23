@@ -181,6 +181,7 @@ pub struct TpmPrfWorkspace {
     pub root_dir: PathBuf,
     pub request_input_path: PathBuf,
     pub raw_output_path: PathBuf,
+    pub transient_parent_context_path: PathBuf,
     pub transient_context_path: PathBuf,
 }
 
@@ -190,6 +191,7 @@ impl TpmPrfWorkspace {
         Self {
             request_input_path: root_dir.join("prf-request.bin"),
             raw_output_path: root_dir.join("prf-raw-output.bin"),
+            transient_parent_context_path: root_dir.join("prf-parent.ctx"),
             transient_context_path: root_dir.join("prf-key.ctx"),
             root_dir,
         }
@@ -281,12 +283,6 @@ where
             &staging.layout.public_path,
             &staging.layout.private_path,
         ))?;
-        self.run_checked(&load_prf_root_invocation(
-            &staging.layout.parent_context_path,
-            &staging.layout.public_path,
-            &staging.layout.private_path,
-            &staging.layout.loaded_context_path,
-        ))?;
 
         self.commit_root_staging(staging, &final_layout)
     }
@@ -342,6 +338,8 @@ struct PrfRootStaging {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TpmPrfCommandKind {
+    FlushTransientObjects,
+    CreatePrimary,
     LoadKey,
     Hmac,
 }
@@ -389,18 +387,27 @@ pub fn plan_tpm_prf_in(
     let mut steps = Vec::new();
 
     if let TpmPrfKeyHandle::LoadableObject {
-        parent_context_path,
         public_path,
         private_path,
+        ..
     } = &executor.key_handle
     {
+        steps.push(TpmPrfCommandStep {
+            kind: TpmPrfCommandKind::FlushTransientObjects,
+            invocation: CommandInvocation::new("tpm2_flushcontext", ["-t"]),
+        });
+        steps.push(TpmPrfCommandStep {
+            kind: TpmPrfCommandKind::CreatePrimary,
+            invocation: create_primary_invocation(&workspace.transient_parent_context_path),
+        });
         steps.push(TpmPrfCommandStep {
             kind: TpmPrfCommandKind::LoadKey,
             invocation: CommandInvocation::new(
                 "tpm2_load",
                 [
+                    "-R".to_string(),
                     "-C".to_string(),
-                    path_arg(parent_context_path),
+                    path_arg(&workspace.transient_parent_context_path),
                     "-u".to_string(),
                     path_arg(public_path),
                     "-r".to_string(),
@@ -516,6 +523,7 @@ fn create_primary_invocation(parent_context_path: &Path) -> CommandInvocation {
     CommandInvocation::new(
         "tpm2_createprimary",
         [
+            "-R".to_string(),
             "-C".to_string(),
             "o".to_string(),
             "-g".to_string(),
@@ -849,12 +857,16 @@ mod tests {
 
         let plan = plan_tpm_prf_in(request, executor, &workspace).unwrap();
 
-        assert_eq!(plan.steps.len(), 2);
-        assert_eq!(plan.steps[0].kind, TpmPrfCommandKind::LoadKey);
-        assert_eq!(plan.steps[0].invocation.program, "tpm2_load");
-        assert_eq!(plan.steps[1].kind, TpmPrfCommandKind::Hmac);
+        assert_eq!(plan.steps.len(), 4);
+        assert_eq!(plan.steps[0].kind, TpmPrfCommandKind::FlushTransientObjects);
+        assert_eq!(plan.steps[0].invocation.program, "tpm2_flushcontext");
+        assert_eq!(plan.steps[1].kind, TpmPrfCommandKind::CreatePrimary);
+        assert_eq!(plan.steps[1].invocation.program, "tpm2_createprimary");
+        assert_eq!(plan.steps[2].kind, TpmPrfCommandKind::LoadKey);
+        assert_eq!(plan.steps[2].invocation.program, "tpm2_load");
+        assert_eq!(plan.steps[3].kind, TpmPrfCommandKind::Hmac);
         assert!(
-            plan.steps[1]
+            plan.steps[3]
                 .invocation
                 .args
                 .contains(&"sha384".to_string())

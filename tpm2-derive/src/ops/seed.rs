@@ -704,6 +704,7 @@ where
         let object_context = transient.path().join("sealed.ctx");
         let output_path = transient.path().join("unsealed.bin");
 
+        self.run_checked(&flush_transient_objects_invocation())?;
         self.run_checked(&create_primary_invocation(&primary_context))?;
         self.run_checked(&load_sealed_object_invocation(
             &primary_context,
@@ -862,6 +863,10 @@ impl SeedBackend for ScaffoldSeedBackend {
     ) -> Result<SeedMaterial> {
         self.inner.unseal_seed(identity, auth_source)
     }
+}
+
+fn flush_transient_objects_invocation() -> CommandInvocation {
+    CommandInvocation::new("tpm2_flushcontext", ["-t".to_string()])
 }
 
 fn create_primary_invocation(primary_context: &Path) -> CommandInvocation {
@@ -1809,6 +1814,7 @@ mod tests {
                     fs::write(&output, bytes).expect("write random seed output");
                     ok_output()
                 }
+                "tpm2_flushcontext" => ok_output(),
                 "tpm2_createprimary" => {
                     fs::write(pathbuf_arg(invocation, "-c"), b"primary-context")
                         .expect("write primary context");
@@ -2031,16 +2037,22 @@ mod tests {
 
         assert_eq!(
             recorded_programs(&state),
-            vec!["tpm2_createprimary", "tpm2_load", "tpm2_unseal"]
+            vec![
+                "tpm2_flushcontext",
+                "tpm2_createprimary",
+                "tpm2_load",
+                "tpm2_unseal",
+            ]
         );
+        assert_eq!(state.invocations.borrow()[0].args, vec!["-t".to_string()]);
         assert!(
-            state.invocations.borrow()[0]
+            state.invocations.borrow()[1]
                 .args
                 .iter()
                 .any(|arg| arg == "-R")
         );
         assert!(
-            state.invocations.borrow()[1]
+            state.invocations.borrow()[2]
                 .args
                 .iter()
                 .any(|arg| arg == "-R")

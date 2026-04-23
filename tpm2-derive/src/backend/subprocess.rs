@@ -86,6 +86,10 @@ where
 pub struct ProcessCommandRunner;
 
 pub fn resolve_trusted_program_path(program: &str) -> std::io::Result<PathBuf> {
+    if let Some(override_path) = resolve_program_override(program)? {
+        return Ok(override_path);
+    }
+
     if program.contains(std::path::MAIN_SEPARATOR) {
         return Ok(PathBuf::from(program));
     }
@@ -97,17 +101,8 @@ pub fn resolve_trusted_program_path(program: &str) -> std::io::Result<PathBuf> {
         "/bin",
     ] {
         let candidate = Path::new(directory).join(program);
-        if let Ok(metadata) = std::fs::metadata(&candidate) {
-            if metadata.is_file() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    if metadata.permissions().mode() & 0o111 == 0 {
-                        continue;
-                    }
-                }
-                return Ok(candidate);
-            }
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
         }
     }
 
@@ -115,6 +110,53 @@ pub fn resolve_trusted_program_path(program: &str) -> std::io::Result<PathBuf> {
         std::io::ErrorKind::NotFound,
         format!("trusted executable '{program}' was not found in the allowed search paths"),
     ))
+}
+
+fn resolve_program_override(program: &str) -> std::io::Result<Option<PathBuf>> {
+    let override_var = program_override_var(program);
+    let Some(path) = std::env::var_os(&override_var) else {
+        return Ok(None);
+    };
+
+    let candidate = PathBuf::from(path);
+    if is_executable_file(&candidate) {
+        return Ok(Some(candidate));
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "{override_var} was set to '{}' but that file is not an executable regular file",
+            candidate.display()
+        ),
+    ))
+}
+
+fn program_override_var(program: &str) -> String {
+    format!(
+        "TPM2_DERIVE_{}_BIN",
+        program.replace('-', "_").to_ascii_uppercase()
+    )
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 impl CommandRunner for ProcessCommandRunner {
@@ -131,10 +173,7 @@ impl CommandRunner for ProcessCommandRunner {
             }
         };
 
-        match Command::new(&program)
-            .args(&invocation.args)
-            .output()
-        {
+        match Command::new(&program).args(&invocation.args).output() {
             Ok(output) => CommandOutput {
                 exit_code: output.status.code(),
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),

@@ -329,10 +329,12 @@ fn apply_prf_root_metadata(identity: &mut Identity, layout: &PrfRootLayout) -> R
         PRF_PRIVATE_PATH_METADATA_KEY.to_string(),
         persistable_state_path(&identity.storage.state_layout, &layout.private_path)?,
     );
-    identity.metadata.insert(
-        PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
-        persistable_state_path(&identity.storage.state_layout, &layout.loaded_context_path)?,
-    );
+    if layout.loaded_context_path.is_file() {
+        identity.metadata.insert(
+            PRF_CONTEXT_PATH_METADATA_KEY.to_string(),
+            persistable_state_path(&identity.storage.state_layout, &layout.loaded_context_path)?,
+        );
+    }
     Ok(())
 }
 
@@ -2047,7 +2049,6 @@ mod tests {
         assert!(object_dir.join("parent.ctx").is_file());
         assert!(object_dir.join("prf-root.pub").is_file());
         assert!(object_dir.join("prf-root.priv").is_file());
-        assert!(object_dir.join("prf-root.ctx").is_file());
         assert_eq!(
             result
                 .identity
@@ -2072,20 +2073,20 @@ mod tests {
                 .map(String::as_str),
             Some("objects/prf-default/prf-root.priv")
         );
-        assert_eq!(
+        assert!(
             result
                 .identity
                 .metadata
                 .get(PRF_CONTEXT_PATH_METADATA_KEY)
-                .map(String::as_str),
-            Some("objects/prf-default/prf-root.ctx")
+                .is_none(),
+            "PRF provisioning now persists loadable blobs and recreates transient contexts at use time"
         );
 
         let loaded = load_identity("prf-default", Some(root_dir.clone())).expect("identity loads");
         assert_eq!(loaded.metadata, result.identity.metadata);
         assert_eq!(
             runner.recorded_programs(),
-            vec!["tpm2_createprimary", "tpm2_create", "tpm2_load"]
+            vec!["tpm2_createprimary", "tpm2_create"]
         );
 
         fs::remove_dir_all(root_dir).expect("temporary prf setup state should be removed");
