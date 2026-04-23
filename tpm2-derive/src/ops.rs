@@ -22,11 +22,11 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey as Ed25519EncodePrivateKey;
 use k256::elliptic_curve::sec1::ToEncodedPoint as _;
-use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 use secrecy::ExposeSecret;
 use sha2::{Digest as _, Sha256};
 use sha3::Keccak256;
@@ -39,13 +39,13 @@ use ssh_key::{
 
 use crate::backend::recommend::mode_rejection_reason;
 use crate::backend::{CapabilityProbe, CommandOutput, CommandRunner, ProcessCommandRunner};
-use crate::crypto::{DerivationSpec, DerivationSpecV1, OutputKind};
+use crate::crypto::DerivationSpec;
 use crate::error::{Error, Result};
 use crate::model::{
     Algorithm, CapabilityReport, DerivationOverrides, ExportArtifact, ExportFormat, ExportKind,
     ExportRequest, ExportResult, Format, Identity, IdentityCreateRequest, IdentityCreateResult,
-    IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode, ModePreference,
-    StateLayout, UseCase, expand_mode_requested_uses,
+    IdentityDerivationDefaults, IdentityModeResolution, InspectRequest, Mode, StateLayout, UseCase,
+    expand_mode_requested_uses,
 };
 use crate::ops::native::subprocess::{
     NativeCommandSpec, NativeKeyLocator, NativePersistentHandle, NativePublicKeyExportOptions,
@@ -100,28 +100,36 @@ where
     let persisted = if request.dry_run {
         false
     } else {
-        let provisioned_dir = match identity.mode.resolved {
+        match identity.mode.resolved {
             Mode::Native => {
-                materialize_native_setup(&mut identity, runner)?;
-                None
+                let _setup_guard = acquire_native_setup_lock(&identity);
+                ensure_identity_does_not_exist(&identity)?;
+                let materialized = materialize_native_setup(&mut identity, runner)?;
+                if let Err(error) = identity.persist() {
+                    if let Err(rollback_error) =
+                        rollback_materialized_native_setup(runner, &materialized)
+                    {
+                        return Err(Error::State(format!(
+                            "failed to persist identity '{}': {error}; additionally failed to roll back native TPM handle '{}': {rollback_error}",
+                            identity.name, materialized.persistent_handle
+                        )));
+                    }
+                    return Err(error);
+                }
             }
             Mode::Prf => {
                 let layout = materialize_prf_setup(&mut identity, runner)?;
-                Some(layout.object_dir)
+                if let Err(error) = identity.persist() {
+                    let _ = fs::remove_dir_all(layout.object_dir);
+                    return Err(error);
+                }
             }
             Mode::Seed => {
                 let backend =
                     SubprocessSeedBackend::new(identity.storage.state_layout.objects_dir.clone());
                 persist_seed_identity(&mut identity, &backend)?;
-                None
+                identity.persist()?;
             }
-        };
-
-        if let Err(error) = identity.persist() {
-            if let Some(path) = provisioned_dir {
-                let _ = fs::remove_dir_all(path);
-            }
-            return Err(error);
         }
 
         true
@@ -1060,7 +1068,22 @@ pub fn seed_valid_ec_scalar_bytes_standalone(
     )))
 }
 
-fn materialize_native_setup<R>(identity: &mut Identity, runner: &R) -> Result<()>
+fn ensure_identity_does_not_exist(identity: &Identity) -> Result<()> {
+    if identity.storage.identity_path.exists() {
+        return Err(Error::State(format!(
+            "identity '{}' already exists at '{}'; remove it before creating a replacement",
+            identity.name,
+            identity.storage.identity_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn materialize_native_setup<R>(
+    identity: &mut Identity,
+    runner: &R,
+) -> Result<MaterializedNativeSetup>
 where
     R: CommandRunner,
 {
@@ -1074,9 +1097,7 @@ where
     let allowed_uses = native_key_uses(identity)?;
     let key_id = native_key_id(identity);
     let native_dir = native_state_dir(identity);
-    let scratch_dir = native_dir.join("setup-work");
     let handle_path = native_handle_path(identity);
-    let persistent_handle = allocate_native_persistent_handle(runner)?;
 
     identity.storage.state_layout.ensure_dirs()?;
     fs::create_dir_all(&native_dir).map_err(|error| {
@@ -1086,58 +1107,121 @@ where
         ))
     })?;
 
-    if scratch_dir.exists() {
-        remove_path_if_present(&scratch_dir);
+    let _allocation_guard = native_handle_allocation_lock()
+        .lock()
+        .expect("native handle allocation lock poisoned");
+
+    for _attempt in 0..NATIVE_SETUP_HANDLE_RETRY_LIMIT {
+        let persistent_handle = allocate_native_persistent_handle(runner)?;
+        match materialize_native_setup_with_handle(
+            identity,
+            runner,
+            &allowed_uses,
+            &key_id,
+            &native_dir,
+            &handle_path,
+            &persistent_handle,
+        ) {
+            Ok(materialized) => return Ok(materialized),
+            Err(NativeSetupAttemptError::PersistentHandleCollision) => continue,
+            Err(NativeSetupAttemptError::Fatal(error)) => return Err(error),
+        }
     }
-    fs::create_dir_all(&scratch_dir).map_err(|error| {
-        Error::State(format!(
-            "failed to create native scratch directory '{}': {error}",
-            scratch_dir.display()
-        ))
-    })?;
+
+    Err(Error::State(format!(
+        "native setup for identity '{}' exceeded {} persistent-handle allocation retries",
+        identity.name, NATIVE_SETUP_HANDLE_RETRY_LIMIT
+    )))
+}
+
+fn materialize_native_setup_with_handle<R>(
+    identity: &mut Identity,
+    runner: &R,
+    allowed_uses: &[NativeKeyUse],
+    key_id: &str,
+    native_dir: &Path,
+    handle_path: &Path,
+    persistent_handle: &str,
+) -> std::result::Result<MaterializedNativeSetup, NativeSetupAttemptError>
+where
+    R: CommandRunner,
+{
+    remove_path_if_present(handle_path);
+
+    let scratch_dir = TempfileBuilder::new()
+        .prefix("setup-")
+        .tempdir_in(native_dir)
+        .map_err(|error| {
+            NativeSetupAttemptError::Fatal(Error::State(format!(
+                "failed to create native setup workspace in '{}': {error}",
+                native_dir.display()
+            )))
+        })?;
 
     let setup_request = NativeIdentityCreateRequest {
         identity: identity.name.clone(),
         key_label: Some(identity.name.clone()),
         algorithm: NativeAlgorithm::P256,
         curve: NativeCurve::NistP256,
-        allowed_uses,
+        allowed_uses: allowed_uses.to_vec(),
         hardware_binding: NativeHardwareBinding::Required,
         private_key_policy: NativePrivateKeyPolicy::NonExportable,
     };
     let plan = plan_setup(
         &setup_request,
         &NativeSetupArtifacts {
-            scratch_dir: scratch_dir.clone(),
-            key_id: key_id.clone(),
+            scratch_dir: scratch_dir.path().to_path_buf(),
+            key_id: key_id.to_string(),
             persistent: NativePersistentHandle {
-                handle: persistent_handle.clone(),
-                serialized_handle_path: handle_path.clone(),
+                handle: persistent_handle.to_string(),
+                serialized_handle_path: handle_path.to_path_buf(),
             },
         },
-    )?;
+    )
+    .map_err(NativeSetupAttemptError::Fatal)?;
 
-    let execution = plan
-        .commands
-        .iter()
-        .try_for_each(|command| run_native_command_for_operation(command, runner, "native setup"));
+    let mut persisted = false;
+    for command in &plan.commands {
+        let output = runner.run(&crate::backend::CommandInvocation::new(
+            &command.program,
+            command.args.iter().cloned(),
+        ));
+        if output.error.is_some() || output.exit_code != Some(0) {
+            if command.program == "tpm2_evictcontrol" {
+                remove_path_if_present(handle_path);
+                match persistent_handle_is_allocated(runner, persistent_handle) {
+                    Ok(true) => return Err(NativeSetupAttemptError::PersistentHandleCollision),
+                    Ok(false) => {}
+                    Err(error) => return Err(NativeSetupAttemptError::Fatal(error)),
+                }
+            }
 
-    for path in &plan.cleanup_paths {
-        remove_path_if_present(path);
+            return Err(NativeSetupAttemptError::Fatal(
+                native_operation_command_error(command, &output, "native setup"),
+            ));
+        }
+
+        if command.program == "tpm2_evictcontrol" {
+            persisted = true;
+        }
     }
-    remove_path_if_present(&scratch_dir);
-
-    execution?;
 
     if !handle_path.is_file() {
-        return Err(Error::State(format!(
+        if persisted {
+            let _ = rollback_native_persistent_handle(runner, persistent_handle);
+        }
+        return Err(NativeSetupAttemptError::Fatal(Error::State(format!(
             "native setup completed without creating serialized handle state '{}'; sign/export cannot locate the TPM object",
             handle_path.display()
-        )));
+        ))));
     }
 
-    persist_native_metadata(identity, &key_id, &persistent_handle, &handle_path);
-    Ok(())
+    persist_native_metadata(identity, key_id, persistent_handle, handle_path);
+
+    Ok(MaterializedNativeSetup {
+        persistent_handle: persistent_handle.to_string(),
+        handle_path: handle_path.to_path_buf(),
+    })
 }
 
 fn export_native_public_key_with_runner<R>(
@@ -1227,6 +1311,67 @@ where
 const TPM_PERSISTENT_HANDLE_MIN: u32 = 0x8100_0000;
 const TPM_PERSISTENT_HANDLE_MAX: u32 = 0x81ff_ffff;
 const TPM_PERSISTENT_HANDLE_START: u32 = 0x8101_0000;
+const NATIVE_SETUP_HANDLE_RETRY_LIMIT: usize = 32;
+const TPM_OWNER_HIERARCHY: &str = "owner";
+
+static NATIVE_HANDLE_ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static NATIVE_SETUP_LOCKS: OnceLock<NativeSetupLocks> = OnceLock::new();
+
+struct NativeSetupLocks {
+    active: Mutex<BTreeSet<PathBuf>>,
+    ready: Condvar,
+}
+
+impl NativeSetupLocks {
+    fn global() -> &'static Self {
+        NATIVE_SETUP_LOCKS.get_or_init(|| Self {
+            active: Mutex::new(BTreeSet::new()),
+            ready: Condvar::new(),
+        })
+    }
+}
+
+struct NativeSetupGuard {
+    key: PathBuf,
+}
+
+impl Drop for NativeSetupGuard {
+    fn drop(&mut self) {
+        let locks = NativeSetupLocks::global();
+        let mut active = locks.active.lock().expect("native setup lock poisoned");
+        active.remove(&self.key);
+        locks.ready.notify_all();
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct MaterializedNativeSetup {
+    persistent_handle: String,
+    handle_path: PathBuf,
+}
+
+enum NativeSetupAttemptError {
+    PersistentHandleCollision,
+    Fatal(Error),
+}
+
+fn acquire_native_setup_lock(identity: &Identity) -> NativeSetupGuard {
+    let key = identity.storage.identity_path.clone();
+    let locks = NativeSetupLocks::global();
+    let mut active = locks.active.lock().expect("native setup lock poisoned");
+    while active.contains(&key) {
+        active = locks
+            .ready
+            .wait(active)
+            .expect("native setup lock poisoned while waiting");
+    }
+    active.insert(key.clone());
+    NativeSetupGuard { key }
+}
+
+fn native_handle_allocation_lock() -> &'static Mutex<()> {
+    NATIVE_HANDLE_ALLOCATION_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 pub(crate) fn resolve_native_key_locator(identity: &Identity) -> Result<NativeKeyLocator> {
     if let Some(path) = metadata_path(
@@ -1236,20 +1381,36 @@ pub(crate) fn resolve_native_key_locator(identity: &Identity) -> Result<NativeKe
             "native.serialized-handle-path",
         ],
     ) {
-        return Ok(NativeKeyLocator::SerializedHandle { path });
-    }
-
-    if let Some(handle) = metadata_value(
-        identity,
-        &["native.persistent_handle", "native.persistent-handle"],
-    ) {
-        return Ok(NativeKeyLocator::PersistentHandle { handle });
-    }
-
-    for path in native_handle_path_candidates(identity) {
         if path.is_file() {
             return Ok(NativeKeyLocator::SerializedHandle { path });
         }
+
+        return Err(Error::State(format!(
+            "identity '{}' resolved to native mode but serialized handle state '{}' is missing; recreate the identity instead of falling back to a raw persistent handle",
+            identity.name,
+            path.display()
+        )));
+    }
+
+    let discovered_paths: Vec<_> = native_handle_path_candidates(identity)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect();
+    if discovered_paths.len() == 1 {
+        return Ok(NativeKeyLocator::SerializedHandle {
+            path: discovered_paths[0].clone(),
+        });
+    }
+    if discovered_paths.len() > 1 {
+        return Err(Error::State(format!(
+            "identity '{}' resolved to native mode but multiple serialized handle files were found: {}; remove stale native state so key location is unambiguous",
+            identity.name,
+            discovered_paths
+                .iter()
+                .map(|path| format!("'{}'", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
 
     Err(Error::State(format!(
@@ -1294,6 +1455,23 @@ fn allocate_native_persistent_handle<R>(runner: &R) -> Result<String>
 where
     R: CommandRunner,
 {
+    let taken = discover_persistent_handles(runner)?;
+    for candidate in TPM_PERSISTENT_HANDLE_START..=TPM_PERSISTENT_HANDLE_MAX {
+        let handle = format!("0x{candidate:08x}");
+        if !taken.contains(&handle) {
+            return Ok(handle);
+        }
+    }
+
+    Err(Error::State(
+        "no free TPM persistent handles remain in the persistent-object range".to_string(),
+    ))
+}
+
+fn discover_persistent_handles<R>(runner: &R) -> Result<BTreeSet<String>>
+where
+    R: CommandRunner,
+{
     let output = runner.run(&crate::backend::CommandInvocation::new(
         "tpm2_getcap",
         ["handles-persistent"],
@@ -1313,17 +1491,36 @@ where
         )));
     }
 
-    let taken = parse_persistent_handles(&output.stdout)?;
-    for candidate in TPM_PERSISTENT_HANDLE_START..=TPM_PERSISTENT_HANDLE_MAX {
-        let handle = format!("0x{candidate:08x}");
-        if !taken.contains(&handle) {
-            return Ok(handle);
-        }
-    }
+    parse_persistent_handles(&output.stdout)
+}
 
-    Err(Error::State(
-        "no free TPM persistent handles remain in the persistent-object range".to_string(),
-    ))
+fn persistent_handle_is_allocated<R>(runner: &R, handle: &str) -> Result<bool>
+where
+    R: CommandRunner,
+{
+    Ok(discover_persistent_handles(runner)?.contains(handle))
+}
+
+fn rollback_materialized_native_setup<R>(
+    runner: &R,
+    materialized: &MaterializedNativeSetup,
+) -> Result<()>
+where
+    R: CommandRunner,
+{
+    remove_path_if_present(&materialized.handle_path);
+    rollback_native_persistent_handle(runner, &materialized.persistent_handle)
+}
+
+fn rollback_native_persistent_handle<R>(runner: &R, handle: &str) -> Result<()>
+where
+    R: CommandRunner,
+{
+    let command = NativeCommandSpec::new(
+        "tpm2_evictcontrol",
+        ["-C", TPM_OWNER_HIERARCHY, "-c", handle],
+    );
+    run_native_command_for_operation(&command, runner, "native setup rollback")
 }
 
 fn parse_persistent_handles(stdout: &str) -> Result<BTreeSet<String>> {
@@ -1797,25 +1994,33 @@ where
         command.args.iter().cloned(),
     ));
 
-    if output.error.is_some() {
-        return Err(Error::TpmUnavailable(format!(
-            "{operation} failed while running '{} {}': {}",
-            command.program,
-            command.args.join(" "),
-            render_command_detail(&output)
-        )));
-    }
-
-    if output.exit_code != Some(0) {
-        return Err(Error::CapabilityMismatch(format!(
-            "{operation} failed while running '{} {}': {}",
-            command.program,
-            command.args.join(" "),
-            render_command_detail(&output)
-        )));
+    if output.error.is_some() || output.exit_code != Some(0) {
+        return Err(native_operation_command_error(command, &output, operation));
     }
 
     Ok(())
+}
+
+fn native_operation_command_error(
+    command: &NativeCommandSpec,
+    output: &CommandOutput,
+    operation: &str,
+) -> Error {
+    if output.error.is_some() {
+        Error::TpmUnavailable(format!(
+            "{operation} failed while running '{} {}': {}",
+            command.program,
+            command.args.join(" "),
+            render_command_detail(output)
+        ))
+    } else {
+        Error::CapabilityMismatch(format!(
+            "{operation} failed while running '{} {}': {}",
+            command.program,
+            command.args.join(" "),
+            render_command_detail(output)
+        ))
+    }
 }
 
 fn render_command_detail(output: &CommandOutput) -> String {
@@ -1918,12 +2123,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::env;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
     use ed25519_dalek::pkcs8::EncodePublicKey as _;
-    use k256::pkcs8::EncodePublicKey as _;
-    use p256::pkcs8::EncodePublicKey as _;
     use secrecy::ExposeSecret;
     use ssh_key::PublicKey as SshPublicKey;
 
@@ -1940,6 +2145,14 @@ mod tests {
             "tpm2-derive-{label}-{}-{sequence}",
             std::process::id()
         ))
+    }
+
+    fn native_handle_path_for_test(root_dir: &Path, identity: &str) -> PathBuf {
+        StateLayout::new(root_dir.to_path_buf())
+            .objects_dir
+            .join(identity)
+            .join("native")
+            .join(format!("{identity}-signing-key.handle"))
     }
 
     #[test]
@@ -1996,6 +2209,205 @@ mod tests {
         let loaded = load_identity("prod-signer", Some(root_dir.clone())).expect("identity loads");
         assert_eq!(loaded, result.identity);
         assert_eq!(runner.calls().len(), 5);
+
+        fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
+    }
+
+    #[test]
+    fn same_name_native_setup_is_serialized_and_second_request_fails() {
+        let root_dir = unique_temp_path("setup-same-name-lock");
+        let runner = SlowNativeSetupRunner::new(Duration::from_millis(100));
+        let request = IdentityCreateRequest {
+            identity: "prod-signer".to_string(),
+            algorithm: Algorithm::P256,
+            uses: vec![UseCase::Verify, UseCase::Sign],
+            requested_mode: ModePreference::Native,
+            defaults: crate::model::DerivationOverrides::default(),
+            state_dir: Some(root_dir.clone()),
+            dry_run: false,
+        };
+        let barrier = Arc::new(Barrier::new(2));
+
+        let runner_one = runner.clone();
+        let request_one = request.clone();
+        let barrier_one = barrier.clone();
+        let worker_one = thread::spawn(move || {
+            barrier_one.wait();
+            resolve_identity_with_runner(&HeuristicProbe, &request_one, &runner_one)
+        });
+
+        let runner_two = runner.clone();
+        let request_two = request.clone();
+        let barrier_two = barrier.clone();
+        let worker_two = thread::spawn(move || {
+            barrier_two.wait();
+            resolve_identity_with_runner(&HeuristicProbe, &request_two, &runner_two)
+        });
+
+        let first = worker_one
+            .join()
+            .expect("first setup thread should not panic");
+        let second = worker_two
+            .join()
+            .expect("second setup thread should not panic");
+        let results = [first, second];
+
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one setup should succeed"
+        );
+        assert_eq!(
+            results.iter().filter(|result| result.is_err()).count(),
+            1,
+            "exactly one setup should fail"
+        );
+        assert!(results.iter().any(|result| {
+            matches!(
+                result,
+                Err(Error::State(message)) if message.contains("already exists")
+            )
+        }));
+        assert_eq!(runner.calls().len(), 5);
+        assert!(
+            root_dir
+                .join("identities")
+                .join("prod-signer.json")
+                .is_file()
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
+    }
+
+    #[test]
+    fn setup_retries_persistent_handle_collisions_with_unique_workspaces() {
+        let root_dir = unique_temp_path("setup-handle-collision");
+        let runner = HandleCollisionNativeSetupRunner::new();
+        let request = IdentityCreateRequest {
+            identity: "prod-signer".to_string(),
+            algorithm: Algorithm::P256,
+            uses: vec![UseCase::Verify, UseCase::Sign],
+            requested_mode: ModePreference::Native,
+            defaults: crate::model::DerivationOverrides::default(),
+            state_dir: Some(root_dir.clone()),
+            dry_run: false,
+        };
+
+        let result = resolve_identity_with_runner(&HeuristicProbe, &request, &runner)
+            .expect("setup should retry and succeed");
+        assert_eq!(
+            result.identity.metadata.get("native.persistent_handle"),
+            Some(&"0x81010003".to_string())
+        );
+
+        let primary_contexts = runner.paths_for("tpm2_createprimary", "-c");
+        assert_eq!(primary_contexts.len(), 2);
+        assert_ne!(primary_contexts[0], primary_contexts[1]);
+        assert_ne!(
+            primary_contexts[0].parent(),
+            primary_contexts[1].parent(),
+            "retry attempts should use different native setup workspaces"
+        );
+        assert!(primary_contexts.iter().all(|path| !path.exists()));
+
+        fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
+    }
+
+    #[test]
+    fn setup_rolls_back_materialized_handle_when_identity_persist_fails() {
+        let root_dir = unique_temp_path("setup-native-persist-failure");
+        let identity_path = StateLayout::new(root_dir.clone()).identity_path("prod-signer");
+        let runner = PersistFailureNativeSetupRunner::new(identity_path.clone());
+        let request = IdentityCreateRequest {
+            identity: "prod-signer".to_string(),
+            algorithm: Algorithm::P256,
+            uses: vec![UseCase::Verify, UseCase::Sign],
+            requested_mode: ModePreference::Native,
+            defaults: crate::model::DerivationOverrides::default(),
+            state_dir: Some(root_dir.clone()),
+            dry_run: false,
+        };
+
+        let error = resolve_identity_with_runner(&HeuristicProbe, &request, &runner)
+            .expect_err("persist failure should roll back native state");
+        assert!(matches!(error, Error::State(_)));
+        assert!(!native_handle_path_for_test(&root_dir, "prod-signer").exists());
+        assert!(runner.rollback_was_attempted());
+
+        fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
+    }
+
+    #[test]
+    fn resolve_native_key_locator_fails_closed_when_serialized_handle_metadata_is_missing() {
+        let root_dir = unique_temp_path("native-locator-fail-closed");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let mut identity = Identity::new(
+            "prod-signer".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            state_layout,
+        );
+        identity.metadata.insert(
+            "native.serialized_handle_path".to_string(),
+            "objects/prod-signer/native/missing.handle".to_string(),
+        );
+        identity.metadata.insert(
+            "native.persistent_handle".to_string(),
+            "0x81010002".to_string(),
+        );
+
+        let error = resolve_native_key_locator(&identity)
+            .expect_err("missing serialized handle metadata should fail closed");
+        assert!(
+            matches!(error, Error::State(message) if message.contains("serialized handle state") && message.contains("raw persistent handle"))
+        );
+
+        fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
+    }
+
+    #[test]
+    fn resolve_native_key_locator_rejects_ambiguous_serialized_handle_state() {
+        let root_dir = unique_temp_path("native-locator-ambiguous");
+        let state_layout = StateLayout::new(root_dir.clone());
+        state_layout.ensure_dirs().expect("state dirs");
+
+        let identity = Identity::new(
+            "prod-signer".to_string(),
+            Algorithm::P256,
+            vec![UseCase::Sign],
+            IdentityModeResolution {
+                requested: ModePreference::Native,
+                resolved: Mode::Native,
+                reasons: vec!["native requested".to_string()],
+            },
+            state_layout,
+        );
+        let primary_handle = native_handle_path(&identity);
+        let alternate_handle = identity
+            .storage
+            .state_layout
+            .objects_dir
+            .join(&identity.name)
+            .join("key.handle");
+        fs::create_dir_all(primary_handle.parent().expect("primary handle parent"))
+            .expect("primary handle dir");
+        fs::create_dir_all(alternate_handle.parent().expect("alternate handle parent"))
+            .expect("alternate handle dir");
+        fs::write(&primary_handle, b"serialized-handle").expect("primary handle file");
+        fs::write(&alternate_handle, b"serialized-handle").expect("alternate handle file");
+
+        let error = resolve_native_key_locator(&identity)
+            .expect_err("ambiguous serialized handles should fail closed");
+        assert!(
+            matches!(error, Error::State(message) if message.contains("multiple serialized handle files") && message.contains("unambiguous"))
+        );
 
         fs::remove_dir_all(root_dir).expect("temporary setup state should be removed");
     }
@@ -3050,6 +3462,216 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct SlowNativeSetupRunner {
+        calls: Arc<Mutex<Vec<CommandInvocation>>>,
+        createprimary_delay: Duration,
+    }
+
+    impl SlowNativeSetupRunner {
+        fn new(createprimary_delay: Duration) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                createprimary_delay,
+            }
+        }
+
+        fn calls(&self) -> Vec<CommandInvocation> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl CommandRunner for SlowNativeSetupRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(invocation.clone());
+
+            match invocation.program.as_str() {
+                "tpm2_getcap" => CommandOutput {
+                    exit_code: Some(0),
+                    stdout: "- 0x81010000\n- 0x81010001\n".to_string(),
+                    stderr: String::new(),
+                    error: None,
+                },
+                "tpm2_createprimary" => {
+                    thread::sleep(self.createprimary_delay);
+                    write_output_flag(invocation, "-c", b"primary-context");
+                    success_output()
+                }
+                "tpm2_create" => {
+                    write_output_flag(invocation, "-u", b"public-blob");
+                    write_output_flag(invocation, "-r", b"private-blob");
+                    success_output()
+                }
+                "tpm2_load" => {
+                    write_output_flag(invocation, "-c", b"loaded-context");
+                    write_output_flag(invocation, "-n", b"object-name");
+                    success_output()
+                }
+                "tpm2_evictcontrol" => {
+                    write_output_flag(invocation, "-o", b"serialized-handle");
+                    success_output()
+                }
+                other => panic!("unexpected command {other}"),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct HandleCollisionNativeSetupRunner {
+        calls: Arc<Mutex<Vec<CommandInvocation>>>,
+        handles: Arc<Mutex<BTreeSet<String>>>,
+        collision_emitted: Arc<AtomicBool>,
+    }
+
+    impl HandleCollisionNativeSetupRunner {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                handles: Arc::new(Mutex::new(BTreeSet::from([
+                    "0x81010000".to_string(),
+                    "0x81010001".to_string(),
+                ]))),
+                collision_emitted: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn paths_for(&self, program: &str, flag: &str) -> Vec<PathBuf> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .iter()
+                .filter(|invocation| invocation.program == program)
+                .map(|invocation| pathbuf_arg(invocation, flag))
+                .collect()
+        }
+    }
+
+    impl CommandRunner for HandleCollisionNativeSetupRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(invocation.clone());
+
+            match invocation.program.as_str() {
+                "tpm2_getcap" => CommandOutput {
+                    exit_code: Some(0),
+                    stdout: render_persistent_handles(&self.handles.lock().expect("handles lock")),
+                    stderr: String::new(),
+                    error: None,
+                },
+                "tpm2_createprimary" => {
+                    write_output_flag(invocation, "-c", b"primary-context");
+                    success_output()
+                }
+                "tpm2_create" => {
+                    write_output_flag(invocation, "-u", b"public-blob");
+                    write_output_flag(invocation, "-r", b"private-blob");
+                    success_output()
+                }
+                "tpm2_load" => {
+                    write_output_flag(invocation, "-c", b"loaded-context");
+                    write_output_flag(invocation, "-n", b"object-name");
+                    success_output()
+                }
+                "tpm2_evictcontrol" => {
+                    let persistent_handle = invocation
+                        .args
+                        .last()
+                        .cloned()
+                        .expect("persistent handle argument");
+                    if !self.collision_emitted.swap(true, Ordering::SeqCst) {
+                        self.handles
+                            .lock()
+                            .expect("handles lock")
+                            .insert(persistent_handle);
+                        return CommandOutput {
+                            exit_code: Some(1),
+                            stdout: String::new(),
+                            stderr: "persistent handle collision".to_string(),
+                            error: None,
+                        };
+                    }
+
+                    self.handles
+                        .lock()
+                        .expect("handles lock")
+                        .insert(persistent_handle);
+                    write_output_flag(invocation, "-o", b"serialized-handle");
+                    success_output()
+                }
+                other => panic!("unexpected command {other}"),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct PersistFailureNativeSetupRunner {
+        calls: Arc<Mutex<Vec<CommandInvocation>>>,
+        identity_path: PathBuf,
+        rollback_attempted: Arc<AtomicBool>,
+    }
+
+    impl PersistFailureNativeSetupRunner {
+        fn new(identity_path: PathBuf) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                identity_path,
+                rollback_attempted: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn rollback_was_attempted(&self) -> bool {
+            self.rollback_attempted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CommandRunner for PersistFailureNativeSetupRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(invocation.clone());
+
+            match invocation.program.as_str() {
+                "tpm2_getcap" => CommandOutput {
+                    exit_code: Some(0),
+                    stdout: "- 0x81010000\n- 0x81010001\n".to_string(),
+                    stderr: String::new(),
+                    error: None,
+                },
+                "tpm2_createprimary" => {
+                    write_output_flag(invocation, "-c", b"primary-context");
+                    success_output()
+                }
+                "tpm2_create" => {
+                    write_output_flag(invocation, "-u", b"public-blob");
+                    write_output_flag(invocation, "-r", b"private-blob");
+                    success_output()
+                }
+                "tpm2_load" => {
+                    write_output_flag(invocation, "-c", b"loaded-context");
+                    write_output_flag(invocation, "-n", b"object-name");
+                    success_output()
+                }
+                "tpm2_evictcontrol" => {
+                    if invocation.args.iter().any(|arg| arg == "-o") {
+                        write_output_flag(invocation, "-o", b"serialized-handle");
+                        fs::create_dir_all(&self.identity_path)
+                            .expect("create directory that blocks identity persistence");
+                    } else {
+                        self.rollback_attempted.store(true, Ordering::SeqCst);
+                    }
+                    success_output()
+                }
+                other => panic!("unexpected command {other}"),
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct StaticCapabilityProbe {
         report: CapabilityReport,
@@ -3502,6 +4124,16 @@ mod tests {
         };
 
         ethereum_address_from_raw_public_bytes(&raw_public).expect("ethereum address")
+    }
+
+    fn render_persistent_handles(handles: &BTreeSet<String>) -> String {
+        let mut output = String::new();
+        for handle in handles {
+            output.push_str("- ");
+            output.push_str(handle);
+            output.push('\n');
+        }
+        output
     }
 
     fn write_output_flag(invocation: &CommandInvocation, flag: &str, bytes: &[u8]) {

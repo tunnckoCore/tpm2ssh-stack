@@ -949,15 +949,14 @@ mod tests {
     }
 
     #[test]
-    fn native_sign_stays_planned_when_setup_material_is_missing() {
+    fn native_sign_fails_closed_when_setup_material_is_missing() {
         let state_root = tempdir().expect("state root");
         let identity = native_profile(state_root.path(), Mode::Native, vec![UseCase::Sign]);
-        let runner = RecordingNativeSignRunner::success(vec![0x22; 64]);
 
         let input_path = state_root.path().join("input.bin");
         fs::write(&input_path, b"plan only").expect("input file");
 
-        let staged = stage_native_sign(
+        let error = stage_native_sign(
             &SignRequest {
                 identity: identity.name.clone(),
                 input: InputSource::Path { path: input_path },
@@ -966,16 +965,11 @@ mod tests {
             },
             &identity,
         )
-        .expect("staged native sign");
+        .expect_err("native sign should fail without serialized handle state");
 
-        assert!(!staged.ready_for_execution);
-        assert!(staged.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "native-key-handle-missing"
-                && diagnostic
-                    .message
-                    .contains("will execute once native setup material is present")
-        }));
-        assert!(runner.invocations().is_empty());
+        assert!(
+            matches!(error, crate::error::Error::State(message) if message.contains("serialized handle state") || message.contains("no serialized handle state"))
+        );
     }
 
     #[test]

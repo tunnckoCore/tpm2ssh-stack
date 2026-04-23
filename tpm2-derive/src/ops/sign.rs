@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
+use tempfile::{Builder as TempfileBuilder, TempDir};
+
 use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
 use k256::ecdsa::{Signature as K256Signature, SigningKey as K256SigningKey};
 use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey};
@@ -16,8 +18,8 @@ use crate::model::{
 };
 use crate::ops::keygen::{derive_identity_key_material_with_defaults, hex_encode};
 use crate::ops::native::subprocess::{
-    NativeAuthSource, NativeKeyLocator, NativePostProcessAction, NativeSignArtifacts,
-    NativeSignOptions, NativeSignPlan, plan_sign,
+    NativeAuthSource, NativePostProcessAction, NativeSignArtifacts, NativeSignOptions,
+    NativeSignPlan, plan_sign,
 };
 use crate::ops::native::{
     DigestAlgorithm, NativeKeyRef, NativeSignRequest, NativeSignatureFormat, NativeSignatureScheme,
@@ -86,8 +88,9 @@ pub enum SeedSignatureFormat {
     Raw,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StagedNativeSign {
+    _workspace_dir: TempDir,
     pub digest_algorithm: DigestAlgorithm,
     pub input_bytes: usize,
     pub digest_path: PathBuf,
@@ -446,6 +449,15 @@ pub(crate) fn stage_native_sign(
         .join(&identity.name)
         .join("native-sign");
     ensure_dir(&runtime_dir, "native sign runtime")?;
+    let workspace_dir = TempfileBuilder::new()
+        .prefix("request-")
+        .tempdir_in(&runtime_dir)
+        .map_err(|error| {
+            Error::State(format!(
+                "failed to create native sign workspace in '{}': {error}",
+                runtime_dir.display()
+            ))
+        })?;
 
     let input_bytes = load_sign_input(&request.input)?;
     if input_bytes.is_empty() {
@@ -455,9 +467,9 @@ pub(crate) fn stage_native_sign(
     }
 
     let digest = Sha256::digest(&input_bytes).to_vec();
-    let digest_path = runtime_dir.join("sha256.digest.bin");
-    let plain_signature_path = runtime_dir.join("signature.p1363.bin");
-    let artifact_path = runtime_dir.join("signature.der");
+    let digest_path = workspace_dir.path().join("sha256.digest.bin");
+    let plain_signature_path = workspace_dir.path().join("signature.p1363.bin");
+    let artifact_path = workspace_dir.path().join("signature.der");
     fs::write(&digest_path, &digest).map_err(|error| {
         Error::State(format!(
             "failed to write staged sign digest '{}': {error}",
@@ -465,7 +477,7 @@ pub(crate) fn stage_native_sign(
         ))
     })?;
 
-    let (locator, ready_for_execution, locator_diagnostics) = resolve_native_sign_locator(identity);
+    let locator = crate::ops::resolve_native_key_locator(identity)?;
     let plan = plan_sign(
         &NativeSignRequest {
             key: NativeKeyRef {
@@ -487,92 +499,18 @@ pub(crate) fn stage_native_sign(
             },
         },
     )?;
-
-    let mut diagnostics = plan.warnings.clone();
-    diagnostics.extend(locator_diagnostics);
+    let diagnostics = plan.warnings.clone();
 
     Ok(StagedNativeSign {
+        _workspace_dir: workspace_dir,
         digest_algorithm: DigestAlgorithm::Sha256,
         input_bytes: input_bytes.len(),
         digest_path,
         artifact_path,
         plan,
-        ready_for_execution,
+        ready_for_execution: true,
         diagnostics,
     })
-}
-
-fn resolve_native_sign_locator(identity: &Identity) -> (NativeKeyLocator, bool, Vec<Diagnostic>) {
-    if let Some(path) = crate::ops::metadata_path(
-        identity,
-        &[
-            "native.serialized_handle_path",
-            "native.serialized-handle-path",
-        ],
-    ) {
-        if path.is_file() {
-            return (
-                NativeKeyLocator::SerializedHandle { path },
-                true,
-                Vec::new(),
-            );
-        }
-    }
-
-    if let Some(handle) = crate::ops::metadata_value(
-        identity,
-        &["native.persistent_handle", "native.persistent-handle"],
-    ) {
-        return (
-            NativeKeyLocator::PersistentHandle { handle },
-            true,
-            Vec::new(),
-        );
-    }
-
-    for path in crate::ops::native_handle_path_candidates(identity) {
-        if path.is_file() {
-            return (
-                NativeKeyLocator::SerializedHandle { path },
-                true,
-                Vec::new(),
-            );
-        }
-    }
-
-    let missing_handle_path = crate::ops::metadata_path(
-        identity,
-        &[
-            "native.serialized_handle_path",
-            "native.serialized-handle-path",
-        ],
-    )
-    .or_else(|| {
-        crate::ops::native_handle_path_candidates(identity)
-            .into_iter()
-            .next()
-    })
-    .unwrap_or_else(|| {
-        identity
-            .storage
-            .state_layout
-            .objects_dir
-            .join(format!("{}.handle", identity.name))
-    });
-
-    (
-        NativeKeyLocator::SerializedHandle {
-            path: missing_handle_path.clone(),
-        },
-        false,
-        vec![Diagnostic::warning(
-            "native-key-handle-missing",
-            format!(
-                "serialized native key handle '{}' is not present yet; sign returns a concrete plan and staged digest, and will execute once native setup material is present",
-                missing_handle_path.display()
-            ),
-        )],
-    )
 }
 
 pub(crate) fn execute_native_sign_plan_with_runner<R>(
@@ -714,15 +652,62 @@ mod tests {
     use super::*;
 
     use std::fs;
+    use std::path::Path;
+    use std::sync::Mutex;
 
     use tempfile::tempdir;
 
+    use crate::backend::{CommandInvocation, CommandOutput};
     use crate::model::{IdentityModeResolution, InputSource, ModePreference, StateLayout};
 
-    #[test]
-    fn native_sign_rejects_derivation_overrides() {
-        let state_root = tempdir().expect("state root");
-        let identity = Identity::new(
+    struct DigestEchoNativeSignRunner {
+        invocations: Mutex<Vec<CommandInvocation>>,
+    }
+
+    impl DigestEchoNativeSignRunner {
+        fn new() -> Self {
+            Self {
+                invocations: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for DigestEchoNativeSignRunner {
+        fn run(&self, invocation: &CommandInvocation) -> CommandOutput {
+            self.invocations
+                .lock()
+                .expect("native sign invocations")
+                .push(invocation.clone());
+            let digest_path = invocation
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-d")
+                .map(|pair| Path::new(&pair[1]).to_path_buf())
+                .expect("digest path");
+            let output_path = invocation
+                .args
+                .windows(2)
+                .find(|pair| pair[0] == "-o")
+                .map(|pair| Path::new(&pair[1]).to_path_buf())
+                .expect("output path");
+            let digest = fs::read(digest_path).expect("read digest");
+            fs::write(output_path, plain_signature_from_digest(&digest)).expect("write signature");
+
+            CommandOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            }
+        }
+    }
+
+    fn plain_signature_from_digest(digest: &[u8]) -> Vec<u8> {
+        (0..64).map(|index| digest[index % digest.len()]).collect()
+    }
+
+    fn native_identity(root: &Path) -> Identity {
+        Identity::new(
             "native-sign".to_string(),
             Algorithm::P256,
             vec![UseCase::Sign, UseCase::Verify],
@@ -731,8 +716,24 @@ mod tests {
                 resolved: Mode::Native,
                 reasons: vec!["native requested".to_string()],
             },
-            StateLayout::new(state_root.path().to_path_buf()),
-        );
+            StateLayout::new(root.to_path_buf()),
+        )
+    }
+
+    fn write_default_handle(identity: &Identity) {
+        let handle_path = identity
+            .storage
+            .state_layout
+            .objects_dir
+            .join(format!("{}.handle", identity.name));
+        fs::create_dir_all(handle_path.parent().expect("handle parent")).expect("handle dir");
+        fs::write(handle_path, b"serialized-handle").expect("handle file");
+    }
+
+    #[test]
+    fn native_sign_rejects_derivation_overrides() {
+        let state_root = tempdir().expect("state root");
+        let identity = native_identity(state_root.path());
         let input_path = state_root.path().join("input.bin");
         fs::write(&input_path, b"hello native sign").expect("input file");
 
@@ -755,5 +756,87 @@ mod tests {
         assert!(
             matches!(error, Error::Validation(message) if message.contains("native identities reject derivation overrides"))
         );
+    }
+
+    #[test]
+    fn native_sign_uses_unique_workspace_per_request() {
+        let state_root = tempdir().expect("state root");
+        let identity = native_identity(state_root.path());
+        write_default_handle(&identity);
+
+        let input_one = state_root.path().join("one.bin");
+        let input_two = state_root.path().join("two.bin");
+        fs::write(&input_one, b"first native message").expect("first input");
+        fs::write(&input_two, b"second native message").expect("second input");
+
+        let staged_one = stage_native_sign(
+            &SignRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path {
+                    path: input_one.clone(),
+                },
+                format: Format::Hex,
+                output: None,
+            },
+            &identity,
+        )
+        .expect("first staged sign");
+        let staged_two = stage_native_sign(
+            &SignRequest {
+                identity: identity.name.clone(),
+                input: InputSource::Path {
+                    path: input_two.clone(),
+                },
+                format: Format::Hex,
+                output: None,
+            },
+            &identity,
+        )
+        .expect("second staged sign");
+
+        assert_ne!(staged_one.digest_path, staged_two.digest_path);
+        assert_ne!(staged_one.artifact_path, staged_two.artifact_path);
+        assert_ne!(
+            staged_one.digest_path.parent(),
+            staged_two.digest_path.parent(),
+            "native sign requests should stage in different workspace directories"
+        );
+
+        let workspace_one = staged_one
+            .digest_path
+            .parent()
+            .expect("first workspace")
+            .to_path_buf();
+        let workspace_two = staged_two
+            .digest_path
+            .parent()
+            .expect("second workspace")
+            .to_path_buf();
+
+        let runner = DigestEchoNativeSignRunner::new();
+        let signature_one = execute_native_sign_plan_with_runner(&staged_one.plan, &runner)
+            .expect("execute first staged sign");
+        let signature_two = execute_native_sign_plan_with_runner(&staged_two.plan, &runner)
+            .expect("execute second staged sign");
+
+        let expected_one = crate::ops::native::subprocess::finalize_p256_signature(
+            NativeSignatureFormat::Der,
+            &plain_signature_from_digest(&Sha256::digest(b"first native message")),
+        )
+        .expect("first expected signature");
+        let expected_two = crate::ops::native::subprocess::finalize_p256_signature(
+            NativeSignatureFormat::Der,
+            &plain_signature_from_digest(&Sha256::digest(b"second native message")),
+        )
+        .expect("second expected signature");
+
+        assert_eq!(signature_one, expected_one);
+        assert_eq!(signature_two, expected_two);
+        assert_ne!(signature_one, signature_two);
+
+        drop(staged_one);
+        drop(staged_two);
+        assert!(!workspace_one.exists());
+        assert!(!workspace_two.exists());
     }
 }

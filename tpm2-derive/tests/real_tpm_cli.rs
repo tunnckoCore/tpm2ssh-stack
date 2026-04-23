@@ -3,6 +3,8 @@ mod support;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use serde_json::Value;
 use support::{RealTpmHarness, hex_decode, hex_encode, normalize_openssh_public_key};
@@ -118,6 +120,202 @@ fn native_identity_library_round_trip_covers_create_sign_verify_and_export() {
 
     let public_key = fs::read_to_string(&public_key_path).expect("read exported public key");
     assert!(public_key.starts_with("ecdsa-sha2-nistp256 "));
+}
+
+#[test]
+fn native_identity_supports_parallel_sign_for_same_identity() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity = create_identity(
+        &harness,
+        "native-parallel",
+        Algorithm::P256,
+        ModePreference::Native,
+        vec![UseCase::Sign, UseCase::Verify],
+        DerivationOverrides::default(),
+    );
+
+    let message_one = write_workspace_file(&harness, "parallel-one.bin", b"parallel message one\n");
+    let message_two = write_workspace_file(&harness, "parallel-two.bin", b"parallel message two\n");
+    let signature_one = harness.workspace_path("parallel-one.sig");
+    let signature_two = harness.workspace_path("parallel-two.sig");
+    let barrier = Arc::new(Barrier::new(2));
+
+    let barrier_one = barrier.clone();
+    let identity_one = identity.clone();
+    let message_one_path = message_one.clone();
+    let signature_one_path = signature_one.clone();
+    let worker_one = thread::spawn(move || {
+        barrier_one.wait();
+        sign::execute_with_defaults(
+            &identity_one,
+            &tpm2_derive::model::SignRequest {
+                identity: identity_one.name.clone(),
+                input: path_input(&message_one_path),
+                format: Format::Der,
+                output: Some(signature_one_path),
+            },
+            &DerivationOverrides::default(),
+        )
+    });
+
+    let barrier_two = barrier.clone();
+    let identity_two = identity.clone();
+    let message_two_path = message_two.clone();
+    let signature_two_path = signature_two.clone();
+    let worker_two = thread::spawn(move || {
+        barrier_two.wait();
+        sign::execute_with_defaults(
+            &identity_two,
+            &tpm2_derive::model::SignRequest {
+                identity: identity_two.name.clone(),
+                input: path_input(&message_two_path),
+                format: Format::Der,
+                output: Some(signature_two_path),
+            },
+            &DerivationOverrides::default(),
+        )
+    });
+
+    let result_one = worker_one
+        .join()
+        .expect("first native sign thread should not panic")
+        .expect("first native sign should succeed");
+    let result_two = worker_two
+        .join()
+        .expect("second native sign thread should not panic")
+        .expect("second native sign should succeed");
+
+    let SignOperationResult::Native(native_one) = result_one.0 else {
+        panic!("expected first native sign result");
+    };
+    let SignOperationResult::Native(native_two) = result_two.0 else {
+        panic!("expected second native sign result");
+    };
+    assert_eq!(native_one.state, "executed");
+    assert_eq!(native_two.state, "executed");
+    assert!(signature_one.is_file());
+    assert!(signature_two.is_file());
+    assert_ne!(
+        fs::read(&signature_one).expect("read first signature"),
+        fs::read(&signature_two).expect("read second signature")
+    );
+
+    for (message_path, signature_path) in [
+        (&message_one, &signature_one),
+        (&message_two, &signature_two),
+    ] {
+        let (verify_result, _diagnostics) = verify::execute_with_defaults(
+            &identity,
+            &VerifyRequest {
+                identity: identity.name.clone(),
+                input: path_input(message_path),
+                signature: path_input(signature_path),
+                format: InputFormat::Der,
+            },
+            &DerivationOverrides::default(),
+        )
+        .expect("parallel native verify");
+        assert!(verify_result.verified);
+    }
+}
+
+#[test]
+fn concurrent_native_setup_same_identity_allows_only_one_winner() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let state_dir = harness.state_dir().to_path_buf();
+    let barrier = Arc::new(Barrier::new(2));
+
+    let barrier_one = barrier.clone();
+    let state_dir_one = state_dir.clone();
+    let worker_one = thread::spawn(move || {
+        let probe = default_probe();
+        barrier_one.wait();
+        ops::resolve_identity(
+            &probe,
+            &IdentityCreateRequest {
+                identity: "native-race".to_string(),
+                algorithm: Algorithm::P256,
+                uses: vec![UseCase::Sign, UseCase::Verify],
+                requested_mode: ModePreference::Native,
+                defaults: DerivationOverrides::default(),
+                state_dir: Some(state_dir_one),
+                dry_run: false,
+            },
+        )
+    });
+
+    let barrier_two = barrier.clone();
+    let state_dir_two = state_dir.clone();
+    let worker_two = thread::spawn(move || {
+        let probe = default_probe();
+        barrier_two.wait();
+        ops::resolve_identity(
+            &probe,
+            &IdentityCreateRequest {
+                identity: "native-race".to_string(),
+                algorithm: Algorithm::P256,
+                uses: vec![UseCase::Sign, UseCase::Verify],
+                requested_mode: ModePreference::Native,
+                defaults: DerivationOverrides::default(),
+                state_dir: Some(state_dir_two),
+                dry_run: false,
+            },
+        )
+    });
+
+    let first = worker_one
+        .join()
+        .expect("first native setup thread should not panic");
+    let second = worker_two
+        .join()
+        .expect("second native setup thread should not panic");
+    let results = [first, second];
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert!(results.iter().any(|result| {
+        matches!(result, Err(Error::State(message)) if message.contains("already exists"))
+    }));
+
+    let loaded = ops::load_identity("native-race", Some(state_dir.clone()))
+        .expect("winner identity should persist cleanly");
+    assert_eq!(loaded.mode.resolved, Mode::Native);
+}
+
+#[test]
+fn native_sign_fails_closed_when_serialized_handle_file_is_removed() {
+    let harness = RealTpmHarness::start().expect("start swtpm harness");
+    let identity = create_identity(
+        &harness,
+        "native-missing-handle",
+        Algorithm::P256,
+        ModePreference::Native,
+        vec![UseCase::Sign, UseCase::Verify],
+        DerivationOverrides::default(),
+    );
+    let handle_path = harness
+        .state_dir()
+        .join("objects")
+        .join(&identity.name)
+        .join("native")
+        .join(format!("{}-signing-key.handle", identity.name));
+    fs::remove_file(&handle_path).expect("remove serialized handle file");
+
+    let message_path = write_workspace_file(&harness, "missing-handle.bin", b"fail closed\n");
+    let error = sign::execute_with_defaults(
+        &identity,
+        &tpm2_derive::model::SignRequest {
+            identity: identity.name.clone(),
+            input: path_input(&message_path),
+            format: Format::Hex,
+            output: None,
+        },
+        &DerivationOverrides::default(),
+    )
+    .expect_err("native sign should fail closed without serialized handle state");
+    assert!(
+        matches!(error, Error::State(message) if message.contains("serialized handle state") || message.contains("no serialized handle state"))
+    );
 }
 
 #[test]
