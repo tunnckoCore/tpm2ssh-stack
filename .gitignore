@@ -10,3 +10,4 @@
 # Build outputs
 /target/
 **/target/
+PROMPT.md
