@@ -254,13 +254,13 @@ Checklist:
 - [x] Implement ECC P-256 sign key template.
 - [x] Implement ECC P-256 ECDH key template.
 - [x] Implement keyed-hash HMAC key template.
-- [ ] Create/load parent key.
-- [ ] Create child key.
-- [ ] Store public/private blobs under `--id`.
-- [ ] Persist key with `EvictControl` when `--handle` is provided.
-- [ ] Cache/export public key for asymmetric keys.
-- [ ] Reject duplicate IDs unless `--force` is provided.
-- [ ] Reject occupied persistent handles unless `--force` is provided.
+- [x] Create/load parent key.
+- [x] Create child key.
+- [x] Store public/private blobs under `--id`.
+- [x] Persist key with `EvictControl` when `--handle` is provided.
+- [x] Cache/export public key for asymmetric keys.
+- [x] Reject duplicate IDs unless `--force` is provided.
+- [x] Reject occupied persistent handles unless `--force` is provided.
 
 ### `tpmctl sign`
 
@@ -863,11 +863,11 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 5 — Key generation
 
-- [ ] Implement sign key creation.
-- [ ] Implement ECDH key creation.
-- [ ] Implement HMAC key creation.
-- [ ] Persist with handle where requested.
-- [ ] Store local registry entries.
+- [x] Implement sign key creation.
+- [x] Implement ECDH key creation.
+- [x] Implement HMAC key creation.
+- [x] Persist with handle where requested.
+- [x] Store local registry entries.
 - [x] Test duplicate ID/handle behavior.
 
 ### Phase 6 — Public key export

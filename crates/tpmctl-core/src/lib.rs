@@ -333,8 +333,28 @@ pub struct DeriveRequest {
     pub force: bool,
 }
 
-pub fn keygen(_request: KeygenRequest) -> Result<()> {
-    Err(Error::unsupported("keygen"))
+pub fn keygen(request: KeygenRequest) -> Result<()> {
+    let usage = match request.usage {
+        KeyUsage::Sign => keygen::KeygenUsage::Sign,
+        KeyUsage::Ecdh => keygen::KeygenUsage::Ecdh,
+        KeyUsage::Hmac => keygen::KeygenUsage::Hmac,
+        KeyUsage::Sealed => {
+            return Err(Error::invalid(
+                "usage",
+                "keygen supports sign, ecdh, and hmac usages",
+            ));
+        }
+    };
+    let id = RegistryId::new(request.id)?;
+    let store = Store::new(request.runtime.store.root);
+    keygen::KeygenRequest {
+        usage,
+        id,
+        persist_at: request.handle,
+        force: request.force,
+    }
+    .execute_with_store(&store)?;
+    Ok(())
 }
 
 pub fn sign(_request: SignRequest) -> Result<()> {
