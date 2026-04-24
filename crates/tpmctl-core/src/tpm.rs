@@ -2,11 +2,19 @@ use std::{env, str::FromStr};
 
 use tss_esapi::{
     Context,
+    attributes::ObjectAttributesBuilder,
     handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
     interface_types::{
-        dynamic_handles::Persistent, resource_handles::Provision, session_handles::AuthSession,
+        algorithm::{HashingAlgorithm, PublicAlgorithm},
+        dynamic_handles::Persistent,
+        key_bits::RsaKeyBits,
+        resource_handles::{Hierarchy, Provision},
+        session_handles::AuthSession,
     },
-    structures::{Name, Private, Public},
+    structures::{
+        Auth, Name, Private, Public, PublicBuilder, PublicKeyRsa, PublicRsaParametersBuilder,
+        RsaExponent, SymmetricDefinitionObject,
+    },
     tcti_ldr::{DeviceConfig, TctiNameConf},
     traits::{Marshall, UnMarshall},
 };
@@ -136,6 +144,96 @@ pub fn resolve_tcti(override_value: Option<&str>) -> Result<String> {
 pub fn create_context() -> Result<Context> {
     let tcti = resolve_tcti_name_conf()?;
     Context::new(tcti).map_err(|source| CoreError::tpm("Context::new", source))
+}
+
+pub const OWNER_STORAGE_PARENT_TEMPLATE: &str = "owner-rsa2048-aes128cfb-restricted-decrypt";
+
+#[derive(Debug, Clone)]
+pub struct CreatedChildKey {
+    pub public: Public,
+    pub private: Private,
+}
+
+pub fn owner_storage_parent_template() -> Result<Public> {
+    let object_attributes = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_sensitive_data_origin(true)
+        .with_user_with_auth(true)
+        .with_decrypt(true)
+        .with_sign_encrypt(false)
+        .with_restricted(true)
+        .build()
+        .map_err(|source| CoreError::tpm("build owner storage parent attributes", source))?;
+
+    let parameters = PublicRsaParametersBuilder::new_restricted_decryption_key(
+        SymmetricDefinitionObject::AES_128_CFB,
+        RsaKeyBits::Rsa2048,
+        RsaExponent::default(),
+    )
+    .build()
+    .map_err(|source| CoreError::tpm("build owner storage parent parameters", source))?;
+
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::Rsa)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(object_attributes)
+        .with_rsa_parameters(parameters)
+        .with_rsa_unique_identifier(PublicKeyRsa::default())
+        .build()
+        .map_err(|source| CoreError::tpm("build owner storage parent template", source))
+}
+
+pub fn create_owner_storage_parent(context: &mut Context) -> Result<KeyHandle> {
+    let public = owner_storage_parent_template()?;
+    context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.create_primary(
+                Hierarchy::Owner,
+                public,
+                Some(Auth::default()),
+                None,
+                None,
+                None,
+            )
+        })
+        .map(|result| result.key_handle)
+        .map_err(|source| CoreError::tpm("CreatePrimary owner storage parent", source))
+}
+
+pub fn create_child_key(
+    context: &mut Context,
+    parent_handle: KeyHandle,
+    public: Public,
+) -> Result<CreatedChildKey> {
+    context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.create(
+                parent_handle,
+                public,
+                Some(Auth::default()),
+                None,
+                None,
+                None,
+            )
+        })
+        .map(|result| CreatedChildKey {
+            public: result.out_public,
+            private: result.out_private,
+        })
+        .map_err(|source| CoreError::tpm("Create child object", source))
+}
+
+pub fn load_created_child_key(
+    context: &mut Context,
+    parent_handle: KeyHandle,
+    child: &CreatedChildKey,
+) -> Result<KeyHandle> {
+    context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.load(parent_handle, child.private.clone(), child.public.clone())
+        })
+        .map_err(|source| CoreError::tpm("Load child object", source))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -269,7 +367,9 @@ pub fn load_object_from_blobs(
     let private = unmarshal_private(&blobs.private)?;
     let public = unmarshal_public(&blobs.public)?;
     context
-        .load(parent_handle, private, public)
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.load(parent_handle, private, public)
+        })
         .map_err(|source| CoreError::tpm("Load", source))
 }
 
@@ -339,7 +439,23 @@ pub fn persist_object(
                 Persistent::from(destination.persistent_tpm_handle()),
             )
         })
-        .map_err(|source| CoreError::tpm("EvictControl", source))
+        .map_err(|source| CoreError::tpm("EvictControl persist object", source))
+}
+
+pub fn evict_persistent_object(
+    context: &mut Context,
+    object_handle: ObjectHandle,
+    destination: PersistentHandle,
+) -> Result<ObjectHandle> {
+    context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.evict_control(
+                Provision::Owner,
+                object_handle,
+                Persistent::from(destination.persistent_tpm_handle()),
+            )
+        })
+        .map_err(|source| CoreError::tpm("EvictControl evict persistent object", source))
 }
 
 fn invalid_handle(input: &str, reason: impl Into<String>) -> CoreError {
