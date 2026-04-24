@@ -122,7 +122,7 @@ crates/
 - [ ] Create `crates/tpmctl-core` as the reusable library crate.
 - [ ] Create `crates/tpmctl-cli` as the `tpmctl` binary crate.
 - [ ] Create `crates/tpmctl-pkcs11` as the PKCS#11 `cdylib` crate.
-- [ ] Put `tss-esapi` and TPM-domain dependencies in `tpmctl-core`.
+- [x] Put `tss-esapi` and TPM-domain dependencies in `tpmctl-core`.
 - [ ] Put `clap` and CLI-only dependencies in `tpmctl-cli`.
 - [ ] Put `pkcs11-sys` and PKCS#11-only dependencies in `tpmctl-pkcs11`.
 
@@ -196,16 +196,16 @@ Example sealed object:
 
 Metadata checklist:
 
-- [ ] `id`
-- [ ] `kind`: `key` or `sealed`
-- [ ] `usage`: `sign`, `ecdh`, `hmac`, or `sealed`
-- [ ] `handle`: optional persistent handle
-- [ ] `persistent`: boolean
-- [ ] `curve`: for asymmetric ECC keys
-- [ ] `hash`: for HMAC keys and sealed HMAC output metadata
-- [ ] `created_at`
-- [ ] TPM parent/template information required to reload non-persistent objects
-- [ ] Public key cache where applicable
+- [x] `id`
+- [x] `kind`: `key` or `sealed`
+- [x] `usage`: `sign`, `ecdh`, `hmac`, or `sealed`
+- [x] `handle`: optional persistent handle
+- [x] `persistent`: boolean
+- [x] `curve`: for asymmetric ECC keys
+- [x] `hash`: for HMAC keys and sealed HMAC output metadata
+- [x] `created_at`
+- [x] TPM parent/template information required to reload non-persistent objects
+- [x] Public key cache where applicable
 
 ## Global CLI Rules
 
@@ -733,13 +733,13 @@ Implementation should be run by five subagents working in separate git worktrees
 
 #### Agent 02 — Core TPM and Registry
 
-- [ ] `cargo test -p tpmctl-core store` passes.
-- [ ] `cargo test -p tpmctl-core handle` passes.
-- [ ] `cargo test -p tpmctl-core tcti` passes.
-- [ ] Store precedence is implemented: `--store`, then `TPMCTL_STORE`, then XDG default.
-- [ ] Registry IDs reject absolute paths, `..`, empty components, and invalid separators.
-- [ ] Persistent handles parse expected forms like `0x81010010`.
-- [ ] TPM errors map to stable core errors instead of panics.
+- [x] `cargo test -p tpmctl-core store` passes.
+- [x] `cargo test -p tpmctl-core handle` passes.
+- [x] `cargo test -p tpmctl-core tcti` passes.
+- [x] Store precedence is implemented: `--store`, then `TPMCTL_STORE`, then XDG default.
+- [x] Registry IDs reject absolute paths, `..`, empty components, and invalid separators.
+- [x] Persistent handles parse expected forms like `0x81010010`.
+- [x] TPM errors map to stable core errors instead of panics.
 
 #### Agent 03 — CLI Validation and I/O
 
@@ -831,26 +831,26 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 2 — Core TPM helpers
 
-- [ ] Centralize TCTI resolution.
-- [ ] Centralize ESAPI context creation.
-- [ ] Implement persistent handle parsing.
-- [ ] Implement object loading from registry blobs.
-- [ ] Implement object loading from persistent handle.
-- [ ] Implement `ReadPublic` helper.
-- [ ] Implement `EvictControl` persistence helper.
-- [ ] Add consistent TPM error mapping.
+- [x] Centralize TCTI resolution.
+- [x] Centralize ESAPI context creation.
+- [x] Implement persistent handle parsing.
+- [x] Implement object loading from registry blobs.
+- [x] Implement object loading from persistent handle.
+- [x] Implement `ReadPublic` helper.
+- [x] Implement `EvictControl` persistence helper.
+- [x] Add consistent TPM error mapping.
 
 ### Phase 3 — Registry
 
-- [ ] Define registry root.
-- [ ] Implement store root precedence: `--store`, then `TPMCTL_STORE`, then XDG default.
-- [ ] Define metadata schema.
-- [ ] Implement safe ID-to-path mapping.
-- [ ] Reject path traversal in IDs.
-- [ ] Implement atomic metadata/blob writes.
-- [ ] Implement ID existence checks.
-- [ ] Implement load/save for key objects.
-- [ ] Implement load/save for sealed objects.
+- [x] Define registry root.
+- [x] Implement store root precedence: `--store`, then `TPMCTL_STORE`, then XDG default.
+- [x] Define metadata schema.
+- [x] Implement safe ID-to-path mapping.
+- [x] Reject path traversal in IDs.
+- [x] Implement atomic metadata/blob writes.
+- [x] Implement ID existence checks.
+- [x] Implement load/save for key objects.
+- [x] Implement load/save for sealed objects.
 
 ### Phase 4 — CLI skeleton
 

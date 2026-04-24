@@ -1,0 +1,13 @@
+[package]
+name = "tpmctl-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tpmctl"
+path = "src/main.rs"
+
+[dependencies]
+tpmctl-core = { path = "../tpmctl-core" }
