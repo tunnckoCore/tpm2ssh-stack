@@ -26,7 +26,6 @@ use tss_esapi::{
     tcti_ldr::{DeviceConfig, TctiNameConf},
     traits::{Marshall, UnMarshall},
     tss2_esys::TPMT_TK_HASHCHECK,
-    utils,
 };
 /// Shared execution context passed from frontends into core operations.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -517,17 +516,7 @@ pub fn evict_persistent_object(
 }
 
 pub fn create_default_parent(context: &mut Context) -> Result<KeyHandle> {
-    let public = utils::create_restricted_decryption_rsa_public(
-        SymmetricDefinitionObject::AES_256_CFB,
-        RsaKeyBits::Rsa2048,
-        tss_esapi::structures::RsaExponent::default(),
-    )
-    .map_err(|source| CoreError::tpm("build parent public", source))?;
-
-    context
-        .create_primary(Hierarchy::Owner, public, None, None, None, None)
-        .map(|result| result.key_handle)
-        .map_err(|source| CoreError::tpm("CreatePrimary", source))
+    create_owner_storage_parent(context)
 }
 
 pub fn load_key_by_id(context: &mut Context, store: &Store, id: &RegistryId) -> Result<LoadedKey> {

@@ -9,8 +9,8 @@ use tss_esapi::{
     },
     structures::{
         Digest, EccPoint, EccScheme, HashScheme, HmacScheme, KeyDerivationFunctionScheme,
-        KeyedHashScheme, Public, PublicBuilder, PublicEccParametersBuilder,
-        PublicKeyedHashParameters,
+        KeyedHashScheme, Public, PublicBuilder, PublicEccParameters, PublicEccParametersBuilder,
+        PublicKeyedHashParameters, SymmetricDefinitionObject,
     },
 };
 
@@ -164,15 +164,12 @@ pub fn ecc_p256_sign_template() -> Result<Public> {
         .build()
         .map_err(|source| CoreError::tpm("build ECC signing attributes", source))?;
 
-    let parameters = PublicEccParametersBuilder::new()
-        .with_ecc_scheme(EccScheme::EcDsa(HashScheme::new(HashingAlgorithm::Sha256)))
-        .with_curve(TpmEccCurve::NistP256)
-        .with_is_signing_key(true)
-        .with_is_decryption_key(false)
-        .with_restricted(false)
-        .with_key_derivation_function_scheme(KeyDerivationFunctionScheme::Null)
-        .build()
-        .map_err(|source| CoreError::tpm("build ECC signing parameters", source))?;
+    let parameters = PublicEccParameters::new(
+        SymmetricDefinitionObject::Null,
+        EccScheme::Null,
+        TpmEccCurve::NistP256,
+        KeyDerivationFunctionScheme::Null,
+    );
 
     PublicBuilder::new()
         .with_public_algorithm(PublicAlgorithm::Ecc)
@@ -346,6 +343,11 @@ fn push_fixed_32(out: &mut Vec<u8>, value: &[u8], coordinate: &'static str) -> R
 #[cfg(test)]
 mod keygen_tests {
     use super::*;
+    use crate::{
+        HashAlgorithm,
+        output::SignatureFormat,
+        sign::{SignInput, SignRequest},
+    };
     use tss_esapi::{
         interface_types::algorithm::EccSchemeAlgorithm,
         structures::{KeyedHashScheme, Public},
@@ -380,10 +382,7 @@ mod keygen_tests {
         };
         assert!(object_attributes.sign_encrypt());
         assert!(!object_attributes.decrypt());
-        assert_eq!(
-            parameters.ecc_scheme().algorithm(),
-            EccSchemeAlgorithm::EcDsa
-        );
+        assert_eq!(parameters.ecc_scheme(), EccScheme::Null);
 
         let ecdh = public_template_for_usage(KeygenUsage::Ecdh).unwrap();
         let Public::Ecc {
@@ -524,5 +523,39 @@ mod keygen_tests {
         let result = request.execute_with_store(&store).unwrap();
         assert_eq!(result.usage, KeygenUsage::Sign);
         assert!(store.exists(RegistryCollection::Keys, &request.id));
+    }
+
+    #[test]
+    fn simulator_non_persistent_keygen_sign_reload_supports_sha512() {
+        if std::env::var("TEST_TCTI")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            eprintln!("skipping simulator reload/sign test: TEST_TCTI is not set");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path());
+        let id = RegistryId::new("sim/keygen/reload-sign-sha512").unwrap();
+        let request = KeygenRequest {
+            usage: KeygenUsage::Sign,
+            id: id.clone(),
+            persist_at: None,
+            force: false,
+        };
+        request.execute_with_store(&store).unwrap();
+
+        let signature = SignRequest {
+            selector: ObjectSelector::Id(id),
+            input: SignInput::Message(b"parent and hash flexibility".to_vec()),
+            hash: HashAlgorithm::Sha512,
+            format: SignatureFormat::Raw,
+        }
+        .execute(&store)
+        .unwrap();
+
+        assert_eq!(signature.len(), 64);
     }
 }
