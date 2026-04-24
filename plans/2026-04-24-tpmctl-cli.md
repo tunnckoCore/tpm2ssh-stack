@@ -460,16 +460,16 @@ Rules:
 - [x] Default `--hash` is key metadata hash or `sha256`.
 - [x] Default `--format` is `raw` when not sealing.
 - [x] When sealing, do not print or write PRF bytes unless explicitly requested.
-- [ ] JSON for sealed output uses `sealed_at` or `sealed_id` and `hash`.
+- [x] JSON for sealed output uses `sealed_at` or `sealed_id` and `hash`.
 
 Checklist:
 
-- [ ] Load HMAC key.
+- [x] Load HMAC key.
 - [x] Implement one-shot HMAC for small input.
 - [ ] Implement HMAC sequence APIs for large input.
 - [x] Encode raw/hex output.
-- [ ] Implement `--seal-at` by sealing HMAC output and persisting at handle.
-- [ ] Implement `--seal-id` by sealing HMAC output and storing under registry ID.
+- [x] Implement `--seal-at` by sealing HMAC output and persisting at handle.
+- [x] Implement `--seal-id` by sealing HMAC output and storing under registry ID.
 - [x] Zeroize HMAC output after sealing/writing where practical.
 
 ### `tpmctl seal`
@@ -486,16 +486,16 @@ tpmctl seal --input ./secret.bin --id org/acme/alice/sealed/foo
 Rules:
 
 - [x] Require exactly one of `--id` or `--handle`.
-- [ ] `--handle` persists the sealed object at a TPM persistent handle.
-- [ ] `--id` stores the sealed object under the local registry.
+- [x] `--handle` persists the sealed object at a TPM persistent handle.
+- [x] `--id` stores the sealed object under the local registry.
 
 Checklist:
 
-- [ ] Read input from file or stdin.
-- [ ] Create sealed data object.
-- [ ] Persist with `EvictControl` for `--handle`.
-- [ ] Store TPM blobs and metadata for `--id`.
-- [ ] Print concise success output or JSON.
+- [x] Read input from file or stdin.
+- [x] Create sealed data object.
+- [x] Persist with `EvictControl` for `--handle`.
+- [x] Store TPM blobs and metadata for `--id`.
+- [x] Print concise success output or JSON.
 
 ### `tpmctl unseal`
 
@@ -516,11 +516,11 @@ Rules:
 
 Checklist:
 
-- [ ] Load sealed object by registry ID.
-- [ ] Load sealed object by persistent handle.
-- [ ] Call TPM `Unseal`.
-- [ ] Write unsealed bytes to file/stdout.
-- [ ] Zeroize unsealed bytes after writing where practical.
+- [x] Load sealed object by registry ID.
+- [x] Load sealed object by persistent handle.
+- [x] Call TPM `Unseal`.
+- [x] Write unsealed bytes to file/stdout.
+- [x] Zeroize unsealed bytes after writing where practical.
 
 ### `tpmctl derive`
 
@@ -898,28 +898,28 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 ### Phase 9 — HMAC
 
 - [x] Validate HMAC key usage.
-- [ ] Implement one-shot HMAC.
+- [x] Implement one-shot HMAC.
 - [ ] Implement sequence HMAC for large input.
 - [x] Encode raw/hex output.
 - [x] Support `--hash`.
 
 ### Phase 10 — Seal/unseal
 
-- [ ] Create sealed object from input.
-- [ ] Persist sealed object by handle.
-- [ ] Store sealed object by ID.
-- [ ] Load and unseal by handle.
-- [ ] Load and unseal by ID.
-- [ ] Zeroize unsealed data.
+- [x] Create sealed object from input.
+- [x] Persist sealed object by handle.
+- [x] Store sealed object by ID.
+- [x] Load and unseal by handle.
+- [x] Load and unseal by ID.
+- [x] Zeroize unsealed data.
 
 ### Phase 11 — HMAC sealing convenience
 
-- [ ] Compute HMAC output.
-- [ ] Seal output at persistent handle for `--seal-at`.
-- [ ] Seal output into registry for `--seal-id`.
+- [x] Compute HMAC output.
+- [x] Seal output at persistent handle for `--seal-at`.
+- [x] Seal output into registry for `--seal-id`.
 - [x] Reject `--seal-at` and `--seal-id` together.
-- [ ] Emit human success output.
-- [ ] Emit JSON success output.
+- [x] Emit human success output.
+- [x] Emit JSON success output.
 
 ### Phase 12 — Derive
 

@@ -1,5 +1,10 @@
 use std::{env, str::FromStr};
 
+use crate::{
+    CoreError, EccCurve, EccPublicKey, Error, HashAlgorithm, ObjectDescriptor, ObjectSelector,
+    Result,
+    store::{ObjectUsage, RegistryCollection, RegistryId, Store, StoreOptions, StoredObjectEntry},
+};
 use tss_esapi::{
     Context,
     attributes::ObjectAttributesBuilder,
@@ -23,12 +28,6 @@ use tss_esapi::{
     tss2_esys::TPMT_TK_HASHCHECK,
     utils,
 };
-
-use crate::{
-    CoreError, EccPublicKey, HashAlgorithm, ObjectDescriptor, ObjectSelector, Result,
-    store::{ObjectUsage, RegistryCollection, RegistryId, Store, StoreOptions, StoredObjectEntry},
-};
-
 /// Shared execution context passed from frontends into core operations.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct CommandContext {
@@ -159,6 +158,33 @@ pub struct CreatedChildKey {
     pub private: Private,
 }
 
+pub fn create_context_with_tcti(override_value: Option<&str>) -> Result<Context> {
+    let tcti = match override_value {
+        Some(value) if value.trim().is_empty() => {
+            return Err(CoreError::Tcti("TCTI override is empty".into()));
+        }
+        Some(value) => value.parse::<TctiNameConf>().map_err(|source| {
+            CoreError::Tcti(format!(
+                "failed to parse TCTI override {value:?} as a TCTI configuration: {source}"
+            ))
+        })?,
+        None => resolve_tcti_name_conf()?,
+    };
+    Context::new(tcti).map_err(|source| CoreError::tpm("Context::new", source))
+}
+
+pub fn create_context_for(command: &CommandContext) -> Result<Context> {
+    create_context_with_tcti(command.tcti.as_deref())
+}
+
+pub fn hashing_algorithm(hash: HashAlgorithm) -> HashingAlgorithm {
+    match hash {
+        HashAlgorithm::Sha256 => HashingAlgorithm::Sha256,
+        HashAlgorithm::Sha384 => HashingAlgorithm::Sha384,
+        HashAlgorithm::Sha512 => HashingAlgorithm::Sha512,
+    }
+}
+
 pub fn owner_storage_parent_template() -> Result<Public> {
     let object_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
@@ -206,6 +232,10 @@ pub fn create_owner_storage_parent(context: &mut Context) -> Result<KeyHandle> {
         .map_err(|source| CoreError::tpm("CreatePrimary owner storage parent", source))
 }
 
+pub fn create_owner_primary(context: &mut Context) -> Result<KeyHandle> {
+    create_owner_storage_parent(context)
+}
+
 pub fn create_child_key(
     context: &mut Context,
     parent_handle: KeyHandle,
@@ -240,7 +270,6 @@ pub fn load_created_child_key(
         })
         .map_err(|source| CoreError::tpm("Load child object", source))
 }
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PersistentHandle {
     raw: u32,
@@ -398,6 +427,18 @@ pub fn load_key_from_registry(
     load_object_from_registry(context, store, RegistryCollection::Keys, id, parent_handle)
 }
 
+pub fn load_key_from_registry_with_descriptor(
+    context: &mut Context,
+    store: &Store,
+    id: &RegistryId,
+    parent_handle: KeyHandle,
+) -> Result<(KeyHandle, ObjectDescriptor)> {
+    let entry = store.load_entry(RegistryCollection::Keys, id)?;
+    let descriptor = descriptor_from_registry_entry(RegistryCollection::Keys, id, &entry)?;
+    let handle = load_object_from_blobs(context, parent_handle, &ObjectBlobs::from_entry(&entry))?;
+    Ok((handle, descriptor))
+}
+
 pub fn load_sealed_from_registry(
     context: &mut Context,
     store: &Store,
@@ -411,6 +452,18 @@ pub fn load_sealed_from_registry(
         id,
         parent_handle,
     )
+}
+
+pub fn load_sealed_from_registry_with_descriptor(
+    context: &mut Context,
+    store: &Store,
+    id: &RegistryId,
+    parent_handle: KeyHandle,
+) -> Result<(KeyHandle, ObjectDescriptor)> {
+    let entry = store.load_entry(RegistryCollection::Sealed, id)?;
+    let descriptor = descriptor_from_registry_entry(RegistryCollection::Sealed, id, &entry)?;
+    let handle = load_object_from_blobs(context, parent_handle, &ObjectBlobs::from_entry(&entry))?;
+    Ok((handle, descriptor))
 }
 
 pub fn load_persistent_object(
@@ -789,6 +842,91 @@ impl ObjectDescriptor {
             self.public_key = Some(ecc_public_key_from_public(&public)?);
         }
         Ok(self)
+    }
+}
+
+pub fn descriptor_from_registry_entry(
+    collection: RegistryCollection,
+    id: &RegistryId,
+    entry: &StoredObjectEntry,
+) -> Result<ObjectDescriptor> {
+    let usage = key_usage_from_metadata(entry.metadata.usage);
+    let expected_kind = match collection {
+        RegistryCollection::Keys => crate::store::StoredObjectKind::Key,
+        RegistryCollection::Sealed => crate::store::StoredObjectKind::Sealed,
+    };
+    if entry.metadata.kind != expected_kind {
+        return Err(Error::invalid(
+            "kind",
+            format!(
+                "registry entry {id} is {:?}, expected {:?}",
+                entry.metadata.kind, expected_kind
+            ),
+        ));
+    }
+
+    Ok(ObjectDescriptor {
+        selector: ObjectSelector::Id(id.clone()),
+        usage,
+        curve: entry
+            .metadata
+            .curve
+            .as_deref()
+            .map(curve_from_metadata)
+            .transpose()?,
+        hash: entry.metadata.hash.as_deref().map(str::parse).transpose()?,
+        public_key: None,
+    })
+}
+
+pub fn descriptor_from_public(
+    selector: ObjectSelector,
+    public: &Public,
+) -> Result<ObjectDescriptor> {
+    let usage = match public {
+        Public::KeyedHash {
+            object_attributes, ..
+        } if object_attributes.sign_encrypt() => crate::KeyUsage::Hmac,
+        Public::KeyedHash { .. } => crate::KeyUsage::Sealed,
+        Public::Ecc { .. } | Public::Rsa { .. } => {
+            return Err(Error::invalid(
+                "usage",
+                "object is not a keyed-hash HMAC key or sealed data object",
+            ));
+        }
+        Public::SymCipher { .. } => {
+            return Err(Error::invalid(
+                "usage",
+                "symmetric-cipher objects are not supported by this operation",
+            ));
+        }
+    };
+
+    Ok(ObjectDescriptor {
+        selector,
+        usage,
+        curve: None,
+        hash: None,
+        public_key: None,
+    })
+}
+
+fn key_usage_from_metadata(usage: ObjectUsage) -> crate::KeyUsage {
+    match usage {
+        ObjectUsage::Sign => crate::KeyUsage::Sign,
+        ObjectUsage::Ecdh => crate::KeyUsage::Ecdh,
+        ObjectUsage::Hmac => crate::KeyUsage::Hmac,
+        ObjectUsage::Sealed => crate::KeyUsage::Sealed,
+    }
+}
+
+fn curve_from_metadata(curve: &str) -> Result<EccCurve> {
+    match curve {
+        "p256" | "P-256" | "nistp256" => Ok(EccCurve::P256),
+        other => Err(Error::invalid(
+            "curve",
+            format!("unsupported curve in registry metadata: {other:?}"),
+        )),
     }
 }
 

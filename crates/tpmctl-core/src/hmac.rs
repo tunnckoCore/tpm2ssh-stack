@@ -1,11 +1,12 @@
 use hmac_crate::{Hmac, Mac};
 use sha2::{Sha256, Sha384, Sha512};
+use tss_esapi::{handles::ObjectHandle, structures::MaxBuffer};
 use zeroize::Zeroizing;
 
 use crate::output::{BinaryFormat, encode_binary};
 use crate::{
-    Error, HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result, SealTarget,
-    unsupported_without_tpm,
+    CommandContext, Error, HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result,
+    SealTarget, seal::seal_bytes, store::Store, tpm,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -16,6 +17,7 @@ pub struct HmacRequest {
     pub format: BinaryFormat,
     pub seal_target: Option<SealTarget>,
     pub emit_prf_when_sealing: bool,
+    pub force: bool,
 }
 
 impl HmacRequest {
@@ -34,14 +36,44 @@ impl HmacRequest {
     }
 
     pub fn execute(&self) -> Result<HmacResult> {
-        let _hash = self.effective_hash(None);
-        Err(unsupported_without_tpm("hmac"))
+        self.execute_with_context(&CommandContext::default())
+    }
+
+    pub fn execute_with_context(&self, command: &CommandContext) -> Result<HmacResult> {
+        let mut context = tpm::create_context_for(command)?;
+        let (object_handle, descriptor) = load_hmac_key(&mut context, command, &self.selector)?;
+        self.validate_descriptor(&descriptor)?;
+        let hash = self.effective_hash(Some(&descriptor));
+        let output = compute_tpm_hmac(&mut context, object_handle, &self.input, hash)?;
+
+        match &self.seal_target {
+            None => Ok(HmacResult::Output(output)),
+            Some(target) => {
+                let selector = match target {
+                    SealTarget::Id(id) => ObjectSelector::Id(id.clone()),
+                    SealTarget::Handle(handle) => ObjectSelector::Handle(*handle),
+                };
+                seal_bytes(command, selector, output.as_slice(), self.force, Some(hash))?;
+                if self.should_emit_prf_bytes() {
+                    Ok(HmacResult::SealedWithOutput {
+                        target: target.clone(),
+                        hash,
+                        output,
+                    })
+                } else {
+                    Ok(HmacResult::Sealed {
+                        target: target.clone(),
+                        hash,
+                    })
+                }
+            }
+        }
     }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum HmacResult {
-    Output(Vec<u8>),
+    Output(Zeroizing<Vec<u8>>),
     Sealed {
         target: SealTarget,
         hash: HashAlgorithm,
@@ -49,12 +81,61 @@ pub enum HmacResult {
     SealedWithOutput {
         target: SealTarget,
         hash: HashAlgorithm,
-        output: Vec<u8>,
+        output: Zeroizing<Vec<u8>>,
     },
 }
 
 pub fn encode_hmac_output(bytes: &[u8], format: BinaryFormat) -> Vec<u8> {
     encode_binary(bytes, format)
+}
+
+pub fn compute_tpm_hmac(
+    context: &mut tss_esapi::Context,
+    object_handle: ObjectHandle,
+    input: &[u8],
+    hash: HashAlgorithm,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if input.len() > MaxBuffer::MAX_SIZE {
+        return Err(Error::invalid(
+            "input",
+            format!(
+                "HMAC input is too large for TPM2_HMAC one-shot ({} > {} bytes); TPM sequence commands are not exposed by the linked tss-esapi version",
+                input.len(),
+                MaxBuffer::MAX_SIZE
+            ),
+        ));
+    }
+
+    let buffer = MaxBuffer::try_from(input)
+        .map_err(|source| crate::CoreError::tpm("prepare HMAC input", source))?;
+    let digest = context
+        .execute_with_nullauth_session(|ctx| {
+            ctx.hmac(object_handle, buffer, tpm::hashing_algorithm(hash))
+        })
+        .map_err(|source| crate::CoreError::tpm("HMAC", source))?;
+    Ok(Zeroizing::new(digest.value().to_vec()))
+}
+
+fn load_hmac_key(
+    context: &mut tss_esapi::Context,
+    command: &CommandContext,
+    selector: &ObjectSelector,
+) -> Result<(ObjectHandle, ObjectDescriptor)> {
+    match selector {
+        ObjectSelector::Handle(handle) => {
+            let object = tpm::load_persistent_object(context, *handle)?;
+            let (public, _, _) = tpm::read_public(context, object)?;
+            let descriptor = tpm::descriptor_from_public(ObjectSelector::Handle(*handle), &public)?;
+            Ok((object, descriptor))
+        }
+        ObjectSelector::Id(id) => {
+            let store = Store::resolve(command.store.root.as_deref())?;
+            let parent = tpm::create_owner_primary(context)?;
+            let (handle, descriptor) =
+                tpm::load_key_from_registry_with_descriptor(context, &store, id, parent)?;
+            Ok((ObjectHandle::from(handle), descriptor))
+        }
+    }
 }
 
 pub fn compute_software_hmac_for_tests(
@@ -93,6 +174,7 @@ mod hmac_tests {
             format: BinaryFormat::Raw,
             seal_target: None,
             emit_prf_when_sealing: false,
+            force: false,
         }
     }
 
@@ -145,5 +227,11 @@ mod hmac_tests {
         assert!(!request.should_emit_prf_bytes());
         request.emit_prf_when_sealing = true;
         assert!(request.should_emit_prf_bytes());
+    }
+
+    #[test]
+    fn hmac_result_can_carry_zeroizing_output() {
+        let result = HmacResult::Output(Zeroizing::new(vec![1, 2, 3]));
+        assert!(matches!(result, HmacResult::Output(_)));
     }
 }
