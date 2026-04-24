@@ -1,8 +1,0 @@
-Command: standalone rust repro linked against current crate with fake TPM runner
-
-seal_result=Err(State("failed to remove existing seed object directory /tmp/tpm2-derive-seed-dot-overwrite-2442865/objects/.: Invalid argument (os error 22)"))
-objects_dir_exists=true
-victim_exists=false
-sentinel_exists=false
-
-Interpretation: an overwrite against identity/profile `.` deleted unrelated data under the shared objects root before the operation returned an error.

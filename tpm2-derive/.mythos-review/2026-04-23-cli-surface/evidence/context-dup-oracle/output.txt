@@ -1,3 +1,0 @@
-raw_context_pairs=[("tenant", "alpha"), ("tenant", "beta")]
-collected_map={"tenant": "beta"}
-effective_tenant=beta

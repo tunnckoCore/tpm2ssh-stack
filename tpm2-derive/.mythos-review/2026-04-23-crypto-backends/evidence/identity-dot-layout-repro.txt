@@ -1,9 +1,0 @@
-Command: standalone rust repro linked against current crate
-
-identity_name=.
-objects_dir=/tmp/tpm2-derive-dot-name-repro/objects
-seed_object_dir=/tmp/tpm2-derive-dot-name-repro/objects/.
-prf_object_dir=/tmp/tpm2-derive-dot-name-repro/objects/.
-seed_collapses_to_objects_root=true
-prf_collapses_to_objects_root=true
-native_dir_if_used=/tmp/tpm2-derive-dot-name-repro/objects/./native

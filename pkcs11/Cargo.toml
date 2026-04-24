@@ -1,0 +1,15 @@
+[package]
+name = "tpm2-derive-pkcs11"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal standalone TPM2 PKCS#11 provider for P-256 ECDSA"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8", "pem"] }
+pkcs11-sys = "0.2"
+tss-esapi = "7.6.0"

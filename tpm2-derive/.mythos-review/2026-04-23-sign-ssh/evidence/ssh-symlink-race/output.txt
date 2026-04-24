@@ -1,9 +1,0 @@
-accepted_request_socket=/tmp/.tmpgd7PTc/linkdir/agent.sock
-result_socket=/tmp/.tmpgd7PTc/linkdir/agent.sock
-client_presented_socket=/tmp/.tmpgd7PTc/linkdir/agent.sock
-canonical_socket_after_swap=/tmp/.tmpgd7PTc/attacker/agent.sock
-safe_socket=/tmp/.tmpgd7PTc/safe/agent.sock
-attacker_socket=/tmp/.tmpgd7PTc/attacker/agent.sock
-swapped_to_attacker=true
-result_path_is_noncanonical=true
-derived_public_key_prefix=ssh-ed25519
