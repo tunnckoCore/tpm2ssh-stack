@@ -118,12 +118,12 @@ crates/
 
 ## Cargo Plan
 
-- [ ] Convert the repository to a Cargo workspace with members under `crates/`.
-- [ ] Create `crates/tpmctl-core` as the reusable library crate.
-- [ ] Create `crates/tpmctl-cli` as the `tpmctl` binary crate.
-- [ ] Create `crates/tpmctl-pkcs11` as the PKCS#11 `cdylib` crate.
+- [x] Convert the repository to a Cargo workspace with members under `crates/`.
+- [x] Create `crates/tpmctl-core` as the reusable library crate.
+- [x] Create `crates/tpmctl-cli` as the `tpmctl` binary crate.
+- [x] Create `crates/tpmctl-pkcs11` as the PKCS#11 `cdylib` crate.
 - [ ] Put `tss-esapi` and TPM-domain dependencies in `tpmctl-core`.
-- [ ] Put `clap` and CLI-only dependencies in `tpmctl-cli`.
+- [x] Put `clap` and CLI-only dependencies in `tpmctl-cli`.
 - [ ] Put `pkcs11-sys` and PKCS#11-only dependencies in `tpmctl-pkcs11`.
 
 Suggested workspace direction:
@@ -209,19 +209,19 @@ Metadata checklist:
 
 ## Global CLI Rules
 
-- [ ] Support `-h` / `--help`.
-- [ ] Support `--version`.
-- [ ] Primary output goes to stdout.
-- [ ] Diagnostics and errors go to stderr.
-- [ ] Support `--json` for structured command results where useful.
-- [ ] Support `-o` / `--output <file>` for output-producing commands.
-- [ ] Support `-` as stdin/stdout where file input/output is expected.
-- [ ] Reject binary output to an interactive TTY unless format is text or `--force` is provided.
-- [ ] Support exactly one of `--id <id>` or `--handle <handle>` for operations over existing TPM material.
+- [x] Support `-h` / `--help`.
+- [x] Support `--version`.
+- [x] Primary output goes to stdout.
+- [x] Diagnostics and errors go to stderr.
+- [x] Support `--json` for structured command results where useful.
+- [x] Support `-o` / `--output <file>` for output-producing commands.
+- [x] Support `-` as stdin/stdout where file input/output is expected.
+- [x] Reject binary output to an interactive TTY unless format is text or `--force` is provided.
+- [x] Support exactly one of `--id <id>` or `--handle <handle>` for operations over existing TPM material.
 - [ ] Make `--id` and `--handle` mutually exclusive everywhere they both appear.
-- [ ] Parse handles as hex strings like `0x81010010`.
+- [x] Parse handles as hex strings like `0x81010010`.
 - [ ] Respect TCTI from `TPM2TOOLS_TCTI`, `TCTI`, or `TEST_TCTI`; otherwise default to device TCTI.
-- [ ] Support `--store <path>` and `TPMCTL_STORE` for local registry location, with flags taking precedence over env.
+- [x] Support `--store <path>` and `TPMCTL_STORE` for local registry location, with flags taking precedence over env.
 - [ ] Use empty TPM object auth in v1; do not expose key auth flags yet.
 
 ## Command Specification
@@ -302,10 +302,10 @@ tpmctl sign \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Require exactly one of `--input` or `--digest`.
-- [ ] Default `--hash` is `sha256` for `--input`.
-- [ ] Default `--format` is `der`.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Require exactly one of `--input` or `--digest`.
+- [x] Default `--hash` is `sha256` for `--input`.
+- [x] Default `--format` is `der`.
 - [ ] For `--digest`, validate digest length against `--hash`.
 - [ ] `--format der` outputs ASN.1 DER ECDSA signature.
 - [ ] `--format raw` outputs P1363 `r || s` bytes.
@@ -355,7 +355,7 @@ Rules:
 
 Checklist:
 
-- [ ] Require exactly one of `--id` or `--handle`.
+- [x] Require exactly one of `--id` or `--handle`.
 - [ ] Reject HMAC and sealed objects.
 - [ ] Export from local cached public material where possible.
 - [ ] Use `ReadPublic` for direct handles.
@@ -390,8 +390,8 @@ tpmctl ecdh \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Default `--format` is `raw`.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Default `--format` is `raw`.
 - [ ] `--format raw` outputs raw shared secret bytes.
 - [ ] `--format hex` outputs `hex(shared secret bytes)`.
 
@@ -455,11 +455,11 @@ tpmctl hmac \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] `--seal-at` and `--seal-id` are mutually exclusive.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] `--seal-at` and `--seal-id` are mutually exclusive.
 - [ ] Default `--hash` is key metadata hash or `sha256`.
-- [ ] Default `--format` is `raw` when not sealing.
-- [ ] When sealing, do not print or write PRF bytes unless explicitly requested.
+- [x] Default `--format` is `raw` when not sealing.
+- [x] When sealing, do not print or write PRF bytes unless explicitly requested.
 - [ ] JSON for sealed output uses `sealed_at` or `sealed_id` and `hash`.
 
 Checklist:
@@ -485,7 +485,7 @@ tpmctl seal --input ./secret.bin --id org/acme/alice/sealed/foo
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
+- [x] Require exactly one of `--id` or `--handle`.
 - [ ] `--handle` persists the sealed object at a TPM persistent handle.
 - [ ] `--id` stores the sealed object under the local registry.
 
@@ -510,9 +510,9 @@ tpmctl unseal --id org/acme/alice/sealed/foo --output ./secret.bin
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Output to `--output` or stdout.
-- [ ] Refuse binary output to interactive TTY unless `--force` is provided.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Output to `--output` or stdout.
+- [x] Refuse binary output to interactive TTY unless `--force` is provided.
 
 Checklist:
 
@@ -611,23 +611,23 @@ tpmctl derive \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Default `--use` is `secret`.
-- [ ] Supported `--use`: `secret`, `pubkey`, `sign`.
-- [ ] Supported `--algorithm`: `p256`, `ed25519`, `secp256k1`.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Default `--use` is `secret`.
+- [x] Supported `--use`: `secret`, `pubkey`, `sign`.
+- [x] Supported `--algorithm`: `p256`, `ed25519`, `secp256k1`.
 - [ ] `--label <label>` present means deterministic derivation from PRF + label.
 - [ ] Missing `--label` means ephemeral derivation using fresh randomness.
-- [ ] For `--use sign`, require exactly one of `--input` or `--digest`.
-- [ ] For `--algorithm ed25519 --use sign`, do not support `--hash`.
-- [ ] For `--algorithm ed25519 --use sign`, support only `raw` and `hex` formats.
+- [x] For `--use sign`, require exactly one of `--input` or `--digest`.
+- [x] For `--algorithm ed25519 --use sign`, do not support `--hash`.
+- [x] For `--algorithm ed25519 --use sign`, support only `raw` and `hex` formats.
 - [ ] For `--algorithm ed25519 --use sign --digest`, sign the supplied bytes as the Ed25519 message bytes; do not implement Ed25519ph in v1.
-- [ ] For `--algorithm p256 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
-- [ ] For `--algorithm secp256k1 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
+- [x] For `--algorithm p256 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
+- [x] For `--algorithm secp256k1 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
 - [ ] For p256 and secp256k1 public keys, default to uncompressed public key bytes.
-- [ ] `--compressed` is valid only for secp256k1 `--use pubkey` with `raw` or `hex` output.
-- [ ] `--format address` is valid only for `--algorithm secp256k1 --use pubkey`.
-- [ ] Reject `--compressed --format address`.
-- [ ] Print a warning to stderr when `--label` is omitted for `--use pubkey` or `--use secret`, because the derived key is ephemeral and will change on each invocation.
+- [x] `--compressed` is valid only for secp256k1 `--use pubkey` with `raw` or `hex` output.
+- [x] `--format address` is valid only for `--algorithm secp256k1 --use pubkey`.
+- [x] Reject `--compressed --format address`.
+- [x] Print a warning to stderr when `--label` is omitted for `--use pubkey` or `--use secret`, because the derived key is ephemeral and will change on each invocation.
 
 Format matrix:
 
@@ -668,7 +668,7 @@ Checklist:
 - [ ] `pubkey --format hex` means `hex(raw public key bytes)`.
 - [ ] p256 and secp256k1 raw public keys default to uncompressed SEC1 points.
 - [ ] Ethereum address output is EIP-55 checksummed text.
-- [ ] Binary stdout to TTY should be rejected unless `--force` is provided.
+- [x] Binary stdout to TTY should be rejected unless `--force` is provided.
 
 ## Parallel Worktree Execution Model
 
@@ -743,13 +743,13 @@ Implementation should be run by five subagents working in separate git worktrees
 
 #### Agent 03 — CLI Validation and I/O
 
-- [ ] `cargo test -p tpmctl-cli` passes.
-- [ ] `cargo run -p tpmctl-cli -- --help` succeeds.
-- [ ] `cargo run -p tpmctl-cli -- --version` succeeds.
-- [ ] `--id` and `--handle` are mutually exclusive for all relevant commands.
-- [ ] `sign` and `derive --use sign` require exactly one of `--input` or `--digest`.
-- [ ] `hmac --seal-at` and `hmac --seal-id` are mutually exclusive.
-- [ ] Binary stdout to interactive TTY is rejected unless `--force` is present.
+- [x] `cargo test -p tpmctl-cli` passes.
+- [x] `cargo run -p tpmctl-cli -- --help` succeeds.
+- [x] `cargo run -p tpmctl-cli -- --version` succeeds.
+- [x] `--id` and `--handle` are mutually exclusive for all relevant commands.
+- [x] `sign` and `derive --use sign` require exactly one of `--input` or `--digest`.
+- [x] `hmac --seal-at` and `hmac --seal-id` are mutually exclusive.
+- [x] Binary stdout to interactive TTY is rejected unless `--force` is present.
 
 #### Agent 04 — TPM Commands
 
@@ -819,10 +819,10 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 1 — Workspace restructuring and crate boundaries
 
-- [ ] Create root Cargo workspace.
-- [ ] Create `crates/tpmctl-core` library crate.
-- [ ] Create `crates/tpmctl-cli` binary crate.
-- [ ] Create `crates/tpmctl-pkcs11` `cdylib` crate.
+- [x] Create root Cargo workspace.
+- [x] Create `crates/tpmctl-core` library crate.
+- [x] Create `crates/tpmctl-cli` binary crate.
+- [x] Create `crates/tpmctl-pkcs11` `cdylib` crate.
 - [ ] Move TPM and crypto logic into `tpmctl-core`.
 - [ ] Move CLI parsing and dispatch into `tpmctl-cli`.
 - [ ] Move PKCS#11 entrypoints into `tpmctl-pkcs11`.
@@ -854,12 +854,12 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 4 — CLI skeleton
 
-- [ ] Add parser.
-- [ ] Add global output helpers.
-- [ ] Add mutual-exclusion validation.
-- [ ] Add stdin/stdout `-` support.
-- [ ] Add `--json` support where planned.
-- [ ] Add clear exit codes and error messages.
+- [x] Add parser.
+- [x] Add global output helpers.
+- [x] Add mutual-exclusion validation.
+- [x] Add stdin/stdout `-` support.
+- [x] Add `--json` support where planned.
+- [x] Add clear exit codes and error messages.
 
 ### Phase 5 — Key generation
 
@@ -948,7 +948,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 - [ ] Unit-test format encoders.
 - [ ] Unit-test ID path safety.
-- [ ] Unit-test CLI parser validation.
+- [x] Unit-test CLI parser validation.
 - [ ] Unit-test secp256k1 scalar derivation retry behavior.
 - [ ] Add simulator/integration tests where available.
 - [ ] Document runtime packages and `pkg-config` requirements.
