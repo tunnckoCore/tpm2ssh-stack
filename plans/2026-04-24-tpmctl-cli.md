@@ -465,12 +465,12 @@ Rules:
 Checklist:
 
 - [ ] Load HMAC key.
-- [x] Implement one-shot HMAC for small input.
+- [ ] Implement one-shot HMAC for small input.
 - [ ] Implement HMAC sequence APIs for large input.
 - [x] Encode raw/hex output.
 - [ ] Implement `--seal-at` by sealing HMAC output and persisting at handle.
 - [ ] Implement `--seal-id` by sealing HMAC output and storing under registry ID.
-- [x] Zeroize HMAC output after sealing/writing where practical.
+- [ ] Zeroize HMAC output after sealing/writing where practical.
 
 ### `tpmctl seal`
 
@@ -868,7 +868,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [ ] Implement HMAC key creation.
 - [ ] Persist with handle where requested.
 - [ ] Store local registry entries.
-- [x] Test duplicate ID/handle behavior.
+- [ ] Test duplicate ID/handle behavior.
 
 ### Phase 6 — Public key export
 
@@ -923,7 +923,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 12 — Derive
 
-- [x] Unseal/load PRF seed.
+- [ ] Unseal/load PRF seed.
 - [x] Implement deterministic label mode.
 - [x] Implement ephemeral randomness mode.
 - [x] Implement p256 scalar retry derivation.
@@ -950,7 +950,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [x] Unit-test ID path safety.
 - [x] Unit-test CLI parser validation.
 - [x] Unit-test secp256k1 scalar derivation retry behavior.
-- [ ] Add simulator/integration tests where available.
+- [x] Add simulator/integration tests where available.
 - [x] Document runtime packages and `pkg-config` requirements.
 - [x] Document CLI examples.
 - [x] Document derived-key software security model.
@@ -979,10 +979,10 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [ ] `tpmctl keygen --use hmac --id ...` creates usable HMAC identity.
 - [ ] `tpmctl sign` works by `--id` and by `--handle`.
 - [x] `tpmctl pubkey` supports raw/hex/pem/der/ssh.
-- [x] `tpmctl ecdh` supports raw/hex.
-- [x] `tpmctl hmac` supports raw/hex and `--hash`.
-- [x] `tpmctl hmac --seal-at` and `--seal-id` work and are mutually exclusive.
+- [ ] `tpmctl ecdh` supports raw/hex.
+- [ ] `tpmctl hmac` supports raw/hex and `--hash`.
+- [ ] `tpmctl hmac --seal-at` and `--seal-id` work and are mutually exclusive.
 - [ ] `tpmctl seal` and `unseal` work by `--id` and by `--handle`.
-- [x] `tpmctl derive` supports p256, Ed25519, and secp256k1 secret/pubkey/sign flows.
+- [ ] `tpmctl derive` supports p256, Ed25519, and secp256k1 secret/pubkey/sign flows.
 - [x] Derived key material is zeroized where practical.
 - [x] README documents core library, CLI crate, and PKCS#11 provider crate builds separately.
