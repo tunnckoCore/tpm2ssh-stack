@@ -1,10 +1,7 @@
 use p256::pkcs8::DecodePublicKey as _;
 
 use crate::output::{PublicKeyFormat, encode_public_key};
-use crate::{
-    EccPublicKey, Error, KeyUsage, ObjectDescriptor, ObjectSelector, Result,
-    unsupported_without_tpm,
-};
+use crate::{EccPublicKey, Error, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PubkeyRequest {
@@ -39,8 +36,20 @@ impl PubkeyRequest {
         )
     }
 
-    pub fn execute(&self) -> Result<Vec<u8>> {
-        Err(unsupported_without_tpm("pubkey"))
+    pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
+        if let ObjectSelector::Id(id) = &self.selector {
+            let entry = store.load_key(id)?;
+            let descriptor =
+                crate::tpm::descriptor_from_entry(ObjectSelector::Id(id.clone()), &entry)?;
+            return self.encode_descriptor_public_key(&descriptor);
+        }
+
+        let mut context = crate::tpm::create_context()?;
+        let ObjectSelector::Handle(handle) = self.selector else {
+            unreachable!("id selector returned above")
+        };
+        let loaded = crate::tpm::load_key_by_handle(&mut context, handle)?;
+        self.encode_descriptor_public_key(&loaded.descriptor)
     }
 }
 
@@ -52,6 +61,20 @@ pub enum PublicKeyInput {
 }
 
 impl PublicKeyInput {
+    pub fn parse_bytes(bytes: Vec<u8>) -> Result<Self> {
+        if bytes.starts_with(b"-----BEGIN") {
+            let pem = String::from_utf8(bytes)
+                .map_err(|error| Error::invalid("public_key", error.to_string()))?;
+            return Ok(Self::Pem(pem));
+        }
+
+        if matches!(bytes.first(), Some(0x02 | 0x03 | 0x04)) {
+            return Ok(Self::Sec1(bytes));
+        }
+
+        Ok(Self::Der(bytes))
+    }
+
     pub fn into_p256(self) -> Result<EccPublicKey> {
         match self {
             Self::Sec1(bytes) => EccPublicKey::p256_sec1(bytes),

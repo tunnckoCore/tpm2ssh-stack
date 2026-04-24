@@ -313,13 +313,13 @@ Rules:
 
 Checklist:
 
-- [ ] Load key by registry ID.
-- [ ] Load key by persistent handle using `ReadPublic`/ESYS handle translation.
+- [x] Load key by registry ID.
+- [x] Load key by persistent handle using `ReadPublic`/ESYS handle translation.
 - [x] Validate key usage is `sign`.
 - [x] Hash `--input` data according to `--hash`.
-- [ ] Call TPM `Sign`.
+- [x] Call TPM `Sign`.
 - [x] Convert TPM signature to DER/raw/hex.
-- [ ] Write to `--output` or stdout.
+- [x] Write to `--output` or stdout.
 
 ### `tpmctl pubkey`
 
@@ -358,7 +358,7 @@ Checklist:
 - [x] Require exactly one of `--id` or `--handle`.
 - [x] Reject HMAC and sealed objects.
 - [x] Export from local cached public material where possible.
-- [ ] Use `ReadPublic` for direct handles.
+- [x] Use `ReadPublic` for direct handles.
 - [x] Implement raw/hex/pem/der/ssh encoders.
 
 ### `tpmctl ecdh`
@@ -397,10 +397,10 @@ Rules:
 
 Checklist:
 
-- [ ] Load ECDH key.
+- [x] Load ECDH key.
 - [x] Parse peer public key from PEM/DER/raw if supported.
-- [ ] Convert peer key to TPM ECC point.
-- [ ] Call TPM `ECDH_ZGen`.
+- [x] Convert peer key to TPM ECC point.
+- [x] Call TPM `ECDH_ZGen`.
 - [x] Encode raw/hex output.
 
 ### `tpmctl hmac`
@@ -883,7 +883,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 - [x] Implement input hashing.
 - [x] Implement digest validation.
-- [ ] Call TPM `Sign`.
+- [x] Call TPM `Sign`.
 - [x] Encode DER.
 - [x] Encode raw P1363.
 - [x] Encode hex P1363.
@@ -892,7 +892,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 - [x] Parse peer public key.
 - [x] Validate local key usage.
-- [ ] Call `ECDH_ZGen`.
+- [x] Call `ECDH_ZGen`.
 - [x] Encode raw/hex output.
 
 ### Phase 9 — HMAC

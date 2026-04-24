@@ -1,8 +1,6 @@
 use zeroize::Zeroizing;
 
-use crate::{
-    HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result, unsupported_without_tpm,
-};
+use crate::{HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store};
 
 use crate::output::{SignatureFormat, encode_p256_signature};
 
@@ -35,9 +33,18 @@ impl SignRequest {
         descriptor.require_usage(KeyUsage::Sign)
     }
 
-    pub fn execute(&self) -> Result<Vec<u8>> {
-        self.digest()?;
-        Err(unsupported_without_tpm("sign"))
+    pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
+        let mut context = crate::tpm::create_context()?;
+        let loaded = match &self.selector {
+            ObjectSelector::Id(id) => crate::tpm::load_key_by_id(&mut context, store, id)?,
+            ObjectSelector::Handle(handle) => {
+                crate::tpm::load_key_by_handle(&mut context, *handle)?
+            }
+        };
+        self.validate_descriptor(&loaded.descriptor)?;
+        let digest = self.digest()?;
+        let p1363 = crate::tpm::sign_digest(&mut context, loaded.handle, &digest, self.hash)?;
+        encode_tpm_p256_signature(&p1363, self.format)
     }
 }
 
@@ -97,14 +104,20 @@ mod sign_tests {
     }
 
     #[test]
-    fn sign_execute_reports_tpm_unavailable_without_foundation() {
+    fn sign_validates_sign_usage() {
         let request = SignRequest {
             selector: selector(),
             input: SignInput::Digest(vec![0; 32]),
             hash: HashAlgorithm::Sha256,
             format: SignatureFormat::Der,
         };
-        let error = request.execute().unwrap_err();
-        assert!(error.to_string().contains("TPM unavailable"));
+        let descriptor = ObjectDescriptor {
+            selector: selector(),
+            usage: KeyUsage::Sign,
+            curve: Some(crate::EccCurve::P256),
+            hash: None,
+            public_key: None,
+        };
+        assert!(request.validate_descriptor(&descriptor).is_ok());
     }
 }
