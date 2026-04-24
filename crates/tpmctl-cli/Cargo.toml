@@ -1,0 +1,15 @@
+[package]
+name = "tpmctl-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin command-line frontend for tpmctl-core"
+
+[[bin]]
+name = "tpmctl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.49", features = ["derive"] }
+tpmctl-core = { path = "../tpmctl-core" }
