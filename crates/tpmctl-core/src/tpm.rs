@@ -1,19 +1,59 @@
-use crate::Result;
+#[cfg(feature = "tss-esapi")]
+use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct TctiConfig {
-    pub spec: Option<String>,
+use crate::Result;
+pub use crate::tcti::TctiConfig;
+
+/// TPM context configuration shared by command-domain operations.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TpmConfig {
+    pub tcti: TctiConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct PersistentHandle(pub u32);
+impl Default for TpmConfig {
+    fn default() -> Self {
+        Self {
+            tcti: TctiConfig::resolve(),
+        }
+    }
+}
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct AuthValue(pub Vec<u8>);
+/// Lightweight ESAPI context wrapper. The actual TSS object is available when the
+/// `tss-esapi` feature is enabled; default builds can still test registry logic.
+#[cfg(feature = "tss-esapi")]
+pub struct EsapiContext {
+    inner: tss_esapi::Context,
+}
 
-#[derive(Debug, Default)]
-pub struct TpmContext;
+#[cfg(feature = "tss-esapi")]
+impl EsapiContext {
+    pub fn connect(config: &TpmConfig) -> Result<Self> {
+        let tcti = match &config.tcti.name_conf {
+            Some(name_conf) => tss_esapi::tcti_ldr::TctiNameConf::from_str(name_conf)?,
+            None => tss_esapi::tcti_ldr::TctiNameConf::Device(Default::default()),
+        };
+        Ok(Self {
+            inner: tss_esapi::Context::new(tcti)?,
+        })
+    }
 
-pub fn open_context(_config: &TctiConfig) -> Result<TpmContext> {
-    Err(crate::TpmctlError::NotImplemented("tpm::open_context"))
+    pub fn inner(&self) -> &tss_esapi::Context {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut tss_esapi::Context {
+        &mut self.inner
+    }
+}
+
+/// Stub context for builds that do not enable typed TSS integration yet.
+#[cfg(not(feature = "tss-esapi"))]
+#[derive(Debug, Clone)]
+pub struct EsapiContext;
+
+#[cfg(not(feature = "tss-esapi"))]
+impl EsapiContext {
+    pub fn connect(_config: &TpmConfig) -> Result<Self> {
+        Ok(Self)
+    }
 }
