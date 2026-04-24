@@ -1,0 +1,16 @@
+[package]
+name = "tpmctl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+tss-esapi-backend = ["dep:tss-esapi"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tss-esapi = { workspace = true, optional = true }
+zeroize.workspace = true
