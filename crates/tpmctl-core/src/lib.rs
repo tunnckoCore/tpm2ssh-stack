@@ -332,35 +332,3 @@ pub struct DeriveRequest {
     pub output: OutputTarget,
     pub force: bool,
 }
-
-pub fn keygen(_request: KeygenRequest) -> Result<()> {
-    Err(Error::unsupported("keygen"))
-}
-
-pub fn sign(_request: SignRequest) -> Result<()> {
-    Err(Error::unsupported("sign"))
-}
-
-pub fn pubkey(_request: PubkeyRequest) -> Result<()> {
-    Err(Error::unsupported("pubkey"))
-}
-
-pub fn ecdh(_request: EcdhRequest) -> Result<()> {
-    Err(Error::unsupported("ecdh"))
-}
-
-pub fn hmac(_request: HmacRequest) -> Result<()> {
-    Err(Error::unsupported("hmac"))
-}
-
-pub fn seal(_request: SealRequest) -> Result<()> {
-    Err(Error::unsupported("seal"))
-}
-
-pub fn unseal(_request: UnsealRequest) -> Result<()> {
-    Err(Error::unsupported("unseal"))
-}
-
-pub fn derive(_request: DeriveRequest) -> Result<()> {
-    Err(Error::unsupported("derive"))
-}

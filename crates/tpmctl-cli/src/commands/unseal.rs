@@ -1,12 +1,16 @@
-use crate::args::{CliError, UnsealArgs};
+use crate::{
+    args::{CliError, UnsealArgs},
+    commands::io::{selector_from_material, write_output},
+};
+use tpmctl_core::seal as core_seal;
 
-pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &UnsealArgs) -> Result<(), CliError> {
-    let request = tpmctl_core::UnsealRequest {
-        runtime,
-        material: args.material.material(),
-        output: (&args.output).into(),
-        force: args.force,
+pub fn run(_runtime: tpmctl_core::RuntimeOptions, args: &UnsealArgs) -> Result<(), CliError> {
+    let request = core_seal::UnsealRequest {
+        selector: selector_from_material(&args.material.material())?,
+        force_binary_stdout: args.force,
     };
-    tpmctl_core::unseal(request)?;
+    let bytes = request.execute()?;
+    let output: tpmctl_core::OutputTarget = (&args.output).into();
+    write_output(&output, &bytes)?;
     Ok(())
 }
