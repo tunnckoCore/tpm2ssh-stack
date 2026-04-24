@@ -47,7 +47,10 @@ impl HmacRequest {
         let output = compute_tpm_hmac(&mut context, object_handle, &self.input, hash)?;
 
         match &self.seal_target {
-            None => Ok(HmacResult::Output(output)),
+            None => Ok(HmacResult::Output(Zeroizing::new(encode_hmac_output(
+                output.as_slice(),
+                self.format,
+            )))),
             Some(target) => {
                 let selector = match target {
                     SealTarget::Id(id) => ObjectSelector::Id(id.clone()),
@@ -58,7 +61,7 @@ impl HmacRequest {
                     Ok(HmacResult::SealedWithOutput {
                         target: target.clone(),
                         hash,
-                        output,
+                        output: Zeroizing::new(encode_hmac_output(output.as_slice(), self.format)),
                     })
                 } else {
                     Ok(HmacResult::Sealed {
