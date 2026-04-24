@@ -96,10 +96,15 @@ pub fn compute_tpm_hmac(
     hash: HashAlgorithm,
 ) -> Result<Zeroizing<Vec<u8>>> {
     if input.len() > MaxBuffer::MAX_SIZE {
+        // tss-esapi 7.6.0 intentionally has no safe wrappers for TPM2_HMAC_Start,
+        // TPM2_SequenceUpdate, or TPM2_SequenceComplete; its
+        // src/context/tpm_commands/hash_hmac_event_sequences.rs lists these exact
+        // calls as "Missing function". Keep large-input HMAC rejected rather than
+        // bypassing the crate's session/handle management with unsafe ESYS calls.
         return Err(Error::invalid(
             "input",
             format!(
-                "HMAC input is too large for TPM2_HMAC one-shot ({} > {} bytes); TPM sequence commands are not exposed by the linked tss-esapi version",
+                "HMAC input is too large for TPM2_HMAC one-shot ({} > {} bytes); tss-esapi 7.6.0 does not expose safe HMAC sequence APIs (HMAC_Start/SequenceUpdate/SequenceComplete are listed as missing)",
                 input.len(),
                 MaxBuffer::MAX_SIZE
             ),

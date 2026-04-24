@@ -24,6 +24,7 @@ use std::{
 };
 
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
+use zeroize::{Zeroize as _, Zeroizing};
 
 pub use error::{CoreError, Error, Result};
 pub use output::{EncodedOutput, OutputFormat};
@@ -181,12 +182,6 @@ impl EccPublicKey {
 pub enum SealTarget {
     Id(RegistryId),
     Handle(PersistentHandle),
-}
-
-pub fn unsupported_without_tpm(operation: &'static str) -> Error {
-    Error::tpm_unavailable(format!(
-        "{operation} requires the TPM/store foundation and a reachable TPM or simulator"
-    ))
 }
 
 // Frontend request contracts used by the thin CLI adapter. These are kept at the
@@ -466,8 +461,314 @@ pub fn unseal(request: UnsealRequest) -> Result<()> {
     write_output(&request.output, bytes.as_slice(), request.force)
 }
 
-pub fn derive(_request: DeriveRequest) -> Result<()> {
-    Err(Error::unsupported("derive"))
+pub fn derive(request: DeriveRequest) -> Result<()> {
+    validate_derive_request(&request)?;
+    if request.label.is_none() && matches!(request.usage, DeriveUse::Pubkey | DeriveUse::Secret) {
+        eprintln!(
+            "warning: --label was not provided; derived material is ephemeral and will change on each invocation"
+        );
+    }
+
+    let command = command_context(&request.runtime);
+    let seed_bytes = seal::UnsealRequest {
+        selector: material_selector(request.material.clone())?,
+        force_binary_stdout: false,
+    }
+    .execute_with_context(&command)?;
+    let seed = crypto::derive::SecretSeed::new(seed_bytes.as_slice()).map_err(derive_error)?;
+    let mode = derive_mode(&request)?;
+    let output = derive_output(&request, &seed, &mode)?;
+    write_output(&request.output, output.as_slice(), request.force)
+}
+
+fn validate_derive_request(request: &DeriveRequest) -> Result<()> {
+    if request.usage == DeriveUse::Sign && request.input.is_none() {
+        return Err(Error::invalid(
+            "derive",
+            "derive --use sign requires exactly one of --input or --digest",
+        ));
+    }
+    if request.usage != DeriveUse::Sign && request.input.is_some() {
+        return Err(Error::invalid(
+            "derive",
+            "derive --input/--digest are only valid with --use sign",
+        ));
+    }
+    if request.algorithm == DeriveAlgorithm::Ed25519
+        && request.usage == DeriveUse::Sign
+        && request.hash.is_some()
+    {
+        return Err(Error::invalid(
+            "derive",
+            "derive --algorithm ed25519 --use sign does not support --hash in v1",
+        ));
+    }
+    if request.usage == DeriveUse::Secret
+        && !matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex)
+    {
+        return Err(Error::invalid(
+            "derive",
+            "derive --use secret supports only --format raw or --format hex",
+        ));
+    }
+    if request.usage == DeriveUse::Pubkey {
+        match request.algorithm {
+            DeriveAlgorithm::P256 | DeriveAlgorithm::Ed25519 => {
+                if !matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex) {
+                    return Err(Error::invalid(
+                        "derive",
+                        "derive --use pubkey with p256 or ed25519 supports only --format raw or --format hex",
+                    ));
+                }
+            }
+            DeriveAlgorithm::Secp256k1 => {
+                if !matches!(
+                    request.format,
+                    DeriveFormat::Raw | DeriveFormat::Hex | DeriveFormat::Address
+                ) {
+                    return Err(Error::invalid(
+                        "derive",
+                        "derive --use pubkey --algorithm secp256k1 supports --format raw, hex, or address",
+                    ));
+                }
+            }
+        }
+    }
+    if request.usage == DeriveUse::Sign {
+        match request.algorithm {
+            DeriveAlgorithm::Ed25519 => {
+                if !matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex) {
+                    return Err(Error::invalid(
+                        "derive",
+                        "derive --algorithm ed25519 --use sign supports only --format raw or --format hex",
+                    ));
+                }
+            }
+            DeriveAlgorithm::P256 | DeriveAlgorithm::Secp256k1 => {
+                if !matches!(
+                    request.format,
+                    DeriveFormat::Der | DeriveFormat::Raw | DeriveFormat::Hex
+                ) {
+                    return Err(Error::invalid(
+                        "derive",
+                        "derive --use sign with p256 or secp256k1 supports --format der, raw, or hex",
+                    ));
+                }
+            }
+        }
+    }
+    if request.compressed
+        && !(request.algorithm == DeriveAlgorithm::Secp256k1
+            && request.usage == DeriveUse::Pubkey
+            && matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex))
+    {
+        return Err(Error::invalid(
+            "compressed",
+            "--compressed is valid only for derive --algorithm secp256k1 --use pubkey with --format raw or hex",
+        ));
+    }
+    if request.format == DeriveFormat::Address
+        && !(request.algorithm == DeriveAlgorithm::Secp256k1 && request.usage == DeriveUse::Pubkey)
+    {
+        return Err(Error::invalid(
+            "format",
+            "--format address is valid only for derive --algorithm secp256k1 --use pubkey",
+        ));
+    }
+
+    crypto::derive::DeriveRequest::new(
+        request.algorithm,
+        request.usage,
+        request.hash.map(hash_selection),
+    )
+    .map_err(derive_error)?;
+    Ok(())
+}
+
+fn derive_mode(request: &DeriveRequest) -> Result<crypto::derive::DeriveMode> {
+    if let Some(label) = &request.label {
+        Ok(crypto::derive::DeriveMode::deterministic(
+            label.as_bytes().to_vec(),
+        ))
+    } else {
+        let mut entropy = Zeroizing::new(vec![0_u8; 32]);
+        getrandom::fill(&mut entropy)
+            .map_err(|error| Error::invalid("entropy", error.to_string()))?;
+        Ok(crypto::derive::DeriveMode::ephemeral(
+            Vec::new(),
+            entropy.to_vec(),
+        ))
+    }
+}
+
+fn derive_output(
+    request: &DeriveRequest,
+    seed: &crypto::derive::SecretSeed,
+    mode: &crypto::derive::DeriveMode,
+) -> Result<Zeroizing<Vec<u8>>> {
+    match request.usage {
+        DeriveUse::Secret => derive_secret(request, seed, mode),
+        DeriveUse::Pubkey => derive_public_key(request, seed, mode),
+        DeriveUse::Sign => derive_signature(request, seed, mode),
+    }
+}
+
+fn derive_secret(
+    request: &DeriveRequest,
+    seed: &crypto::derive::SecretSeed,
+    mode: &crypto::derive::DeriveMode,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut raw = match request.algorithm {
+        DeriveAlgorithm::P256 => crypto::p256::derive_secret_key(seed, mode)
+            .map_err(derive_error)?
+            .to_bytes()
+            .to_vec(),
+        DeriveAlgorithm::Ed25519 => crypto::ed25519::derive_signing_key(seed, mode)
+            .map_err(derive_error)?
+            .to_bytes()
+            .to_vec(),
+        DeriveAlgorithm::Secp256k1 => crypto::secp256k1::derive_secret_key(seed, mode)
+            .map_err(derive_error)?
+            .to_bytes()
+            .to_vec(),
+    };
+    let encoded = encode_raw_or_hex(&raw, request.format)?;
+    raw.zeroize();
+    Ok(Zeroizing::new(encoded))
+}
+
+fn derive_public_key(
+    request: &DeriveRequest,
+    seed: &crypto::derive::SecretSeed,
+    mode: &crypto::derive::DeriveMode,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let bytes = match request.algorithm {
+        DeriveAlgorithm::P256 => {
+            let raw =
+                crypto::p256::derive_public_key_sec1(seed, mode, false).map_err(derive_error)?;
+            encode_raw_or_hex(&raw, request.format)?
+        }
+        DeriveAlgorithm::Ed25519 => {
+            let raw = crypto::ed25519::derive_public_key_bytes(seed, mode).map_err(derive_error)?;
+            encode_raw_or_hex(&raw, request.format)?
+        }
+        DeriveAlgorithm::Secp256k1 if request.format == DeriveFormat::Address => {
+            crypto::secp256k1::derive_ethereum_address(seed, mode)
+                .map_err(derive_error)?
+                .into_bytes()
+        }
+        DeriveAlgorithm::Secp256k1 => {
+            let raw = crypto::secp256k1::derive_public_key_sec1(seed, mode, request.compressed)
+                .map_err(derive_error)?;
+            encode_raw_or_hex(&raw, request.format)?
+        }
+    };
+    Ok(Zeroizing::new(bytes))
+}
+
+fn derive_signature(
+    request: &DeriveRequest,
+    seed: &crypto::derive::SecretSeed,
+    mode: &crypto::derive::DeriveMode,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let message = derive_sign_message_bytes(request)?;
+    let bytes = match request.algorithm {
+        DeriveAlgorithm::P256 => {
+            let mut p1363 =
+                crypto::p256::sign_message(seed, mode, &message).map_err(derive_error)?;
+            let encoded = output::encode_p256_signature(&p1363, signature_format(request.format)?)?;
+            p1363.zeroize();
+            encoded
+        }
+        DeriveAlgorithm::Ed25519 => {
+            let mut raw =
+                crypto::ed25519::sign_message(seed, mode, &message).map_err(derive_error)?;
+            let encoded = encode_raw_or_hex(&raw, request.format)?;
+            raw.zeroize();
+            encoded
+        }
+        DeriveAlgorithm::Secp256k1 => {
+            let mut p1363 =
+                crypto::secp256k1::sign_message(seed, mode, &message).map_err(derive_error)?;
+            let encoded =
+                output::encode_secp256k1_signature(&p1363, signature_format(request.format)?)?;
+            p1363.zeroize();
+            encoded
+        }
+    };
+    Ok(Zeroizing::new(bytes))
+}
+
+fn derive_sign_message_bytes(request: &DeriveRequest) -> Result<Zeroizing<Vec<u8>>> {
+    match request
+        .input
+        .as_ref()
+        .expect("derive --use sign input was validated")
+    {
+        SignInput::Message(source) => {
+            let bytes = read_input(source)?;
+            if request.algorithm == DeriveAlgorithm::Ed25519 {
+                Ok(Zeroizing::new(bytes))
+            } else {
+                Ok(Zeroizing::new(derive_hash(request).unwrap().digest(&bytes)))
+            }
+        }
+        SignInput::Digest(source) => {
+            let bytes = read_input(source)?;
+            if request.algorithm != DeriveAlgorithm::Ed25519 {
+                derive_hash(request).unwrap().validate_digest(&bytes)?;
+            }
+            Ok(Zeroizing::new(bytes))
+        }
+    }
+}
+
+fn encode_raw_or_hex(raw: &[u8], format: DeriveFormat) -> Result<Vec<u8>> {
+    match format {
+        DeriveFormat::Raw => Ok(output::encode_binary(raw, BinaryTextFormat::Raw)),
+        DeriveFormat::Hex => Ok(output::encode_binary(raw, BinaryTextFormat::Hex)),
+        DeriveFormat::Der | DeriveFormat::Address => Err(Error::invalid(
+            "format",
+            "derive output format is not valid for this operation",
+        )),
+    }
+}
+
+fn signature_format(format: DeriveFormat) -> Result<SignatureFormat> {
+    match format {
+        DeriveFormat::Der => Ok(SignatureFormat::Der),
+        DeriveFormat::Raw => Ok(SignatureFormat::Raw),
+        DeriveFormat::Hex => Ok(SignatureFormat::Hex),
+        DeriveFormat::Address => Err(Error::invalid(
+            "format",
+            "derive --use sign does not support --format address",
+        )),
+    }
+}
+
+fn derive_hash(request: &DeriveRequest) -> Option<HashAlgorithm> {
+    if request.usage == DeriveUse::Sign
+        && matches!(
+            request.algorithm,
+            DeriveAlgorithm::P256 | DeriveAlgorithm::Secp256k1
+        )
+    {
+        Some(request.hash.unwrap_or(HashAlgorithm::Sha256))
+    } else {
+        request.hash
+    }
+}
+
+fn hash_selection(hash: HashAlgorithm) -> crypto::derive::HashSelection {
+    match hash {
+        HashAlgorithm::Sha256 => crypto::derive::HashSelection::Sha256,
+        HashAlgorithm::Sha384 => crypto::derive::HashSelection::Sha384,
+        HashAlgorithm::Sha512 => crypto::derive::HashSelection::Sha512,
+    }
+}
+
+fn derive_error(error: impl std::fmt::Display) -> Error {
+    Error::invalid("derive", error.to_string())
 }
 
 fn command_context(runtime: &RuntimeOptions) -> CommandContext {

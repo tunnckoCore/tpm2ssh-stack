@@ -32,6 +32,18 @@ pub enum DeriveMode {
     Ephemeral { label: Vec<u8>, entropy: Vec<u8> },
 }
 
+impl Drop for DeriveMode {
+    fn drop(&mut self) {
+        match self {
+            Self::Deterministic { label } => label.zeroize(),
+            Self::Ephemeral { label, entropy } => {
+                label.zeroize();
+                entropy.zeroize();
+            }
+        }
+    }
+}
+
 impl DeriveMode {
     pub fn deterministic(label: impl Into<Vec<u8>>) -> Self {
         Self::Deterministic {

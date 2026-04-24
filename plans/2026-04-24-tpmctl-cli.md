@@ -466,7 +466,7 @@ Checklist:
 
 - [x] Load HMAC key.
 - [x] Implement one-shot HMAC for small input.
-- [ ] Implement HMAC sequence APIs for large input.
+- [ ] Implement HMAC sequence APIs for large input. Blocked by `tss-esapi` 7.6.0 safe API coverage: `src/context/tpm_commands/hash_hmac_event_sequences.rs` explicitly lists `HMAC_Start`, `SequenceUpdate`, and `SequenceComplete` as missing; current code rejects inputs above `MaxBuffer::MAX_SIZE` with that limitation instead of using unsafe unmanaged ESYS calls.
 - [x] Encode raw/hex output.
 - [x] Implement `--seal-at` by sealing HMAC output and persisting at handle.
 - [x] Implement `--seal-id` by sealing HMAC output and storing under registry ID.
@@ -643,7 +643,7 @@ Format matrix:
 
 Checklist:
 
-- [ ] Load/unseal PRF seed from registry ID or persistent handle.
+- [x] Load/unseal PRF seed from registry ID or persistent handle.
 - [x] Implement deterministic KDF using PRF seed + algorithm + use + label.
 - [x] Implement ephemeral KDF using PRF seed + algorithm + use + fresh randomness.
 - [x] Implement p256 scalar derivation with retry/counter until valid non-zero scalar.
@@ -909,7 +909,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 - [x] Validate HMAC key usage.
 - [x] Implement one-shot HMAC.
-- [ ] Implement sequence HMAC for large input.
+- [ ] Implement sequence HMAC for large input. Blocked by `tss-esapi` 7.6.0 missing safe wrappers for `HMAC_Start`/`SequenceUpdate`/`SequenceComplete`; see the crate's `hash_hmac_event_sequences.rs` and the guarded error path in `crates/tpmctl-core/src/hmac.rs`.
 - [x] Encode raw/hex output.
 - [x] Support `--hash`.
 
@@ -960,7 +960,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [x] Unit-test ID path safety.
 - [x] Unit-test CLI parser validation.
 - [x] Unit-test secp256k1 scalar derivation retry behavior.
-- [ ] Add simulator/integration tests where available.
+- [ ] Add simulator/integration tests where available. Not run/marked complete in Agent 11 because `/dev/tpm0` and `/dev/tpmrm0` exist but are not accessible to the current user (`Permission denied`), and no swtpm/mssim listener is available.
 - [x] Document runtime packages and `pkg-config` requirements.
 - [x] Document CLI examples.
 - [x] Document derived-key software security model.
@@ -981,6 +981,8 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 | PKCS#11 crate split breaks current `.so` workflow | Medium | Medium | Add explicit build checks for `cargo build -p tpmctl-pkcs11 --release`. |
 
 ## Completion Checklist
+
+Agent 11 gating note: hardware/simulator E2E items below remain unchecked because `tpm2_getcap handles-persistent` could not initialize any TCTI: `/dev/tpm0` and `/dev/tpmrm0` returned `Permission denied`, and swtpm/mssim on `127.0.0.1:2321` refused connections.
 
 - [x] `cargo build -p tpmctl-cli --release` succeeds without PKCS#11 dependencies.
 - [x] `cargo build -p tpmctl-pkcs11 --release` produces PKCS#11 `.so`.

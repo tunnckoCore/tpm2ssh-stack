@@ -5,9 +5,6 @@ pub type Error = CoreError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
-    #[error("operation is not implemented yet: {operation}")]
-    Unsupported { operation: &'static str },
-
     #[error("invalid {field}: {reason}")]
     InvalidInput { field: &'static str, reason: String },
 
@@ -58,10 +55,6 @@ pub enum CoreError {
 }
 
 impl CoreError {
-    pub fn unsupported(operation: &'static str) -> Self {
-        Self::Unsupported { operation }
-    }
-
     pub fn invalid(field: &'static str, reason: impl Into<String>) -> Self {
         Self::InvalidInput {
             field,
