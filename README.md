@@ -152,8 +152,17 @@ Global behavior:
 
 - `--store <path>` overrides `TPMCTL_STORE`, which overrides the XDG default store root.
 - Use `-` for stdin/stdout where file input/output is expected.
+- File outputs reject existing paths unless the command's `--force` flag is supplied.
 - Raw binary stdout is rejected on an interactive TTY unless `--force` is supplied.
 - Operations over existing material require exactly one of `--id <id>` or `--handle <handle>`.
+
+## Security notes
+
+- Registry directories contain TPM private blobs, public blobs, metadata, and sometimes cached public PEM files. The store writer enforces private Unix permissions where supported: `0700` directories and `0600` files.
+- The v1 command model assumes empty object auth unless stated otherwise. Empty auth is convenient for local development but makes local TPM access controls and registry filesystem permissions part of the access-control boundary.
+- CLI file outputs reject existing paths by default to avoid accidental clobbering of signatures, public keys, shared secrets, and unsealed data.
+- TPM HMAC currently uses safe one-shot `tss-esapi` APIs and rejects inputs larger than TPM `MaxBuffer`; streaming HMAC remains disabled until safe sequence APIs are available or a reviewed lower-level ESYS implementation is added.
+- TPM simulator tests are opt-in/gated. Set `TEST_TCTI` for an existing simulator or install `swtpm` so the harness can start one; otherwise hardware/simulator-dependent tests skip rather than proving live TPM behavior.
 
 ## Derived-key software model
 
@@ -208,7 +217,8 @@ Scope and limitations:
 - one configured key
 - P-256 EC only
 - `CKM_ECDSA` signing only
-- empty PKCS#11 user PIN and empty TPM auth in the current implementation
+- `C_Login` is required before private-key signing; the current user PIN is empty, so the login gate is not a secret-bearing authentication factor
+- empty TPM object auth in the current implementation
 - no key generation, certificate storage, random, wrap/unwrap, derive, or multipart sign APIs
 
 ## Remaining hardware requirements

@@ -1004,3 +1004,20 @@ Agent 11 gating note: hardware/simulator E2E items below remain unchecked becaus
 - [x] ECDH shared-secret output and seal plaintext input use zeroizing buffers where practical.
 - [x] Registry writes enforce private Unix directory/file permissions and remove stale optional files on forced overwrite.
 - [x] README documents core library, CLI crate, and PKCS#11 provider crate builds separately.
+
+## Review Audit Notes (2026-04-24)
+
+Source-level regression coverage added/checked for review-sensitive paths:
+
+- Parent/template drift is covered by using one canonical owner storage parent for keygen and reload paths, plus simulator-gated non-persistent key reload/sign coverage.
+- HMAC hex encoding is covered in core tests, and CLI HMAC now dispatches through the core wrapper instead of reimplementing output semantics.
+- CLI file outputs now reject existing paths unless `--force` is supplied.
+- Registry overwrite removes stale `public.pem` when the replacement entry has no cached PEM, with a regression test.
+- Registry writes enforce private Unix permissions (`0700` directories, `0600` files) where supported.
+- PKCS#11 signing checks session login state before accepting `C_SignInit` and before `C_Sign`.
+- Derived ECDSA signing uses prehash signing helpers for digest semantics; Ed25519 still treats digest bytes as message bytes for v1 and rejects hash/prehash selection.
+
+Unchecked runtime coverage:
+
+- True hardware TPM flows were not run in this audit environment.
+- Simulator-backed TPM flows remain gated by `TEST_TCTI`/`swtpm`; tests skip when unavailable.
