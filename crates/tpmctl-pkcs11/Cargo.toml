@@ -1,0 +1,17 @@
+[package]
+name = "tpmctl-pkcs11"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal tpmctl PKCS#11 provider for TPM-backed P-256 ECDSA"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8", "pem"] }
+pkcs11-sys = "0.2"
+tpmctl-core = { path = "../tpmctl-core" }
+tss-esapi = "7.6.0"

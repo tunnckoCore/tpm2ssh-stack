@@ -119,12 +119,12 @@ crates/
 ## Cargo Plan
 
 - [ ] Convert the repository to a Cargo workspace with members under `crates/`.
-- [ ] Create `crates/tpmctl-core` as the reusable library crate.
-- [ ] Create `crates/tpmctl-cli` as the `tpmctl` binary crate.
-- [ ] Create `crates/tpmctl-pkcs11` as the PKCS#11 `cdylib` crate.
-- [ ] Put `tss-esapi` and TPM-domain dependencies in `tpmctl-core`.
+- [x] Create `crates/tpmctl-core` as the reusable library crate.
+- [x] Create `crates/tpmctl-cli` as the `tpmctl` binary crate.
+- [x] Create `crates/tpmctl-pkcs11` as the PKCS#11 `cdylib` crate.
+- [x] Put `tss-esapi` and TPM-domain dependencies in `tpmctl-core`.
 - [ ] Put `clap` and CLI-only dependencies in `tpmctl-cli`.
-- [ ] Put `pkcs11-sys` and PKCS#11-only dependencies in `tpmctl-pkcs11`.
+- [x] Put `pkcs11-sys` and PKCS#11-only dependencies in `tpmctl-pkcs11`.
 
 Suggested workspace direction:
 
@@ -150,14 +150,14 @@ Likely dependencies:
 
 - [ ] `clap` for CLI parsing.
 - [ ] `serde`, `serde_json` for local metadata and `--json`.
-- [ ] `zeroize` for derived secrets and software key material.
+- [x] `zeroize` for derived secrets and software key material.
 - [ ] `rand_core` or `getrandom` for ephemeral derivation labels/salt.
 - [ ] `sha2`, `hkdf`, `hmac` for derivation.
-- [ ] `p256` for derived P-256 software operations and public key encoding.
-- [ ] `ed25519-dalek` for derived Ed25519 operations.
-- [ ] `k256` for derived secp256k1 operations.
-- [ ] `sha3` for Keccak-256 Ethereum address derivation.
-- [ ] `hex` for text encoding.
+- [x] `p256` for derived P-256 software operations and public key encoding.
+- [x] `ed25519-dalek` for derived Ed25519 operations.
+- [x] `k256` for derived secp256k1 operations.
+- [x] `sha3` for Keccak-256 Ethereum address derivation.
+- [x] `hex` for text encoding.
 
 ## Local Registry Model
 
@@ -715,7 +715,7 @@ Implementation should be run by five subagents working in separate git worktrees
 - [ ] Avoid multiple agents editing `crates/tpmctl-core/src/lib.rs`; Agent 01 should declare module skeletons up front.
 - [ ] CLI argument parsing belongs to Agent 03; TPM semantics belong to `tpmctl-core` owners.
 - [ ] Agent 04 owns TPM domain operation modules; Agent 03 only calls their public APIs.
-- [ ] Agent 05 owns `crypto/*`, `tpmctl-pkcs11/*`, and final docs/tests.
+- [x] Agent 05 owns `crypto/*`, `tpmctl-pkcs11/*`, and final docs/tests.
 - [ ] Shared files such as `README.md`, root `Cargo.toml`, and top-level module exports require a checkpoint note before edits.
 - [ ] Prefer request/response structs in `tpmctl-core` over embedding business logic in CLI command handlers.
 
@@ -764,15 +764,15 @@ Implementation should be run by five subagents working in separate git worktrees
 
 #### Agent 05 — Derived Crypto, PKCS#11, Tests, Docs
 
-- [ ] `cargo test -p tpmctl-core derive` passes.
-- [ ] `cargo test -p tpmctl-core crypto` passes.
-- [ ] `cargo test -p tpmctl-core ethereum` passes.
-- [ ] `cargo build -p tpmctl-pkcs11 --release` succeeds.
-- [ ] p256 and secp256k1 scalar derivation retry until valid non-zero scalars.
-- [ ] Ed25519 rejects `--hash` for `--use sign`.
-- [ ] `--format address` emits EIP-55 checksummed Ethereum addresses.
-- [ ] Secret/scalar/seed/intermediate buffers use `zeroize` where practical.
-- [ ] README documents core library, CLI crate, PKCS#11 crate, runtime packages, and derived-key software model.
+- [x] `cargo test -p tpmctl-core derive` passes.
+- [x] `cargo test -p tpmctl-core crypto` passes.
+- [x] `cargo test -p tpmctl-core ethereum` passes.
+- [x] `cargo build -p tpmctl-pkcs11 --release` succeeds.
+- [x] p256 and secp256k1 scalar derivation retry until valid non-zero scalars.
+- [x] Ed25519 rejects `--hash` for `--use sign`.
+- [x] `--format address` emits EIP-55 checksummed Ethereum addresses.
+- [x] Secret/scalar/seed/intermediate buffers use `zeroize` where practical.
+- [x] README documents core library, CLI crate, PKCS#11 crate, runtime packages, and derived-key software model.
 
 ### Final Integration Gate
 
@@ -819,15 +819,15 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 1 — Workspace restructuring and crate boundaries
 
-- [ ] Create root Cargo workspace.
-- [ ] Create `crates/tpmctl-core` library crate.
-- [ ] Create `crates/tpmctl-cli` binary crate.
-- [ ] Create `crates/tpmctl-pkcs11` `cdylib` crate.
+- [x] Create root Cargo workspace.
+- [x] Create `crates/tpmctl-core` library crate.
+- [x] Create `crates/tpmctl-cli` binary crate.
+- [x] Create `crates/tpmctl-pkcs11` `cdylib` crate.
 - [ ] Move TPM and crypto logic into `tpmctl-core`.
 - [ ] Move CLI parsing and dispatch into `tpmctl-cli`.
-- [ ] Move PKCS#11 entrypoints into `tpmctl-pkcs11`.
-- [ ] Ensure `cargo build -p tpmctl-cli` does not compile PKCS#11 entrypoint code.
-- [ ] Ensure `cargo build -p tpmctl-pkcs11 --release` builds the `.so`.
+- [x] Move PKCS#11 entrypoints into `tpmctl-pkcs11`.
+- [x] Ensure `cargo build -p tpmctl-cli` does not compile PKCS#11 entrypoint code.
+- [x] Ensure `cargo build -p tpmctl-pkcs11 --release` builds the `.so`.
 
 ### Phase 2 — Core TPM helpers
 
@@ -924,36 +924,36 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 ### Phase 12 — Derive
 
 - [ ] Unseal/load PRF seed.
-- [ ] Implement deterministic label mode.
-- [ ] Implement ephemeral randomness mode.
-- [ ] Implement p256 scalar retry derivation.
-- [ ] Implement Ed25519 secret derivation.
-- [ ] Implement secp256k1 scalar retry derivation.
+- [x] Implement deterministic label mode.
+- [x] Implement ephemeral randomness mode.
+- [x] Implement p256 scalar retry derivation.
+- [x] Implement Ed25519 secret derivation.
+- [x] Implement secp256k1 scalar retry derivation.
 - [ ] Implement `--use secret`.
 - [ ] Implement `--use pubkey`.
 - [ ] Implement `--use sign`.
-- [ ] Implement secp256k1 Ethereum address output.
+- [x] Implement secp256k1 Ethereum address output.
 - [ ] Enforce algorithm/format matrix.
-- [ ] Zeroize all sensitive buffers.
+- [x] Zeroize all sensitive buffers.
 
 ### Phase 13 — PKCS#11 provider crate integration
 
-- [ ] Reuse `tpmctl-core` TPM helpers in `tpmctl-pkcs11`.
-- [ ] Keep PKCS#11 sign-only behavior intact.
-- [ ] Keep PKCS#11 dependencies isolated to `tpmctl-pkcs11`.
-- [ ] Ensure CLI builds do not require PKCS#11 code or dependencies.
-- [ ] Update README to explain separate CLI and PKCS#11 crate builds.
+- [x] Reuse `tpmctl-core` TPM helpers in `tpmctl-pkcs11`.
+- [x] Keep PKCS#11 sign-only behavior intact.
+- [x] Keep PKCS#11 dependencies isolated to `tpmctl-pkcs11`.
+- [x] Ensure CLI builds do not require PKCS#11 code or dependencies.
+- [x] Update README to explain separate CLI and PKCS#11 crate builds.
 
 ### Phase 14 — Tests and docs
 
 - [ ] Unit-test format encoders.
 - [ ] Unit-test ID path safety.
 - [ ] Unit-test CLI parser validation.
-- [ ] Unit-test secp256k1 scalar derivation retry behavior.
+- [x] Unit-test secp256k1 scalar derivation retry behavior.
 - [ ] Add simulator/integration tests where available.
-- [ ] Document runtime packages and `pkg-config` requirements.
+- [x] Document runtime packages and `pkg-config` requirements.
 - [ ] Document CLI examples.
-- [ ] Document derived-key software security model.
+- [x] Document derived-key software security model.
 
 ## Risks and Mitigations
 
@@ -972,8 +972,8 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ## Completion Checklist
 
-- [ ] `cargo build -p tpmctl-cli --release` succeeds without PKCS#11 dependencies.
-- [ ] `cargo build -p tpmctl-pkcs11 --release` produces PKCS#11 `.so`.
+- [x] `cargo build -p tpmctl-cli --release` succeeds without PKCS#11 dependencies.
+- [x] `cargo build -p tpmctl-pkcs11 --release` produces PKCS#11 `.so`.
 - [ ] `tpmctl keygen --use sign --id ...` creates reloadable signing identity.
 - [ ] `tpmctl keygen --use ecdh --id ...` creates usable ECDH identity.
 - [ ] `tpmctl keygen --use hmac --id ...` creates usable HMAC identity.
@@ -984,5 +984,5 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [ ] `tpmctl hmac --seal-at` and `--seal-id` work and are mutually exclusive.
 - [ ] `tpmctl seal` and `unseal` work by `--id` and by `--handle`.
 - [ ] `tpmctl derive` supports p256, Ed25519, and secp256k1 secret/pubkey/sign flows.
-- [ ] Derived key material is zeroized where practical.
-- [ ] README documents core library, CLI crate, and PKCS#11 provider crate builds separately.
+- [x] Derived key material is zeroized where practical.
+- [x] README documents core library, CLI crate, and PKCS#11 provider crate builds separately.
