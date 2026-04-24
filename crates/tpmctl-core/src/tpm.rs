@@ -2,18 +2,29 @@ use std::{env, str::FromStr};
 
 use tss_esapi::{
     Context,
+    constants::tss::{TPM2_RH_NULL, TPM2_ST_HASHCHECK},
     handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
     interface_types::{
-        dynamic_handles::Persistent, resource_handles::Provision, session_handles::AuthSession,
+        algorithm::HashingAlgorithm,
+        dynamic_handles::Persistent,
+        ecc::EccCurve as TpmEccCurve,
+        key_bits::RsaKeyBits,
+        resource_handles::{Hierarchy, Provision},
+        session_handles::AuthSession,
     },
-    structures::{Name, Private, Public},
+    structures::{
+        Digest, EccParameter, EccPoint, HashScheme, HashcheckTicket, Name, Private, Public,
+        Signature, SignatureScheme, SymmetricDefinitionObject,
+    },
     tcti_ldr::{DeviceConfig, TctiNameConf},
     traits::{Marshall, UnMarshall},
+    tss2_esys::TPMT_TK_HASHCHECK,
+    utils,
 };
 
 use crate::{
-    CoreError, Result,
-    store::{RegistryCollection, RegistryId, Store, StoreOptions, StoredObjectEntry},
+    CoreError, EccPublicKey, HashAlgorithm, ObjectDescriptor, ObjectSelector, Result,
+    store::{ObjectUsage, RegistryCollection, RegistryId, Store, StoreOptions, StoredObjectEntry},
 };
 
 /// Shared execution context passed from frontends into core operations.
@@ -340,6 +351,335 @@ pub fn persist_object(
             )
         })
         .map_err(|source| CoreError::tpm("EvictControl", source))
+}
+
+pub fn create_default_parent(context: &mut Context) -> Result<KeyHandle> {
+    let public = utils::create_restricted_decryption_rsa_public(
+        SymmetricDefinitionObject::AES_256_CFB,
+        RsaKeyBits::Rsa2048,
+        tss_esapi::structures::RsaExponent::default(),
+    )
+    .map_err(|source| CoreError::tpm("build parent public", source))?;
+
+    context
+        .create_primary(Hierarchy::Owner, public, None, None, None, None)
+        .map(|result| result.key_handle)
+        .map_err(|source| CoreError::tpm("CreatePrimary", source))
+}
+
+pub fn load_key_by_id(context: &mut Context, store: &Store, id: &RegistryId) -> Result<LoadedKey> {
+    let entry = store.load_key(id)?;
+    let descriptor = descriptor_from_entry(ObjectSelector::Id(id.clone()), &entry)?;
+
+    if let Some(handle) = registry_entry_handle(&entry)? {
+        let object_handle = load_persistent_object(context, handle)?;
+        let (public, _, _) = read_public(context, object_handle)?;
+        let descriptor = descriptor.with_public_from_tpm(public)?;
+        return Ok(LoadedKey {
+            handle: KeyHandle::from(object_handle),
+            descriptor,
+        });
+    }
+
+    let parent_handle = create_default_parent(context)?;
+    let handle = load_object_from_blobs(context, parent_handle, &ObjectBlobs::from_entry(&entry))?;
+    Ok(LoadedKey { handle, descriptor })
+}
+
+pub fn load_key_by_handle(context: &mut Context, handle: PersistentHandle) -> Result<LoadedKey> {
+    let object_handle = load_persistent_object(context, handle)?;
+    let (public, _, _) = read_public(context, object_handle)?;
+    Ok(LoadedKey {
+        handle: KeyHandle::from(object_handle),
+        descriptor: descriptor_from_tpm_public(ObjectSelector::Handle(handle), public)?,
+    })
+}
+
+#[derive(Debug)]
+pub struct LoadedKey {
+    pub handle: KeyHandle,
+    pub descriptor: ObjectDescriptor,
+}
+
+pub fn sign_digest(
+    context: &mut Context,
+    key_handle: KeyHandle,
+    digest: &[u8],
+    hash: HashAlgorithm,
+) -> Result<Vec<u8>> {
+    let digest = Digest::try_from(digest.to_vec())
+        .map_err(|source| CoreError::tpm("build Sign digest", source))?;
+    let scheme = SignatureScheme::EcDsa {
+        hash_scheme: HashScheme::new(hash.to_tpm_hash()),
+    };
+    let validation = null_hashcheck_ticket()?;
+    let signature = context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.sign(key_handle, digest, scheme, validation)
+        })
+        .map_err(|source| CoreError::tpm("Sign", source))?;
+    p1363_from_tpm_signature(signature)
+}
+
+pub fn ecdh_z_gen(
+    context: &mut Context,
+    key_handle: KeyHandle,
+    peer_public_key: &EccPublicKey,
+) -> Result<Vec<u8>> {
+    let point = ecc_point_from_public_key(peer_public_key)?;
+    let z = context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.ecdh_z_gen(key_handle, point)
+        })
+        .map_err(|source| CoreError::tpm("ECDH_ZGen", source))?;
+    let mut x = vec![0_u8; 32];
+    left_pad_copy(z.x().value(), &mut x, "ECDH_ZGen x coordinate")?;
+    Ok(x)
+}
+
+pub fn ecc_public_key_from_public(public: &Public) -> Result<EccPublicKey> {
+    match public {
+        Public::Ecc {
+            parameters, unique, ..
+        } => {
+            if parameters.ecc_curve() != TpmEccCurve::NistP256 {
+                return Err(CoreError::invalid(
+                    "curve",
+                    format!("expected NIST P-256, got {:?}", parameters.ecc_curve()),
+                ));
+            }
+            ecc_public_key_from_point(unique)
+        }
+        _ => Err(CoreError::invalid(
+            "public",
+            "expected an ECC public object",
+        )),
+    }
+}
+
+pub fn descriptor_from_tpm_public(
+    selector: ObjectSelector,
+    public: Public,
+) -> Result<ObjectDescriptor> {
+    let usage = usage_from_public(&public)?;
+    let public_key = match usage {
+        KeyUsage::Sign | KeyUsage::Ecdh => Some(ecc_public_key_from_public(&public)?),
+        KeyUsage::Hmac | KeyUsage::Sealed => None,
+    };
+    Ok(ObjectDescriptor {
+        selector,
+        usage,
+        curve: public_key.as_ref().map(|_| crate::EccCurve::P256),
+        hash: None,
+        public_key,
+    })
+}
+
+pub(crate) fn descriptor_from_entry(
+    selector: ObjectSelector,
+    entry: &StoredObjectEntry,
+) -> Result<ObjectDescriptor> {
+    let usage = match entry.metadata.usage {
+        ObjectUsage::Sign => KeyUsage::Sign,
+        ObjectUsage::Ecdh => KeyUsage::Ecdh,
+        ObjectUsage::Hmac => KeyUsage::Hmac,
+        ObjectUsage::Sealed => KeyUsage::Sealed,
+    };
+    let curve = match entry.metadata.curve.as_deref() {
+        Some("p256" | "P-256" | "nistp256" | "NIST P-256") => Some(crate::EccCurve::P256),
+        Some(other) => {
+            return Err(CoreError::invalid(
+                "curve",
+                format!("unsupported curve {other:?}"),
+            ));
+        }
+        None => None,
+    };
+    let hash = match entry.metadata.hash.as_deref() {
+        Some("sha256") => Some(HashAlgorithm::Sha256),
+        Some("sha384") => Some(HashAlgorithm::Sha384),
+        Some("sha512") => Some(HashAlgorithm::Sha512),
+        Some(other) => {
+            return Err(CoreError::invalid(
+                "hash",
+                format!("unsupported hash {other:?}"),
+            ));
+        }
+        None => None,
+    };
+    let public_key = cached_public_key(entry)?.or_else(|| {
+        unmarshal_public(&entry.public_blob)
+            .ok()
+            .and_then(|public| ecc_public_key_from_public(&public).ok())
+    });
+
+    Ok(ObjectDescriptor {
+        selector,
+        usage,
+        curve,
+        hash,
+        public_key,
+    })
+}
+
+fn cached_public_key(entry: &StoredObjectEntry) -> Result<Option<EccPublicKey>> {
+    if let Some(public_key) = &entry.metadata.public_key {
+        let hex = public_key
+            .strip_prefix("hex:")
+            .unwrap_or(public_key.as_str());
+        let bytes = hex::decode(hex)
+            .map_err(|source| CoreError::invalid("public_key", source.to_string()))?;
+        return EccPublicKey::p256_sec1(bytes).map(Some);
+    }
+
+    if let Some(public_pem) = &entry.public_pem {
+        if let Ok(pem) = std::str::from_utf8(public_pem) {
+            let key = <p256::PublicKey as p256::pkcs8::DecodePublicKey>::from_public_key_pem(pem)
+                .map_err(|source| CoreError::invalid("public_key", source.to_string()))?;
+            let point = p256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&key, false);
+            return EccPublicKey::p256_sec1(point.as_bytes().to_vec()).map(Some);
+        }
+    }
+
+    Ok(None)
+}
+
+fn registry_entry_handle(entry: &StoredObjectEntry) -> Result<Option<PersistentHandle>> {
+    if !entry.metadata.persistent {
+        return Ok(None);
+    }
+    entry
+        .metadata
+        .handle
+        .as_deref()
+        .map(PersistentHandle::parse)
+        .transpose()
+}
+
+fn usage_from_public(public: &Public) -> Result<KeyUsage> {
+    let attrs = public.object_attributes();
+    match public {
+        Public::Ecc { .. } if attrs.sign_encrypt() && !attrs.decrypt() && !attrs.restricted() => {
+            Ok(KeyUsage::Sign)
+        }
+        Public::Ecc { .. } if attrs.decrypt() && !attrs.sign_encrypt() && !attrs.restricted() => {
+            Ok(KeyUsage::Ecdh)
+        }
+        Public::KeyedHash { .. } => Ok(KeyUsage::Hmac),
+        _ => Err(CoreError::invalid(
+            "usage",
+            "unable to infer supported key usage from TPM public area",
+        )),
+    }
+}
+
+fn ecc_public_key_from_point(point: &EccPoint) -> Result<EccPublicKey> {
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(pad_coordinate(point.x().value(), "public key x coordinate")?.as_ref());
+    sec1.extend_from_slice(pad_coordinate(point.y().value(), "public key y coordinate")?.as_ref());
+    EccPublicKey::p256_sec1(sec1)
+}
+
+pub fn ecc_point_from_public_key(public_key: &EccPublicKey) -> Result<EccPoint> {
+    let key = p256::PublicKey::from_sec1_bytes(public_key.sec1())
+        .map_err(|source| CoreError::invalid("public_key", source.to_string()))?;
+    let point = p256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&key, false);
+    let bytes = point.as_bytes();
+    if bytes.len() != 65 || bytes[0] != 0x04 {
+        return Err(CoreError::invalid(
+            "public_key",
+            "expected uncompressed P-256 SEC1 point",
+        ));
+    }
+    Ok(EccPoint::new(
+        EccParameter::try_from(bytes[1..33].to_vec())
+            .map_err(|source| CoreError::tpm("build ECC x coordinate", source))?,
+        EccParameter::try_from(bytes[33..65].to_vec())
+            .map_err(|source| CoreError::tpm("build ECC y coordinate", source))?,
+    ))
+}
+
+fn p1363_from_tpm_signature(signature: Signature) -> Result<Vec<u8>> {
+    let Signature::EcDsa(signature) = signature else {
+        return Err(CoreError::invalid(
+            "signature",
+            format!(
+                "expected TPM ECDSA signature, got {:?}",
+                signature.algorithm()
+            ),
+        ));
+    };
+    let mut p1363 = vec![0_u8; 64];
+    left_pad_copy(
+        signature.signature_r().value(),
+        &mut p1363[..32],
+        "signature r",
+    )?;
+    left_pad_copy(
+        signature.signature_s().value(),
+        &mut p1363[32..],
+        "signature s",
+    )?;
+    Ok(p1363)
+}
+
+fn pad_coordinate(value: &[u8], field: &'static str) -> Result<[u8; 32]> {
+    let mut out = [0_u8; 32];
+    left_pad_copy(value, &mut out, field)?;
+    Ok(out)
+}
+
+fn left_pad_copy(value: &[u8], out: &mut [u8], field: &'static str) -> Result<()> {
+    if value.len() > out.len() {
+        return Err(CoreError::invalid(
+            field,
+            format!("expected at most {} bytes, got {}", out.len(), value.len()),
+        ));
+    }
+    let offset = out.len() - value.len();
+    out[offset..].copy_from_slice(value);
+    Ok(())
+}
+
+fn null_hashcheck_ticket() -> Result<HashcheckTicket> {
+    let validation = TPMT_TK_HASHCHECK {
+        tag: TPM2_ST_HASHCHECK,
+        hierarchy: TPM2_RH_NULL,
+        digest: Default::default(),
+    };
+    validation
+        .try_into()
+        .map_err(|source| CoreError::tpm("build hashcheck ticket", source))
+}
+
+impl HashAlgorithm {
+    pub(crate) fn to_tpm_hash(self) -> HashingAlgorithm {
+        match self {
+            Self::Sha256 => HashingAlgorithm::Sha256,
+            Self::Sha384 => HashingAlgorithm::Sha384,
+            Self::Sha512 => HashingAlgorithm::Sha512,
+        }
+    }
+}
+
+impl ObjectDescriptor {
+    fn with_public_from_tpm(mut self, public: Public) -> Result<Self> {
+        let tpm_usage = usage_from_public(&public)?;
+        if tpm_usage != self.usage {
+            return Err(CoreError::invalid(
+                "usage",
+                format!(
+                    "registry says {} but persistent handle contains {} object",
+                    self.usage, tpm_usage
+                ),
+            ));
+        }
+        if matches!(self.usage, KeyUsage::Sign | KeyUsage::Ecdh) {
+            self.public_key = Some(ecc_public_key_from_public(&public)?);
+        }
+        Ok(self)
+    }
 }
 
 fn invalid_handle(input: &str, reason: impl Into<String>) -> CoreError {

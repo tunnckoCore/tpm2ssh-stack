@@ -1,8 +1,6 @@
 use crate::output::{BinaryFormat, encode_binary};
 use crate::pubkey::PublicKeyInput;
-use crate::{
-    EccPublicKey, KeyUsage, ObjectDescriptor, ObjectSelector, Result, unsupported_without_tpm,
-};
+use crate::{EccPublicKey, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EcdhRequest {
@@ -20,9 +18,18 @@ impl EcdhRequest {
         self.peer_public_key.clone().into_p256()
     }
 
-    pub fn execute(&self) -> Result<Vec<u8>> {
-        self.parse_peer_public_key()?;
-        Err(unsupported_without_tpm("ecdh"))
+    pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
+        let peer_public_key = self.parse_peer_public_key()?;
+        let mut context = crate::tpm::create_context()?;
+        let loaded = match &self.selector {
+            ObjectSelector::Id(id) => crate::tpm::load_key_by_id(&mut context, store, id)?,
+            ObjectSelector::Handle(handle) => {
+                crate::tpm::load_key_by_handle(&mut context, *handle)?
+            }
+        };
+        self.validate_descriptor(&loaded.descriptor)?;
+        let secret = crate::tpm::ecdh_z_gen(&mut context, loaded.handle, &peer_public_key)?;
+        Ok(encode_shared_secret(&secret, self.format))
     }
 }
 

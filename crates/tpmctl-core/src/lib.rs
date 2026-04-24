@@ -17,7 +17,11 @@ pub mod sign;
 pub mod store;
 pub mod tpm;
 
-use std::{fmt, str::FromStr};
+use std::{
+    fmt, fs,
+    io::{Read as _, Write as _},
+    str::FromStr,
+};
 
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 
@@ -155,11 +159,12 @@ pub struct EccPublicKey {
 impl EccPublicKey {
     pub fn p256_sec1(sec1: impl Into<Vec<u8>>) -> Result<Self> {
         let sec1 = sec1.into();
-        p256::PublicKey::from_sec1_bytes(&sec1)
+        let key = p256::PublicKey::from_sec1_bytes(&sec1)
             .map_err(|error| Error::invalid("public_key", error.to_string()))?;
+        let point = p256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&key, false);
         Ok(Self {
             curve: EccCurve::P256,
-            sec1,
+            sec1: point.as_bytes().to_vec(),
         })
     }
 
@@ -337,16 +342,77 @@ pub fn keygen(_request: KeygenRequest) -> Result<()> {
     Err(Error::unsupported("keygen"))
 }
 
-pub fn sign(_request: SignRequest) -> Result<()> {
-    Err(Error::unsupported("sign"))
+pub fn sign(request: SignRequest) -> Result<()> {
+    let store = Store::new(request.runtime.store.root);
+    let domain_request = sign::SignRequest {
+        selector: selector_from_material(request.material)?,
+        input: match request.input {
+            SignInput::Message(source) => sign::SignInput::Message(read_input_source(source)?),
+            SignInput::Digest(source) => sign::SignInput::Digest(read_input_source(source)?),
+        },
+        hash: request.hash,
+        format: request.format,
+    };
+    let output = domain_request.execute(&store)?;
+    write_output(request.output, &output, request.force)
 }
 
-pub fn pubkey(_request: PubkeyRequest) -> Result<()> {
-    Err(Error::unsupported("pubkey"))
+pub fn pubkey(request: PubkeyRequest) -> Result<()> {
+    let store = Store::new(request.runtime.store.root);
+    let domain_request = pubkey::PubkeyRequest {
+        selector: selector_from_material(request.material)?,
+        format: request.format,
+    };
+    let output = domain_request.execute(&store)?;
+    write_output(request.output, &output, request.force)
 }
 
-pub fn ecdh(_request: EcdhRequest) -> Result<()> {
-    Err(Error::unsupported("ecdh"))
+pub fn ecdh(request: EcdhRequest) -> Result<()> {
+    let store = Store::new(request.runtime.store.root);
+    let peer_public_key =
+        pubkey::PublicKeyInput::parse_bytes(read_input_source(request.peer_pub)?)?;
+    let domain_request = ecdh::EcdhRequest {
+        selector: selector_from_material(request.material)?,
+        peer_public_key,
+        format: request.format,
+    };
+    let output = domain_request.execute(&store)?;
+    write_output(request.output, &output, request.force)
+}
+
+fn selector_from_material(material: MaterialRef) -> Result<ObjectSelector> {
+    match material {
+        MaterialRef::Id(id) => Ok(ObjectSelector::Id(RegistryId::new(id)?)),
+        MaterialRef::Handle(handle) => Ok(ObjectSelector::Handle(handle)),
+    }
+}
+
+fn read_input_source(source: InputSource) -> Result<Vec<u8>> {
+    match source {
+        InputSource::Stdin => {
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut bytes)
+                .map_err(|error| Error::io("<stdin>", error))?;
+            Ok(bytes)
+        }
+        InputSource::File(path) => fs::read(&path).map_err(|error| Error::io(path, error)),
+    }
+}
+
+fn write_output(target: OutputTarget, bytes: &[u8], force: bool) -> Result<()> {
+    if let Some(path) = target.path {
+        if !force && path.exists() {
+            return Err(Error::AlreadyExists(path));
+        }
+        fs::write(&path, bytes).map_err(|error| Error::io(path, error))
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(bytes)
+            .and_then(|_| stdout.flush())
+            .map_err(|error| Error::io("<stdout>", error))
+    }
 }
 
 pub fn hmac(_request: HmacRequest) -> Result<()> {
