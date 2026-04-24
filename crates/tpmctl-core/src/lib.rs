@@ -183,3 +183,184 @@ pub fn unsupported_without_tpm(operation: &'static str) -> Error {
         "{operation} requires the TPM/store foundation and a reachable TPM or simulator"
     ))
 }
+
+// Frontend request contracts used by the thin CLI adapter. These are kept at the
+// crate root to preserve a stable, parser-free API surface while TPM semantics
+// remain in the domain modules above.
+use std::path::PathBuf;
+
+pub type SignatureFormat = output::SignatureFormat;
+pub type PublicKeyFormat = output::PublicKeyFormat;
+pub type BinaryTextFormat = output::BinaryFormat;
+pub type DeriveAlgorithm = crypto::derive::DerivedAlgorithm;
+pub type DeriveUse = crypto::derive::DeriveUse;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DeriveFormat {
+    Raw,
+    Hex,
+    Der,
+    Address,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StoreConfig {
+    pub root: PathBuf,
+}
+
+impl StoreConfig {
+    pub fn resolve(explicit: Option<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            root: store::resolve_store_root(explicit.as_deref())?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RuntimeOptions {
+    pub store: StoreConfig,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MaterialRef {
+    Id(String),
+    Handle(PersistentHandle),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OutputTarget {
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum InputSource {
+    Stdin,
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SealDestination {
+    Id(String),
+    Handle(PersistentHandle),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct KeygenRequest {
+    pub runtime: RuntimeOptions,
+    pub usage: KeyUsage,
+    pub id: String,
+    pub handle: Option<PersistentHandle>,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SignRequest {
+    pub runtime: RuntimeOptions,
+    pub material: MaterialRef,
+    pub input: SignInput,
+    pub hash: HashAlgorithm,
+    pub format: SignatureFormat,
+    pub output: OutputTarget,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SignInput {
+    Message(InputSource),
+    Digest(InputSource),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PubkeyRequest {
+    pub runtime: RuntimeOptions,
+    pub material: MaterialRef,
+    pub format: PublicKeyFormat,
+    pub output: OutputTarget,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EcdhRequest {
+    pub runtime: RuntimeOptions,
+    pub material: MaterialRef,
+    pub peer_pub: InputSource,
+    pub format: BinaryTextFormat,
+    pub output: OutputTarget,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct HmacRequest {
+    pub runtime: RuntimeOptions,
+    pub material: MaterialRef,
+    pub input: InputSource,
+    pub hash: Option<HashAlgorithm>,
+    pub format: BinaryTextFormat,
+    pub output: OutputTarget,
+    pub seal: Option<SealDestination>,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SealRequest {
+    pub runtime: RuntimeOptions,
+    pub input: InputSource,
+    pub destination: SealDestination,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UnsealRequest {
+    pub runtime: RuntimeOptions,
+    pub material: MaterialRef,
+    pub output: OutputTarget,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DeriveRequest {
+    pub runtime: RuntimeOptions,
+    pub material: MaterialRef,
+    pub label: Option<String>,
+    pub algorithm: DeriveAlgorithm,
+    pub usage: DeriveUse,
+    pub input: Option<SignInput>,
+    pub hash: Option<HashAlgorithm>,
+    pub format: DeriveFormat,
+    pub compressed: bool,
+    pub output: OutputTarget,
+    pub force: bool,
+}
+
+pub fn keygen(_request: KeygenRequest) -> Result<()> {
+    Err(Error::unsupported("keygen"))
+}
+
+pub fn sign(_request: SignRequest) -> Result<()> {
+    Err(Error::unsupported("sign"))
+}
+
+pub fn pubkey(_request: PubkeyRequest) -> Result<()> {
+    Err(Error::unsupported("pubkey"))
+}
+
+pub fn ecdh(_request: EcdhRequest) -> Result<()> {
+    Err(Error::unsupported("ecdh"))
+}
+
+pub fn hmac(_request: HmacRequest) -> Result<()> {
+    Err(Error::unsupported("hmac"))
+}
+
+pub fn seal(_request: SealRequest) -> Result<()> {
+    Err(Error::unsupported("seal"))
+}
+
+pub fn unseal(_request: UnsealRequest) -> Result<()> {
+    Err(Error::unsupported("unseal"))
+}
+
+pub fn derive(_request: DeriveRequest) -> Result<()> {
+    Err(Error::unsupported("derive"))
+}

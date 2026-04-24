@@ -209,17 +209,17 @@ Metadata checklist:
 
 ## Global CLI Rules
 
-- [ ] Support `-h` / `--help`.
-- [ ] Support `--version`.
-- [ ] Primary output goes to stdout.
-- [ ] Diagnostics and errors go to stderr.
-- [ ] Support `--json` for structured command results where useful.
-- [ ] Support `-o` / `--output <file>` for output-producing commands.
-- [ ] Support `-` as stdin/stdout where file input/output is expected.
-- [ ] Reject binary output to an interactive TTY unless format is text or `--force` is provided.
-- [ ] Support exactly one of `--id <id>` or `--handle <handle>` for operations over existing TPM material.
-- [ ] Make `--id` and `--handle` mutually exclusive everywhere they both appear.
-- [ ] Parse handles as hex strings like `0x81010010`.
+- [x] Support `-h` / `--help`.
+- [x] Support `--version`.
+- [x] Primary output goes to stdout.
+- [x] Diagnostics and errors go to stderr.
+- [x] Support `--json` for structured command results where useful.
+- [x] Support `-o` / `--output <file>` for output-producing commands.
+- [x] Support `-` as stdin/stdout where file input/output is expected.
+- [x] Reject binary output to an interactive TTY unless format is text or `--force` is provided.
+- [x] Support exactly one of `--id <id>` or `--handle <handle>` for operations over existing TPM material.
+- [x] Make `--id` and `--handle` mutually exclusive everywhere they both appear.
+- [x] Parse handles as hex strings like `0x81010010`.
 - [x] Respect TCTI from `TPM2TOOLS_TCTI`, `TCTI`, or `TEST_TCTI`; otherwise default to device TCTI.
 - [x] Support `--store <path>` and `TPMCTL_STORE` for local registry location, with flags taking precedence over env.
 - [ ] Use empty TPM object auth in v1; do not expose key auth flags yet.
@@ -743,13 +743,13 @@ Implementation should be run by five subagents working in separate git worktrees
 
 #### Agent 03 — CLI Validation and I/O
 
-- [ ] `cargo test -p tpmctl-cli` passes.
-- [ ] `cargo run -p tpmctl-cli -- --help` succeeds.
-- [ ] `cargo run -p tpmctl-cli -- --version` succeeds.
-- [ ] `--id` and `--handle` are mutually exclusive for all relevant commands.
-- [ ] `sign` and `derive --use sign` require exactly one of `--input` or `--digest`.
-- [ ] `hmac --seal-at` and `hmac --seal-id` are mutually exclusive.
-- [ ] Binary stdout to interactive TTY is rejected unless `--force` is present.
+- [x] `cargo test -p tpmctl-cli` passes.
+- [x] `cargo run -p tpmctl-cli -- --help` succeeds.
+- [x] `cargo run -p tpmctl-cli -- --version` succeeds.
+- [x] `--id` and `--handle` are mutually exclusive for all relevant commands.
+- [x] `sign` and `derive --use sign` require exactly one of `--input` or `--digest`.
+- [x] `hmac --seal-at` and `hmac --seal-id` are mutually exclusive.
+- [x] Binary stdout to interactive TTY is rejected unless `--force` is present.
 
 #### Agent 04 — TPM Commands
 
@@ -854,12 +854,12 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 4 — CLI skeleton
 
-- [ ] Add parser.
-- [ ] Add global output helpers.
-- [ ] Add mutual-exclusion validation.
-- [ ] Add stdin/stdout `-` support.
-- [ ] Add `--json` support where planned.
-- [ ] Add clear exit codes and error messages.
+- [x] Add parser.
+- [x] Add global output helpers.
+- [x] Add mutual-exclusion validation.
+- [x] Add stdin/stdout `-` support.
+- [x] Add `--json` support where planned.
+- [x] Add clear exit codes and error messages.
 
 ### Phase 5 — Key generation
 
@@ -948,7 +948,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 - [x] Unit-test format encoders.
 - [ ] Unit-test ID path safety.
-- [ ] Unit-test CLI parser validation.
+- [x] Unit-test CLI parser validation.
 - [x] Unit-test secp256k1 scalar derivation retry behavior.
 - [ ] Add simulator/integration tests where available.
 - [x] Document runtime packages and `pkg-config` requirements.

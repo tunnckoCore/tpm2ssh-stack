@@ -1,3 +1,7 @@
+//! Thin command adapters from validated CLI arguments to `tpmctl-core` contracts.
+
+use crate::args::{Cli, CliError, Command};
+
 pub mod derive;
 pub mod ecdh;
 pub mod hmac;
@@ -5,17 +9,18 @@ pub mod keygen;
 pub mod pubkey;
 pub mod seal;
 pub mod sign;
+pub mod unseal;
 
-pub fn dispatch(cli: crate::args::Cli) -> tpmctl_core::Result<()> {
-    match cli.command {
-        Some(crate::args::Command::Keygen) => keygen::run(),
-        Some(crate::args::Command::Sign) => sign::run(),
-        Some(crate::args::Command::Pubkey) => pubkey::run(),
-        Some(crate::args::Command::Ecdh) => ecdh::run(),
-        Some(crate::args::Command::Hmac) => hmac::run(),
-        Some(crate::args::Command::Seal) => seal::run_seal(),
-        Some(crate::args::Command::Unseal) => seal::run_unseal(),
-        Some(crate::args::Command::Derive) => derive::run(),
-        None => Ok(()),
+pub fn run(cli: &Cli) -> Result<(), CliError> {
+    let runtime = cli.runtime()?;
+    match &cli.command {
+        Command::Keygen(args) => keygen::run(runtime, args),
+        Command::Sign(args) => sign::run(runtime, args),
+        Command::Pubkey(args) => pubkey::run(runtime, args),
+        Command::Ecdh(args) => ecdh::run(runtime, args),
+        Command::Hmac(args) => hmac::run(runtime, args),
+        Command::Seal(args) => seal::run(runtime, args),
+        Command::Unseal(args) => unseal::run(runtime, args),
+        Command::Derive(args) => derive::run(runtime, args),
     }
 }
