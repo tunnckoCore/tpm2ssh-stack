@@ -1,0 +1,15 @@
+[package]
+name = "tpmctl-core"
+version = "0.1.0"
+edition = "2024"
+description = "Reusable TPM-backed command domain library for tpmctl"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "0.22.1"
+hex = "0.4.3"
+p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8", "pem"] }
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+zeroize = "1.8.2"

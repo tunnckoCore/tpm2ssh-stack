@@ -1,3 +1,3 @@
 [workspace]
-members = ["tpm2-derive"]
+members = ["tpm2-derive", "crates/tpmctl-core"]
 resolver = "2"
