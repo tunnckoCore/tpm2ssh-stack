@@ -462,10 +462,6 @@ impl DeriveArgs {
             _ => unreachable!("derive validation enforces at most one sign input"),
         }
     }
-
-    pub fn should_warn_ephemeral(&self) -> bool {
-        self.label.is_none() && matches!(self.usage, DeriveUseArg::Secret | DeriveUseArg::Pubkey)
-    }
 }
 
 #[derive(Debug, Args)]

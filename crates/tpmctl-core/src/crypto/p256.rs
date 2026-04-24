@@ -1,5 +1,5 @@
 use p256::{SecretKey, ecdsa::SigningKey, elliptic_curve::sec1::ToEncodedPoint};
-use signature::Signer;
+use signature::{Signer, hazmat::PrehashSigner};
 use zeroize::Zeroize;
 
 use super::derive::{
@@ -42,6 +42,24 @@ pub fn sign_message(
     let secret = derive_secret_key(seed, mode)?;
     let signing_key = SigningKey::from(secret);
     let signature: p256::ecdsa::Signature = signing_key.sign(message);
+    signature_to_vec(signature)
+}
+
+/// Signs a caller-supplied digest using ECDSA/P-256 prehash semantics.
+pub fn sign_prehash(
+    seed: &SecretSeed,
+    mode: &DeriveMode,
+    digest: &[u8],
+) -> Result<Vec<u8>, DeriveError> {
+    let secret = derive_secret_key(seed, mode)?;
+    let signing_key = SigningKey::from(secret);
+    let signature: p256::ecdsa::Signature = signing_key
+        .sign_prehash(digest)
+        .map_err(|_| DeriveError::InvalidPrehash)?;
+    signature_to_vec(signature)
+}
+
+fn signature_to_vec(signature: p256::ecdsa::Signature) -> Result<Vec<u8>, DeriveError> {
     let mut bytes = signature.to_bytes();
     let out = bytes.to_vec();
     bytes.zeroize();
@@ -77,5 +95,16 @@ mod tests {
         let mode = DeriveMode::deterministic(b"p256 sign".to_vec());
         let signature = sign_message(&seed, &mode, b"message").unwrap();
         assert_eq!(signature.len(), 64);
+    }
+
+    #[test]
+    fn prehash_matches_internal_sha256_message_signing() {
+        let seed = SecretSeed::new(b"p256 seed").unwrap();
+        let mode = DeriveMode::deterministic(b"p256 prehash".to_vec());
+        let digest = crate::HashAlgorithm::Sha256.digest(b"message");
+        assert_eq!(
+            sign_message(&seed, &mode, b"message").unwrap(),
+            sign_prehash(&seed, &mode, &digest).unwrap()
+        );
     }
 }

@@ -675,7 +675,7 @@ fn derive_signature(
     let bytes = match request.algorithm {
         DeriveAlgorithm::P256 => {
             let mut p1363 =
-                crypto::p256::sign_message(seed, mode, &message).map_err(derive_error)?;
+                crypto::p256::sign_prehash(seed, mode, &message).map_err(derive_error)?;
             let encoded = output::encode_p256_signature(&p1363, signature_format(request.format)?)?;
             p1363.zeroize();
             encoded
@@ -689,7 +689,7 @@ fn derive_signature(
         }
         DeriveAlgorithm::Secp256k1 => {
             let mut p1363 =
-                crypto::secp256k1::sign_message(seed, mode, &message).map_err(derive_error)?;
+                crypto::secp256k1::sign_prehash(seed, mode, &message).map_err(derive_error)?;
             let encoded =
                 output::encode_secp256k1_signature(&p1363, signature_format(request.format)?)?;
             p1363.zeroize();

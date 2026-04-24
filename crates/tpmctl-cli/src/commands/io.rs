@@ -28,9 +28,13 @@ pub fn read_input(source: &InputSource) -> Result<Vec<u8>, CliError> {
     }
 }
 
-pub fn write_output(target: &OutputTarget, bytes: &[u8]) -> Result<(), CliError> {
+pub fn write_output_with_force(
+    target: &OutputTarget,
+    bytes: &[u8],
+    force: bool,
+) -> Result<(), CliError> {
     match &target.path {
-        Some(path) => write_file(path, bytes),
+        Some(path) => write_file(path, bytes, force),
         None => write_stdout(bytes),
     }
 }
@@ -52,7 +56,10 @@ pub fn write_stdout_line(line: &str) -> Result<(), CliError> {
     write_stdout(&bytes)
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+fn write_file(path: &Path, bytes: &[u8], force: bool) -> Result<(), CliError> {
+    if path.exists() && !force {
+        return Err(CoreError::AlreadyExists(path.to_path_buf()).into());
+    }
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -84,7 +91,7 @@ pub fn write_output_to_writer<W: std::io::Write>(
     stdout: &mut W,
 ) -> Result<(), CliError> {
     match &target.path {
-        Some(path) => write_file(path, bytes),
+        Some(path) => write_file(path, bytes, false),
         None => {
             stdout
                 .write_all(bytes)
@@ -122,8 +129,12 @@ mod tests {
         let target = OutputTarget {
             path: Some(path.clone()),
         };
-        write_output(&target, b"xyz").unwrap();
+        write_output_with_force(&target, b"xyz", false).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"xyz");
+        let error = write_output_with_force(&target, b"overwrite", false).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        write_output_with_force(&target, b"overwrite", true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"overwrite");
         let _ = fs::remove_file(path);
     }
 
