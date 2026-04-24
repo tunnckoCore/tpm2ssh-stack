@@ -674,20 +674,6 @@ Checklist:
 
 Implementation should be run by five subagents working in separate git worktrees. Use a contract-first flow: land crate boundaries and shared API contracts first, then let workstreams proceed in parallel with narrow file ownership.
 
-### Branch and Worktree Setup
-
-Create five worktrees from the current branch (`minimal-and-native`):
-
-```bash
-git worktree add ../tpmctl-wt-01-foundation -b agent/01-foundation-workspace minimal-and-native
-git worktree add ../tpmctl-wt-02-core       -b agent/02-core-tpm-registry     minimal-and-native
-git worktree add ../tpmctl-wt-03-cli        -b agent/03-cli-validation-io     minimal-and-native
-git worktree add ../tpmctl-wt-04-commands   -b agent/04-tpm-commands          minimal-and-native
-git worktree add ../tpmctl-wt-05-derived    -b agent/05-derived-pkcs11-tests  minimal-and-native
-```
-
-Merge subagent branches only into `minimal-and-native` until final acceptance passes. Do not merge subagent branches directly to `main`.
-
 ### Subagent Ownership
 
 | Agent | Branch | Primary Ownership | Main Files |
@@ -722,16 +708,6 @@ Merge subagent branches only into `minimal-and-native` until final acceptance pa
 | 4 | CLI command wiring, integration tests, docs | Agents 03, 04, 05 | Merge only after core behavior compiles and command APIs stabilize. |
 | 5 | Final integration gate | All, coordinated by Agent 05 or lead | Run workspace-wide checks before merging integration to `main`. |
 
-### Merge Order
-
-1. Merge `agent/01-foundation-workspace` first.
-2. Rebase all other worktrees onto `minimal-and-native`.
-3. Merge `agent/02-core-tpm-registry`.
-4. Merge `agent/03-cli-validation-io` once parser and validation compile against core contracts.
-5. Merge `agent/04-tpm-commands`.
-6. Merge `agent/05-derived-pkcs11-tests` last, or split it into derive and PKCS#11/docs sub-merges if needed.
-7. STOP, AND DO NOT MERGE TO MASTER.
-
 ### Conflict Avoidance Rules
 
 - [ ] Agent 01 owns root workspace files until the foundation branch lands.
@@ -743,20 +719,7 @@ Merge subagent branches only into `minimal-and-native` until final acceptance pa
 - [ ] Shared files such as `README.md`, root `Cargo.toml`, and top-level module exports require a checkpoint note before edits.
 - [ ] Prefer request/response structs in `tpmctl-core` over embedding business logic in CLI command handlers.
 
-### Subagent Handoff Template
-
-Each subagent must report this before merge:
-
-```text
-branch:
-files changed:
-commands run:
-tests passing:
-known gaps:
-shared-file edits:
-```
-
-### Per-Workstream Acceptance Checks
+### Agent Scopes
 
 #### Agent 01 — Foundation
 
