@@ -17,7 +17,7 @@ pub mod sign;
 pub mod store;
 pub mod tpm;
 
-pub use error::{Error, Result};
+pub use error::{CoreError, Error, Result};
 pub use output::{EncodedOutput, OutputFormat};
-pub use store::{IdentityRef, ObjectKind, StoreOptions};
+pub use store::{IdentityRef, ObjectKind, RegistryId, Store, StoreOptions};
 pub use tpm::{CommandContext, KeyUsage, PersistentHandle};

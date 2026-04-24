@@ -1,21 +1,60 @@
-use std::fmt;
+use std::path::PathBuf;
 
-/// Result alias used by all public `tpmctl-core` contracts.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, CoreError>;
+pub type Error = CoreError;
 
-/// Stable error surface for frontends.
-///
-/// Domain modules currently return `Unsupported` until the TPM-backed behavior
-/// is implemented by the owning workstreams.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Error {
-    /// A public contract exists, but its implementation has not landed yet.
+#[derive(Debug, thiserror::Error)]
+pub enum CoreError {
+    #[error("operation is not implemented yet: {operation}")]
     Unsupported { operation: &'static str },
-    /// Caller supplied an invalid value for a named field.
+
+    #[error("invalid {field}: {reason}")]
     InvalidInput { field: &'static str, reason: String },
+
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    #[error("invalid registry id {id:?}: {reason}")]
+    InvalidRegistryId { id: String, reason: String },
+
+    #[error("invalid persistent TPM handle {input:?}: {reason}")]
+    InvalidHandle { input: String, reason: String },
+
+    #[error("failed to resolve TCTI: {0}")]
+    Tcti(String),
+
+    #[error("TPM operation {operation} failed: {source}")]
+    Tpm {
+        operation: &'static str,
+        #[source]
+        source: tss_esapi::Error,
+    },
+
+    #[error("store path {path} is invalid: {reason}")]
+    InvalidStorePath { path: PathBuf, reason: String },
+
+    #[error("store entry already exists: {0}")]
+    AlreadyExists(PathBuf),
+
+    #[error("store entry was not found: {0}")]
+    NotFound(PathBuf),
+
+    #[error("I/O error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("JSON error at {path}: {source}")]
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
-impl Error {
+impl CoreError {
     pub fn unsupported(operation: &'static str) -> Self {
         Self::Unsupported { operation }
     }
@@ -26,17 +65,22 @@ impl Error {
             reason: reason.into(),
         }
     }
-}
 
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { operation } => {
-                write!(formatter, "operation is not implemented yet: {operation}")
-            }
-            Self::InvalidInput { field, reason } => write!(formatter, "invalid {field}: {reason}"),
+    pub fn tpm(operation: &'static str, source: tss_esapi::Error) -> Self {
+        Self::Tpm { operation, source }
+    }
+
+    pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+
+    pub fn json(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
+        Self::Json {
+            path: path.into(),
+            source,
         }
     }
 }
-
-impl std::error::Error for Error {}
