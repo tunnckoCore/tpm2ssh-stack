@@ -118,13 +118,13 @@ crates/
 
 ## Cargo Plan
 
-- [ ] Convert the repository to a Cargo workspace with members under `crates/`.
-- [ ] Create `crates/tpmctl-core` as the reusable library crate.
-- [ ] Create `crates/tpmctl-cli` as the `tpmctl` binary crate.
-- [ ] Create `crates/tpmctl-pkcs11` as the PKCS#11 `cdylib` crate.
-- [ ] Put `tss-esapi` and TPM-domain dependencies in `tpmctl-core`.
-- [ ] Put `clap` and CLI-only dependencies in `tpmctl-cli`.
-- [ ] Put `pkcs11-sys` and PKCS#11-only dependencies in `tpmctl-pkcs11`.
+- [x] Convert the repository to a Cargo workspace with members under `crates/`.
+- [x] Create `crates/tpmctl-core` as the reusable library crate.
+- [x] Create `crates/tpmctl-cli` as the `tpmctl` binary crate.
+- [x] Create `crates/tpmctl-pkcs11` as the PKCS#11 `cdylib` crate.
+- [x] Put `tss-esapi` and TPM-domain dependencies in `tpmctl-core`.
+- [x] Put `clap` and CLI-only dependencies in `tpmctl-cli`.
+- [x] Put `pkcs11-sys` and PKCS#11-only dependencies in `tpmctl-pkcs11`.
 
 Suggested workspace direction:
 
@@ -148,7 +148,7 @@ tpmctl-pkcs11  -> cdylib PKCS#11 provider wrapper over tpmctl-core
 
 Likely dependencies:
 
-- [ ] `clap` for CLI parsing.
+- [x] `clap` for CLI parsing.
 - [ ] `serde`, `serde_json` for local metadata and `--json`.
 - [ ] `zeroize` for derived secrets and software key material.
 - [ ] `rand_core` or `getrandom` for ephemeral derivation labels/salt.
@@ -712,24 +712,24 @@ Implementation should be run by five subagents working in separate git worktrees
 
 - [ ] Agent 01 owns root workspace files until the foundation branch lands.
 - [ ] After Agent 01 lands, root `Cargo.toml` changes require coordination.
-- [ ] Avoid multiple agents editing `crates/tpmctl-core/src/lib.rs`; Agent 01 should declare module skeletons up front.
+- [x] Avoid multiple agents editing `crates/tpmctl-core/src/lib.rs`; Agent 01 should declare module skeletons up front.
 - [ ] CLI argument parsing belongs to Agent 03; TPM semantics belong to `tpmctl-core` owners.
 - [ ] Agent 04 owns TPM domain operation modules; Agent 03 only calls their public APIs.
 - [ ] Agent 05 owns `crypto/*`, `tpmctl-pkcs11/*`, and final docs/tests.
 - [ ] Shared files such as `README.md`, root `Cargo.toml`, and top-level module exports require a checkpoint note before edits.
-- [ ] Prefer request/response structs in `tpmctl-core` over embedding business logic in CLI command handlers.
+- [x] Prefer request/response structs in `tpmctl-core` over embedding business logic in CLI command handlers.
 
 ### Agent Scopes
 
 #### Agent 01 — Foundation
 
-- [ ] `cargo metadata --format-version 1` succeeds.
-- [ ] `cargo check -p tpmctl-core` succeeds.
-- [ ] `cargo check -p tpmctl-cli` succeeds.
-- [ ] `cargo check -p tpmctl-pkcs11` succeeds.
-- [ ] `tpmctl-core` has no `clap` dependency.
-- [ ] `tpmctl-core` has no `pkcs11-sys` dependency.
-- [ ] `tpmctl-pkcs11` has `crate-type = ["cdylib"]`.
+- [x] `cargo metadata --format-version 1` succeeds.
+- [x] `cargo check -p tpmctl-core` succeeds.
+- [x] `cargo check -p tpmctl-cli` succeeds.
+- [x] `cargo check -p tpmctl-pkcs11` succeeds.
+- [x] `tpmctl-core` has no `clap` dependency.
+- [x] `tpmctl-core` has no `pkcs11-sys` dependency.
+- [x] `tpmctl-pkcs11` has `crate-type = ["cdylib"]`.
 
 #### Agent 02 — Core TPM and Registry
 
@@ -819,15 +819,15 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 1 — Workspace restructuring and crate boundaries
 
-- [ ] Create root Cargo workspace.
-- [ ] Create `crates/tpmctl-core` library crate.
-- [ ] Create `crates/tpmctl-cli` binary crate.
-- [ ] Create `crates/tpmctl-pkcs11` `cdylib` crate.
+- [x] Create root Cargo workspace.
+- [x] Create `crates/tpmctl-core` library crate.
+- [x] Create `crates/tpmctl-cli` binary crate.
+- [x] Create `crates/tpmctl-pkcs11` `cdylib` crate.
 - [ ] Move TPM and crypto logic into `tpmctl-core`.
-- [ ] Move CLI parsing and dispatch into `tpmctl-cli`.
+- [x] Move CLI parsing and dispatch into `tpmctl-cli`.
 - [ ] Move PKCS#11 entrypoints into `tpmctl-pkcs11`.
-- [ ] Ensure `cargo build -p tpmctl-cli` does not compile PKCS#11 entrypoint code.
-- [ ] Ensure `cargo build -p tpmctl-pkcs11 --release` builds the `.so`.
+- [x] Ensure `cargo build -p tpmctl-cli` does not compile PKCS#11 entrypoint code.
+- [x] Ensure `cargo build -p tpmctl-pkcs11 --release` builds the `.so`.
 
 ### Phase 2 — Core TPM helpers
 

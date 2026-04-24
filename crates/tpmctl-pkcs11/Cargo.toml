@@ -1,0 +1,15 @@
+[package]
+name = "tpmctl-pkcs11"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PKCS#11 provider module for tpmctl-core"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+pkcs11-sys = "0.2"
+tpmctl-core = { path = "../tpmctl-core" }
