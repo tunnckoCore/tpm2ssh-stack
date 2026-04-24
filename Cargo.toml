@@ -13,10 +13,12 @@ license = "Apache-2.0"
 repository = "https://github.com/arcka/tpm2ssh-stack"
 
 [workspace.dependencies]
-clap = { version = "4.5.38", features = ["derive"] }
+clap = { version = "4.5.38", features = ["derive", "env"] }
+is-terminal = "0.4"
 pkcs11-sys = "0.2.25"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+tempfile = "3.27.0"
 thiserror = "2.0.17"
 tss-esapi = "7.6.0"
 tpmctl-core = { path = "crates/tpmctl-core" }

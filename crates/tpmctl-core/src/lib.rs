@@ -25,6 +25,31 @@ pub use handle::PersistentHandle;
 pub use store::{Id, ObjectKind, ObjectMetadata, Store, Usage};
 pub use tcti::{TctiConfig, TctiSource};
 
+/// Target selector for operations over existing TPM/local-registry material.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Target {
+    Id(String),
+    Handle(PersistentHandle),
+}
+
+/// Hash algorithms accepted by signing/HMAC frontends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum HashAlgorithm {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl HashAlgorithm {
+    pub const fn digest_len(self) -> usize {
+        match self {
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+}
+
 /// Stable registry identifier used by the local key store.
 pub type KeyId = Id;
 

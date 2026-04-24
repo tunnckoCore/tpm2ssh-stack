@@ -11,4 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+is-terminal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 tpmctl-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
