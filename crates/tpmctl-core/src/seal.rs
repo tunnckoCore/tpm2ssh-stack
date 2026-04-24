@@ -19,7 +19,7 @@ use crate::{
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SealRequest {
     pub selector: ObjectSelector,
-    pub input: Vec<u8>,
+    pub input: Zeroizing<Vec<u8>>,
     pub force: bool,
 }
 
@@ -237,7 +237,7 @@ mod seal_tests {
     fn seal_requires_non_empty_input() {
         let request = SealRequest {
             selector: selector(),
-            input: Vec::new(),
+            input: Zeroizing::new(Vec::new()),
             force: false,
         };
         assert!(request.validate().is_err());
