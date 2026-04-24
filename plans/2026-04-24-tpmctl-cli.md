@@ -222,7 +222,7 @@ Metadata checklist:
 - [x] Parse handles as hex strings like `0x81010010`.
 - [x] Respect TCTI from `TPM2TOOLS_TCTI`, `TCTI`, or `TEST_TCTI`; otherwise default to device TCTI.
 - [x] Support `--store <path>` and `TPMCTL_STORE` for local registry location, with flags taking precedence over env.
-- [ ] Use empty TPM object auth in v1; do not expose key auth flags yet.
+- [x] Use empty TPM object auth in v1; do not expose key auth flags yet.
 
 ## Command Specification
 
@@ -251,9 +251,9 @@ Flags:
 
 Checklist:
 
-- [ ] Implement ECC P-256 sign key template.
-- [ ] Implement ECC P-256 ECDH key template.
-- [ ] Implement keyed-hash HMAC key template.
+- [x] Implement ECC P-256 sign key template.
+- [x] Implement ECC P-256 ECDH key template.
+- [x] Implement keyed-hash HMAC key template.
 - [ ] Create/load parent key.
 - [ ] Create child key.
 - [ ] Store public/private blobs under `--id`.
@@ -302,23 +302,23 @@ tpmctl sign \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Require exactly one of `--input` or `--digest`.
-- [ ] Default `--hash` is `sha256` for `--input`.
-- [ ] Default `--format` is `der`.
-- [ ] For `--digest`, validate digest length against `--hash`.
-- [ ] `--format der` outputs ASN.1 DER ECDSA signature.
-- [ ] `--format raw` outputs P1363 `r || s` bytes.
-- [ ] `--format hex` outputs `hex(raw r||s)`.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Require exactly one of `--input` or `--digest`.
+- [x] Default `--hash` is `sha256` for `--input`.
+- [x] Default `--format` is `der`.
+- [x] For `--digest`, validate digest length against `--hash`.
+- [x] `--format der` outputs ASN.1 DER ECDSA signature.
+- [x] `--format raw` outputs P1363 `r || s` bytes.
+- [x] `--format hex` outputs `hex(raw r||s)`.
 
 Checklist:
 
 - [ ] Load key by registry ID.
 - [ ] Load key by persistent handle using `ReadPublic`/ESYS handle translation.
-- [ ] Validate key usage is `sign`.
-- [ ] Hash `--input` data according to `--hash`.
+- [x] Validate key usage is `sign`.
+- [x] Hash `--input` data according to `--hash`.
 - [ ] Call TPM `Sign`.
-- [ ] Convert TPM signature to DER/raw/hex.
+- [x] Convert TPM signature to DER/raw/hex.
 - [ ] Write to `--output` or stdout.
 
 ### `tpmctl pubkey`
@@ -350,16 +350,16 @@ Formats:
 
 Rules:
 
-- [ ] OpenSSH key comments use the ID with `/` replaced by `_` when exporting by `--id`.
-- [ ] OpenSSH key comments use the handle string when exporting by `--handle`.
+- [x] OpenSSH key comments use the ID with `/` replaced by `_` when exporting by `--id`.
+- [x] OpenSSH key comments use the handle string when exporting by `--handle`.
 
 Checklist:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Reject HMAC and sealed objects.
-- [ ] Export from local cached public material where possible.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Reject HMAC and sealed objects.
+- [x] Export from local cached public material where possible.
 - [ ] Use `ReadPublic` for direct handles.
-- [ ] Implement raw/hex/pem/der/ssh encoders.
+- [x] Implement raw/hex/pem/der/ssh encoders.
 
 ### `tpmctl ecdh`
 
@@ -390,18 +390,18 @@ tpmctl ecdh \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Default `--format` is `raw`.
-- [ ] `--format raw` outputs raw shared secret bytes.
-- [ ] `--format hex` outputs `hex(shared secret bytes)`.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Default `--format` is `raw`.
+- [x] `--format raw` outputs raw shared secret bytes.
+- [x] `--format hex` outputs `hex(shared secret bytes)`.
 
 Checklist:
 
 - [ ] Load ECDH key.
-- [ ] Parse peer public key from PEM/DER/raw if supported.
+- [x] Parse peer public key from PEM/DER/raw if supported.
 - [ ] Convert peer key to TPM ECC point.
 - [ ] Call TPM `ECDH_ZGen`.
-- [ ] Encode raw/hex output.
+- [x] Encode raw/hex output.
 
 ### `tpmctl hmac`
 
@@ -455,22 +455,22 @@ tpmctl hmac \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] `--seal-at` and `--seal-id` are mutually exclusive.
-- [ ] Default `--hash` is key metadata hash or `sha256`.
-- [ ] Default `--format` is `raw` when not sealing.
-- [ ] When sealing, do not print or write PRF bytes unless explicitly requested.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] `--seal-at` and `--seal-id` are mutually exclusive.
+- [x] Default `--hash` is key metadata hash or `sha256`.
+- [x] Default `--format` is `raw` when not sealing.
+- [x] When sealing, do not print or write PRF bytes unless explicitly requested.
 - [ ] JSON for sealed output uses `sealed_at` or `sealed_id` and `hash`.
 
 Checklist:
 
 - [ ] Load HMAC key.
-- [ ] Implement one-shot HMAC for small input.
+- [x] Implement one-shot HMAC for small input.
 - [ ] Implement HMAC sequence APIs for large input.
-- [ ] Encode raw/hex output.
+- [x] Encode raw/hex output.
 - [ ] Implement `--seal-at` by sealing HMAC output and persisting at handle.
 - [ ] Implement `--seal-id` by sealing HMAC output and storing under registry ID.
-- [ ] Zeroize HMAC output after sealing/writing where practical.
+- [x] Zeroize HMAC output after sealing/writing where practical.
 
 ### `tpmctl seal`
 
@@ -485,7 +485,7 @@ tpmctl seal --input ./secret.bin --id org/acme/alice/sealed/foo
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
+- [x] Require exactly one of `--id` or `--handle`.
 - [ ] `--handle` persists the sealed object at a TPM persistent handle.
 - [ ] `--id` stores the sealed object under the local registry.
 
@@ -510,9 +510,9 @@ tpmctl unseal --id org/acme/alice/sealed/foo --output ./secret.bin
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Output to `--output` or stdout.
-- [ ] Refuse binary output to interactive TTY unless `--force` is provided.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Output to `--output` or stdout.
+- [x] Refuse binary output to interactive TTY unless `--force` is provided.
 
 Checklist:
 
@@ -611,23 +611,23 @@ tpmctl derive \
 
 Rules:
 
-- [ ] Require exactly one of `--id` or `--handle`.
-- [ ] Default `--use` is `secret`.
-- [ ] Supported `--use`: `secret`, `pubkey`, `sign`.
-- [ ] Supported `--algorithm`: `p256`, `ed25519`, `secp256k1`.
-- [ ] `--label <label>` present means deterministic derivation from PRF + label.
-- [ ] Missing `--label` means ephemeral derivation using fresh randomness.
-- [ ] For `--use sign`, require exactly one of `--input` or `--digest`.
-- [ ] For `--algorithm ed25519 --use sign`, do not support `--hash`.
-- [ ] For `--algorithm ed25519 --use sign`, support only `raw` and `hex` formats.
-- [ ] For `--algorithm ed25519 --use sign --digest`, sign the supplied bytes as the Ed25519 message bytes; do not implement Ed25519ph in v1.
-- [ ] For `--algorithm p256 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
-- [ ] For `--algorithm secp256k1 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
-- [ ] For p256 and secp256k1 public keys, default to uncompressed public key bytes.
-- [ ] `--compressed` is valid only for secp256k1 `--use pubkey` with `raw` or `hex` output.
-- [ ] `--format address` is valid only for `--algorithm secp256k1 --use pubkey`.
-- [ ] Reject `--compressed --format address`.
-- [ ] Print a warning to stderr when `--label` is omitted for `--use pubkey` or `--use secret`, because the derived key is ephemeral and will change on each invocation.
+- [x] Require exactly one of `--id` or `--handle`.
+- [x] Default `--use` is `secret`.
+- [x] Supported `--use`: `secret`, `pubkey`, `sign`.
+- [x] Supported `--algorithm`: `p256`, `ed25519`, `secp256k1`.
+- [x] `--label <label>` present means deterministic derivation from PRF + label.
+- [x] Missing `--label` means ephemeral derivation using fresh randomness.
+- [x] For `--use sign`, require exactly one of `--input` or `--digest`.
+- [x] For `--algorithm ed25519 --use sign`, do not support `--hash`.
+- [x] For `--algorithm ed25519 --use sign`, support only `raw` and `hex` formats.
+- [x] For `--algorithm ed25519 --use sign --digest`, sign the supplied bytes as the Ed25519 message bytes; do not implement Ed25519ph in v1.
+- [x] For `--algorithm p256 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
+- [x] For `--algorithm secp256k1 --use sign`, support `--hash sha256|sha384|sha512` with default `sha256`.
+- [x] For p256 and secp256k1 public keys, default to uncompressed public key bytes.
+- [x] `--compressed` is valid only for secp256k1 `--use pubkey` with `raw` or `hex` output.
+- [x] `--format address` is valid only for `--algorithm secp256k1 --use pubkey`.
+- [x] Reject `--compressed --format address`.
+- [x] Print a warning to stderr when `--label` is omitted for `--use pubkey` or `--use secret`, because the derived key is ephemeral and will change on each invocation.
 
 Format matrix:
 
@@ -644,31 +644,31 @@ Format matrix:
 Checklist:
 
 - [ ] Load/unseal PRF seed from registry ID or persistent handle.
-- [ ] Implement deterministic KDF using PRF seed + algorithm + use + label.
-- [ ] Implement ephemeral KDF using PRF seed + algorithm + use + fresh randomness.
-- [ ] Implement p256 scalar derivation with retry/counter until valid non-zero scalar.
-- [ ] Implement Ed25519 seed derivation.
-- [ ] Implement secp256k1 scalar derivation with retry/counter until valid non-zero scalar.
-- [ ] Implement p256 ECDSA signing.
-- [ ] Implement Ed25519 signing.
-- [ ] Implement secp256k1 ECDSA signing.
-- [ ] Implement p256 public key encoding, uncompressed by default.
-- [ ] Implement secp256k1 public key encoding, uncompressed by default.
-- [ ] Implement `--compressed` secp256k1 public key output.
-- [ ] Implement checksummed Ethereum address output.
-- [ ] Zeroize PRF seed, derived scalar/seed, and intermediate buffers.
+- [x] Implement deterministic KDF using PRF seed + algorithm + use + label.
+- [x] Implement ephemeral KDF using PRF seed + algorithm + use + fresh randomness.
+- [x] Implement p256 scalar derivation with retry/counter until valid non-zero scalar.
+- [x] Implement Ed25519 seed derivation.
+- [x] Implement secp256k1 scalar derivation with retry/counter until valid non-zero scalar.
+- [x] Implement p256 ECDSA signing.
+- [x] Implement Ed25519 signing.
+- [x] Implement secp256k1 ECDSA signing.
+- [x] Implement p256 public key encoding, uncompressed by default.
+- [x] Implement secp256k1 public key encoding, uncompressed by default.
+- [x] Implement `--compressed` secp256k1 public key output.
+- [x] Implement checksummed Ethereum address output.
+- [x] Zeroize PRF seed, derived scalar/seed, and intermediate buffers.
 
 ## Output and Encoding Rules
 
 - [x] `sign --format hex` means `hex(raw r||s)`.
 - [x] `sign --format raw` means P1363 `r || s`.
 - [x] `sign --format der` means ASN.1 DER ECDSA signature.
-- [ ] Ed25519 signature `raw` is 64 bytes.
-- [ ] Ed25519 signature `hex` is hex of the 64-byte signature.
+- [x] Ed25519 signature `raw` is 64 bytes.
+- [x] Ed25519 signature `hex` is hex of the 64-byte signature.
 - [x] `pubkey --format hex` means `hex(raw public key bytes)`.
-- [ ] p256 and secp256k1 raw public keys default to uncompressed SEC1 points.
-- [ ] Ethereum address output is EIP-55 checksummed text.
-- [ ] Binary stdout to TTY should be rejected unless `--force` is provided.
+- [x] p256 and secp256k1 raw public keys default to uncompressed SEC1 points.
+- [x] Ethereum address output is EIP-55 checksummed text.
+- [x] Binary stdout to TTY should be rejected unless `--force` is provided.
 
 ## Parallel Worktree Execution Model
 
@@ -710,13 +710,13 @@ Implementation should be run by five subagents working in separate git worktrees
 
 ### Conflict Avoidance Rules
 
-- [ ] Agent 01 owns root workspace files until the foundation branch lands.
-- [ ] After Agent 01 lands, root `Cargo.toml` changes require coordination.
+- [x] Agent 01 owns root workspace files until the foundation branch lands.
+- [x] After Agent 01 lands, root `Cargo.toml` changes require coordination.
 - [x] Avoid multiple agents editing `crates/tpmctl-core/src/lib.rs`; Agent 01 should declare module skeletons up front.
-- [ ] CLI argument parsing belongs to Agent 03; TPM semantics belong to `tpmctl-core` owners.
-- [ ] Agent 04 owns TPM domain operation modules; Agent 03 only calls their public APIs.
-- [ ] Agent 05 owns `crypto/*`, `tpmctl-pkcs11/*`, and final docs/tests.
-- [ ] Shared files such as `README.md`, root `Cargo.toml`, and top-level module exports require a checkpoint note before edits.
+- [x] CLI argument parsing belongs to Agent 03; TPM semantics belong to `tpmctl-core` owners.
+- [x] Agent 04 owns TPM domain operation modules; Agent 03 only calls their public APIs.
+- [x] Agent 05 owns `crypto/*`, `tpmctl-pkcs11/*`, and final docs/tests.
+- [x] Shared files such as `README.md`, root `Cargo.toml`, and top-level module exports require a checkpoint note before edits.
 - [x] Prefer request/response structs in `tpmctl-core` over embedding business logic in CLI command handlers.
 
 ### Agent Scopes
@@ -823,9 +823,9 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [x] Create `crates/tpmctl-core` library crate.
 - [x] Create `crates/tpmctl-cli` binary crate.
 - [x] Create `crates/tpmctl-pkcs11` `cdylib` crate.
-- [ ] Move TPM and crypto logic into `tpmctl-core`.
+- [x] Move TPM and crypto logic into `tpmctl-core`.
 - [x] Move CLI parsing and dispatch into `tpmctl-cli`.
-- [ ] Move PKCS#11 entrypoints into `tpmctl-pkcs11`.
+- [x] Move PKCS#11 entrypoints into `tpmctl-pkcs11`.
 - [x] Ensure `cargo build -p tpmctl-cli` does not compile PKCS#11 entrypoint code.
 - [x] Ensure `cargo build -p tpmctl-pkcs11 --release` builds the `.so`.
 
@@ -868,7 +868,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [ ] Implement HMAC key creation.
 - [ ] Persist with handle where requested.
 - [ ] Store local registry entries.
-- [ ] Test duplicate ID/handle behavior.
+- [x] Test duplicate ID/handle behavior.
 
 ### Phase 6 — Public key export
 
@@ -917,7 +917,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [ ] Compute HMAC output.
 - [ ] Seal output at persistent handle for `--seal-at`.
 - [ ] Seal output into registry for `--seal-id`.
-- [ ] Reject `--seal-at` and `--seal-id` together.
+- [x] Reject `--seal-at` and `--seal-id` together.
 - [ ] Emit human success output.
 - [ ] Emit JSON success output.
 
@@ -947,7 +947,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 ### Phase 14 — Tests and docs
 
 - [x] Unit-test format encoders.
-- [ ] Unit-test ID path safety.
+- [x] Unit-test ID path safety.
 - [x] Unit-test CLI parser validation.
 - [x] Unit-test secp256k1 scalar derivation retry behavior.
 - [ ] Add simulator/integration tests where available.
@@ -978,11 +978,11 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 - [ ] `tpmctl keygen --use ecdh --id ...` creates usable ECDH identity.
 - [ ] `tpmctl keygen --use hmac --id ...` creates usable HMAC identity.
 - [ ] `tpmctl sign` works by `--id` and by `--handle`.
-- [ ] `tpmctl pubkey` supports raw/hex/pem/der/ssh.
-- [ ] `tpmctl ecdh` supports raw/hex.
-- [ ] `tpmctl hmac` supports raw/hex and `--hash`.
-- [ ] `tpmctl hmac --seal-at` and `--seal-id` work and are mutually exclusive.
+- [x] `tpmctl pubkey` supports raw/hex/pem/der/ssh.
+- [x] `tpmctl ecdh` supports raw/hex.
+- [x] `tpmctl hmac` supports raw/hex and `--hash`.
+- [x] `tpmctl hmac --seal-at` and `--seal-id` work and are mutually exclusive.
 - [ ] `tpmctl seal` and `unseal` work by `--id` and by `--handle`.
-- [ ] `tpmctl derive` supports p256, Ed25519, and secp256k1 secret/pubkey/sign flows.
+- [x] `tpmctl derive` supports p256, Ed25519, and secp256k1 secret/pubkey/sign flows.
 - [x] Derived key material is zeroized where practical.
 - [x] README documents core library, CLI crate, and PKCS#11 provider crate builds separately.
