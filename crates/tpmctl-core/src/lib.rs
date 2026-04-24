@@ -370,7 +370,7 @@ pub fn sign(request: SignRequest) -> Result<()> {
         format: request.format,
     };
     let output = domain_request.execute(&store)?;
-    write_output(&request.output, &output, request.force)
+    write_output(&request.output, output.as_slice(), request.force)
 }
 
 pub fn pubkey(request: PubkeyRequest) -> Result<()> {
@@ -380,7 +380,7 @@ pub fn pubkey(request: PubkeyRequest) -> Result<()> {
         format: request.format,
     };
     let output = domain_request.execute(&store)?;
-    write_output(&request.output, &output, request.force)
+    write_output(&request.output, output.as_slice(), request.force)
 }
 
 pub fn ecdh(request: EcdhRequest) -> Result<()> {
@@ -392,7 +392,7 @@ pub fn ecdh(request: EcdhRequest) -> Result<()> {
         format: request.format,
     };
     let output = domain_request.execute(&store)?;
-    write_output(&request.output, &output, request.force)
+    write_output(&request.output, output.as_slice(), request.force)
 }
 
 pub fn hmac(request: HmacRequest) -> Result<()> {
@@ -439,7 +439,7 @@ pub fn hmac(request: HmacRequest) -> Result<()> {
 
 pub fn seal(request: SealRequest) -> Result<()> {
     let command = command_context(&request.runtime);
-    let input = read_input(&request.input)?;
+    let input = zeroize::Zeroizing::new(read_input(&request.input)?);
     let selector = seal_destination_selector(request.destination)?;
     let domain = seal::SealRequest {
         selector,

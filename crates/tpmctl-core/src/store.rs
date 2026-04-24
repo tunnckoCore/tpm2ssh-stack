@@ -77,13 +77,17 @@ impl Store {
             return Err(CoreError::AlreadyExists(dir));
         }
 
-        fs::create_dir_all(&dir).map_err(|source| CoreError::io(&dir, source))?;
+        create_secure_dir_all(&dir)?;
         write_json_atomic(&dir.join(META_FILE), &entry.metadata)?;
         write_atomic(&dir.join(PUBLIC_BLOB_FILE), &entry.public_blob)?;
         write_atomic(&dir.join(PRIVATE_BLOB_FILE), &entry.private_blob)?;
 
+        let public_pem_path = dir.join(PUBLIC_PEM_FILE);
         if let Some(public_pem) = &entry.public_pem {
-            write_atomic(&dir.join(PUBLIC_PEM_FILE), public_pem)?;
+            write_atomic(&public_pem_path, public_pem)?;
+        } else if overwrite && public_pem_path.exists() {
+            fs::remove_file(&public_pem_path)
+                .map_err(|source| CoreError::io(&public_pem_path, source))?;
         }
 
         Ok(dir)
@@ -401,7 +405,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         path: path.to_path_buf(),
         reason: "path has no parent".into(),
     })?;
-    fs::create_dir_all(parent).map_err(|source| CoreError::io(parent, source))?;
+    create_secure_dir_all(parent)?;
 
     let tmp = path.with_extension(format!(
         "tmp-{}-{}",
@@ -411,8 +415,73 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default()
     ));
-    fs::write(&tmp, bytes).map_err(|source| CoreError::io(&tmp, source))?;
+    write_secure_temp_file(&tmp, bytes)?;
     fs::rename(&tmp, path).map_err(|source| CoreError::io(path, source))?;
+    set_secure_file_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_secure_dir_all(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut to_secure = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        to_secure.push(current.to_path_buf());
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+
+    fs::create_dir_all(path).map_err(|source| CoreError::io(path, source))?;
+    to_secure.push(path.to_path_buf());
+    to_secure.sort();
+    to_secure.dedup();
+    for dir in to_secure {
+        if dir.is_dir() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .map_err(|source| CoreError::io(&dir, source))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_secure_dir_all(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).map_err(|source| CoreError::io(path, source))
+}
+
+#[cfg(unix)]
+fn write_secure_temp_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| CoreError::io(path, source))?;
+    file.write_all(bytes)
+        .map_err(|source| CoreError::io(path, source))
+}
+
+#[cfg(not(unix))]
+fn write_secure_temp_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes).map_err(|source| CoreError::io(path, source))
+}
+
+#[cfg(unix)]
+fn set_secure_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|source| CoreError::io(path, source))
+}
+
+#[cfg(not(unix))]
+fn set_secure_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -528,5 +597,67 @@ mod tests {
 
         let loaded = store.load_key(&id).unwrap();
         assert_eq!(loaded, entry);
+    }
+
+    #[test]
+    fn overwrite_removes_stale_public_pem_when_entry_has_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path());
+        let id = RegistryId::parse("org/acme/key").unwrap();
+        let metadata = RegistryMetadata::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
+        let with_pem = StoredObjectEntry {
+            metadata: metadata.clone(),
+            public_blob: b"public".to_vec(),
+            private_blob: b"private".to_vec(),
+            public_pem: Some(b"pem".to_vec()),
+        };
+        let without_pem = StoredObjectEntry {
+            metadata,
+            public_blob: b"public2".to_vec(),
+            private_blob: b"private2".to_vec(),
+            public_pem: None,
+        };
+
+        let dir = store.save_key(&with_pem, false).unwrap();
+        assert!(dir.join(PUBLIC_PEM_FILE).is_file());
+        store.save_key(&without_pem, true).unwrap();
+
+        assert!(!dir.join(PUBLIC_PEM_FILE).exists());
+        assert_eq!(store.load_key(&id).unwrap(), without_pem);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_writes_use_private_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path());
+        let id = RegistryId::parse("org/acme/key").unwrap();
+        let metadata = RegistryMetadata::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
+        let entry = StoredObjectEntry {
+            metadata,
+            public_blob: b"public".to_vec(),
+            private_blob: b"private".to_vec(),
+            public_pem: Some(b"pem".to_vec()),
+        };
+
+        let dir = store.save_key(&entry, false).unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for file in [
+            META_FILE,
+            PUBLIC_BLOB_FILE,
+            PRIVATE_BLOB_FILE,
+            PUBLIC_PEM_FILE,
+        ] {
+            assert_eq!(
+                fs::metadata(dir.join(file)).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "{file} should be private"
+            );
+        }
     }
 }

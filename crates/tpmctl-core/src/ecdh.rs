@@ -1,6 +1,7 @@
 use crate::output::{BinaryFormat, encode_binary};
 use crate::pubkey::PublicKeyInput;
 use crate::{EccPublicKey, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EcdhRequest {
@@ -18,7 +19,7 @@ impl EcdhRequest {
         self.peer_public_key.clone().into_p256()
     }
 
-    pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
+    pub fn execute(&self, store: &Store) -> Result<Zeroizing<Vec<u8>>> {
         let peer_public_key = self.parse_peer_public_key()?;
         let mut context = crate::tpm::create_context()?;
         let loaded = match &self.selector {
@@ -29,12 +30,12 @@ impl EcdhRequest {
         };
         self.validate_descriptor(&loaded.descriptor)?;
         let secret = crate::tpm::ecdh_z_gen(&mut context, loaded.handle, &peer_public_key)?;
-        Ok(encode_shared_secret(&secret, self.format))
+        Ok(encode_shared_secret(secret.as_slice(), self.format))
     }
 }
 
-pub fn encode_shared_secret(secret: &[u8], format: BinaryFormat) -> Vec<u8> {
-    encode_binary(secret, format)
+pub fn encode_shared_secret(secret: &[u8], format: BinaryFormat) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(encode_binary(secret, format))
 }
 
 #[cfg(test)]
@@ -85,7 +86,13 @@ mod ecdh_tests {
 
     #[test]
     fn ecdh_encodes_raw_and_hex_shared_secret() {
-        assert_eq!(encode_shared_secret(&[1, 2], BinaryFormat::Raw), vec![1, 2]);
-        assert_eq!(encode_shared_secret(&[1, 2], BinaryFormat::Hex), b"0102");
+        assert_eq!(
+            encode_shared_secret(&[1, 2], BinaryFormat::Raw).as_slice(),
+            &[1, 2]
+        );
+        assert_eq!(
+            encode_shared_secret(&[1, 2], BinaryFormat::Hex).as_slice(),
+            b"0102"
+        );
     }
 }

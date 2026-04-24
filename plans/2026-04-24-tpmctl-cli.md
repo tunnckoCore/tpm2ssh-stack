@@ -958,6 +958,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 - [x] Unit-test format encoders.
 - [x] Unit-test ID path safety.
+- [x] Unit-test registry overwrite stale-file cleanup and Unix private registry permissions.
 - [x] Unit-test CLI parser validation.
 - [x] Unit-test secp256k1 scalar derivation retry behavior.
 - [ ] Add simulator/integration tests where available. Not run/marked complete in Agent 11 because `/dev/tpm0` and `/dev/tpmrm0` exist but are not accessible to the current user (`Permission denied`), and no swtpm/mssim listener is available.
@@ -997,4 +998,6 @@ Agent 11 gating note: hardware/simulator E2E items below remain unchecked becaus
 - [ ] `tpmctl seal` and `unseal` work by `--id` and by `--handle`.
 - [x] `tpmctl derive` supports p256, Ed25519, and secp256k1 secret/pubkey/sign flows.
 - [x] Derived key material is zeroized where practical.
+- [x] ECDH shared-secret output and seal plaintext input use zeroizing buffers where practical.
+- [x] Registry writes enforce private Unix directory/file permissions and remove stale optional files on forced overwrite.
 - [x] README documents core library, CLI crate, and PKCS#11 provider crate builds separately.

@@ -3,6 +3,7 @@ use crate::{
     commands::io::{read_input, seal_target_from_destination, write_stdout, write_stdout_line},
 };
 use tpmctl_core::{CommandContext, SealTarget, StoreOptions, seal as core_seal};
+use zeroize::Zeroizing;
 
 pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &SealArgs) -> Result<(), CliError> {
     let destination = args.destination();
@@ -13,7 +14,7 @@ pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &SealArgs) -> Result<(), 
     };
     let request = core_seal::SealRequest {
         selector,
-        input: read_input(&args.input)?,
+        input: Zeroizing::new(read_input(&args.input)?),
         force: args.force,
     };
     let command = CommandContext {
