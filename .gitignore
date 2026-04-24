@@ -5,7 +5,7 @@
 *~
 .vscode/
 .idea/
-.worktrees
+.worktrees/
 
 # Build outputs
 /target/
