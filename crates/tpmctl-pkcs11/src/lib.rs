@@ -10,17 +10,11 @@ use std::sync::{Mutex, OnceLock};
 
 use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 use pkcs11_sys::*;
-use tpmctl_core::tpm::{
-    parse_tpm_handle_literal as core_parse_tpm_handle_literal, tcti_name_conf_from_env,
+use tpmctl_core::{
+    HashAlgorithm,
+    tpm::{parse_tpm_handle_literal as core_parse_tpm_handle_literal, tcti_name_conf_from_env},
 };
-use tss_esapi::{
-    Context as TpmContext,
-    constants::{StructureTag, tss::TPM2_RH_NULL},
-    handles::TpmHandle,
-    interface_types::{algorithm::HashingAlgorithm, session_handles::AuthSession},
-    structures::{Auth, Digest, HashScheme, HashcheckTicket, Signature, SignatureScheme},
-    tss2_esys::{TPM2B_DIGEST, TPMT_TK_HASHCHECK},
-};
+use tss_esapi::{Context as TpmContext, handles::TpmHandle, structures::Auth};
 
 const SLOT_ID: CK_SLOT_ID = 1;
 const USER_PIN: &[u8] = b"";
@@ -62,6 +56,13 @@ struct SessionState {
 enum ObjectKind {
     Public,
     Private,
+}
+
+fn require_private_key_login(session: &SessionState, kind: ObjectKind) -> Result<(), CK_RV> {
+    if kind == ObjectKind::Private && !session.logged_in {
+        return Err(CKR_USER_NOT_LOGGED_IN);
+    }
+    Ok(())
 }
 
 fn provider() -> &'static Mutex<ProviderState> {
@@ -207,60 +208,19 @@ fn unmarshal_tpms_context(bytes: &[u8]) -> Result<tss_esapi::utils::TpmsContext,
         .map_err(|error| error.to_string())
 }
 
-fn hash_algorithm_for_digest_len(len: usize) -> Result<HashingAlgorithm, String> {
+fn hash_algorithm_for_digest_len(len: usize) -> Result<HashAlgorithm, String> {
     match len {
-        32 => Ok(HashingAlgorithm::Sha256),
-        48 => Ok(HashingAlgorithm::Sha384),
-        64 => Ok(HashingAlgorithm::Sha512),
+        32 => Ok(HashAlgorithm::Sha256),
+        48 => Ok(HashAlgorithm::Sha384),
+        64 => Ok(HashAlgorithm::Sha512),
         other => Err(format!(
             "unsupported digest length {other}; expected 32, 48, or 64 bytes"
         )),
     }
 }
 
-fn null_hashcheck_ticket() -> Result<HashcheckTicket, String> {
-    HashcheckTicket::try_from(TPMT_TK_HASHCHECK {
-        tag: StructureTag::Hashcheck.into(),
-        hierarchy: TPM2_RH_NULL,
-        digest: TPM2B_DIGEST {
-            size: 0,
-            buffer: [0; 64],
-        },
-    })
-    .map_err(|error| error.to_string())
-}
-
-fn signature_to_raw_ecdsa(signature: Signature) -> Result<Vec<u8>, String> {
-    let ecc = match signature {
-        Signature::EcDsa(signature) => signature,
-        other => return Err(format!("expected ECDSA signature, got {other:?}")),
-    };
-
-    let mut out = Vec::with_capacity(64);
-    append_padded_scalar(&mut out, ecc.signature_r().value())?;
-    append_padded_scalar(&mut out, ecc.signature_s().value())?;
-    Ok(out)
-}
-
-fn append_padded_scalar(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
-    if value.len() > 32 {
-        return Err(format!(
-            "ECDSA scalar too large for P-256: {} bytes",
-            value.len()
-        ));
-    }
-    out.resize(out.len() + (32 - value.len()), 0);
-    out.extend_from_slice(value);
-    Ok(())
-}
-
 fn sign_with_tpm(key: &KeyObject, digest: &[u8]) -> Result<Vec<u8>, String> {
     let hash_algorithm = hash_algorithm_for_digest_len(digest.len())?;
-    let digest = Digest::try_from(digest.to_vec()).map_err(|error| error.to_string())?;
-    let scheme = SignatureScheme::EcDsa {
-        hash_scheme: HashScheme::new(hash_algorithm),
-    };
-    let validation = null_hashcheck_ticket()?;
 
     let mut context = TpmContext::new(tcti_name_conf()?).map_err(|error| error.to_string())?;
     let object = load_signing_key(&mut context, &key.key_ref)?;
@@ -269,14 +229,11 @@ fn sign_with_tpm(key: &KeyObject, digest: &[u8]) -> Result<Vec<u8>, String> {
         .tr_set_auth(object, auth)
         .map_err(|error| error.to_string())?;
 
+    // PKCS#11 still owns object/session/attribute glue above, but the TPM digest signing
+    // operation is shared with tpmctl-core so TPM scheme, ticket, and P1363 encoding stay aligned.
     let key_handle = tss_esapi::handles::KeyHandle::from(object);
-    let signature = context
-        .execute_with_session(Some(AuthSession::Password), |ctx| {
-            ctx.sign(key_handle, digest, scheme, validation)
-        })
-        .map_err(|error| error.to_string())?;
-
-    signature_to_raw_ecdsa(signature)
+    tpmctl_core::tpm::sign_digest(&mut context, key_handle, digest, hash_algorithm)
+        .map_err(|error| error.to_string())
 }
 
 fn space_pad<const N: usize>(value: &str) -> [u8; N] {
@@ -857,6 +814,9 @@ extern "C" fn c_sign_init(
         let Some(session_state) = state.sessions.get_mut(&session) else {
             return CKR_SESSION_HANDLE_INVALID;
         };
+        if let Err(rv) = require_private_key_login(session_state, kind) {
+            return rv;
+        }
         session_state.sign_key = Some(key);
         CKR_OK
     })
@@ -884,6 +844,9 @@ extern "C" fn c_sign(
         };
         if kind != ObjectKind::Private {
             return CKR_KEY_HANDLE_INVALID;
+        }
+        if let Err(rv) = require_private_key_login(session_state, kind) {
+            return rv;
         }
         let digest = if data_len == 0 {
             &[][..]
@@ -927,6 +890,50 @@ extern "C" fn c_sign_final(
     _signature_len: CK_ULONG_PTR,
 ) -> CK_RV {
     CKR_FUNCTION_NOT_SUPPORTED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn install_test_private_key(logged_in: bool) -> (CK_SESSION_HANDLE, CK_OBJECT_HANDLE) {
+        let session = 7;
+        with_state(|state| {
+            state.objects = vec![KeyObject {
+                label: "test-key".to_string(),
+                id: b"test-key".to_vec(),
+                key_ref: TpmKeyRef::Persistent(TpmHandle::try_from(0x8100_0001).unwrap()),
+                ec_point_der: Vec::new(),
+            }];
+            state.sessions.clear();
+            state.sessions.insert(
+                session,
+                SessionState {
+                    logged_in,
+                    ..SessionState::default()
+                },
+            );
+        });
+        (session, private_handle(0))
+    }
+
+    #[test]
+    fn sign_init_requires_login_for_private_key() {
+        let (session, key) = install_test_private_key(false);
+        let mut mechanism = CK_MECHANISM {
+            mechanism: CKM_ECDSA,
+            pParameter: ptr::null_mut(),
+            ulParameterLen: 0,
+        };
+
+        assert_eq!(
+            c_sign_init(session, &mut mechanism, key),
+            CKR_USER_NOT_LOGGED_IN
+        );
+
+        let (session, key) = install_test_private_key(true);
+        assert_eq!(c_sign_init(session, &mut mechanism, key), CKR_OK);
+    }
 }
 
 static FUNCTION_LIST: CK_FUNCTION_LIST = CK_FUNCTION_LIST {
