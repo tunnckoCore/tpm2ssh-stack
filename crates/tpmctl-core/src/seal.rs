@@ -1,34 +1,62 @@
-use crate::{KeyId, Result, store::StoreConfig, tpm::TctiConfig};
+use crate::{InputMaterial, ObjectSelector, Result, ensure_selector, tpm_todo};
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SealRequest {
-    pub id: KeyId,
-    pub plaintext: Vec<u8>,
-    pub store: StoreConfig,
-    pub tcti: TctiConfig,
+    pub target: ObjectSelector,
+    pub input: InputMaterial,
+    pub force: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SealResponse {
-    pub id: KeyId,
+    pub target: ObjectSelector,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnsealRequest {
-    pub id: KeyId,
-    pub store: StoreConfig,
-    pub tcti: TctiConfig,
+    pub selector: ObjectSelector,
+    pub force_stdout: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnsealResponse {
-    pub plaintext: Vec<u8>,
+    pub secret: Vec<u8>,
 }
 
-pub fn seal(_request: SealRequest) -> Result<SealResponse> {
-    Err(crate::TpmctlError::NotImplemented("seal::seal"))
+impl SealRequest {
+    pub fn validate(&self) -> Result<()> {
+        ensure_selector(&self.target)
+    }
 }
 
-pub fn unseal(_request: UnsealRequest) -> Result<UnsealResponse> {
-    Err(crate::TpmctlError::NotImplemented("seal::unseal"))
+impl UnsealRequest {
+    pub fn validate(&self) -> Result<()> {
+        ensure_selector(&self.selector)
+    }
+}
+
+/// Seal arbitrary bytes to a TPM object, storing by ID or persistent handle.
+///
+/// TODO(tss-esapi): create sealed data object under the owner primary, persist
+/// with EvictControl for handles or save public/private blobs and metadata for IDs.
+pub fn seal(request: SealRequest) -> Result<SealResponse> {
+    request.validate()?;
+    let mut bytes = request.input.read_all()?;
+    bytes.zeroize();
+    tpm_todo("seal: TPM sealed-data object create/store integration")
+}
+
+/// Unseal arbitrary bytes from a TPM sealed object.
+///
+/// TODO(tss-esapi): load sealed object by ID/handle, call Unseal, return bytes;
+/// caller owns output destination and TTY policy.
+pub fn unseal(request: UnsealRequest) -> Result<UnsealResponse> {
+    request.validate()?;
+    tpm_todo("unseal: TPM Unseal integration")
+}
+
+pub fn zeroize_unsealed(response: &mut UnsealResponse) {
+    response.secret.zeroize();
 }

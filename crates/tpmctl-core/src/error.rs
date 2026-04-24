@@ -19,6 +19,21 @@ pub enum TpmctlError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("validation error: {0}")]
+    Validation(String),
+
+    #[error("unsupported format {format:?} for {operation}")]
+    UnsupportedFormat {
+        operation: &'static str,
+        format: crate::OutputFormat,
+    },
+
+    #[error("TPM integration not yet wired: {0}")]
+    TpmTodo(&'static str),
+
+    #[error("invalid key material: {0}")]
+    InvalidKeyMaterial(String),
+
     #[error("invalid persistent handle `{input}`: {reason}")]
     InvalidPersistentHandle { input: String, reason: String },
 
