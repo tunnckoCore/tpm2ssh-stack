@@ -86,6 +86,39 @@ pub fn resolve_tcti_name_conf() -> Result<TctiNameConf> {
     TctiResolution::from_environment().to_name_conf()
 }
 
+pub fn tcti_name_conf_from_env() -> std::result::Result<TctiNameConf, String> {
+    resolve_tcti_name_conf().map_err(|error| error.to_string())
+}
+
+pub fn parse_tpm_handle_literal(value: &str) -> std::result::Result<Option<TpmHandle>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("empty TPM handle".to_owned());
+    }
+
+    let parsed = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        Some(u32::from_str_radix(hex, 16).map_err(|error| error.to_string())?)
+    } else if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(
+            trimmed
+                .parse::<u32>()
+                .map_err(|error: std::num::ParseIntError| error.to_string())?,
+        )
+    } else {
+        None
+    };
+
+    match parsed {
+        Some(raw) => TpmHandle::try_from(raw)
+            .map(Some)
+            .map_err(|error| format!("unsupported TPM handle {trimmed}: {error}")),
+        None => Ok(None),
+    }
+}
+
 pub fn resolve_tcti(override_value: Option<&str>) -> Result<String> {
     if let Some(value) = override_value {
         if value.trim().is_empty() {
