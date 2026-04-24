@@ -1,0 +1,14 @@
+[package]
+name = "tpmctl-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.22"
+hex = "0.4"
+hmac-crate = { package = "hmac", version = "0.12" }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+sha2 = "0.10"
+zeroize = "1"

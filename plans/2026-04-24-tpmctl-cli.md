@@ -660,12 +660,12 @@ Checklist:
 
 ## Output and Encoding Rules
 
-- [ ] `sign --format hex` means `hex(raw r||s)`.
-- [ ] `sign --format raw` means P1363 `r || s`.
-- [ ] `sign --format der` means ASN.1 DER ECDSA signature.
+- [x] `sign --format hex` means `hex(raw r||s)`.
+- [x] `sign --format raw` means P1363 `r || s`.
+- [x] `sign --format der` means ASN.1 DER ECDSA signature.
 - [ ] Ed25519 signature `raw` is 64 bytes.
 - [ ] Ed25519 signature `hex` is hex of the 64-byte signature.
-- [ ] `pubkey --format hex` means `hex(raw public key bytes)`.
+- [x] `pubkey --format hex` means `hex(raw public key bytes)`.
 - [ ] p256 and secp256k1 raw public keys default to uncompressed SEC1 points.
 - [ ] Ethereum address output is EIP-55 checksummed text.
 - [ ] Binary stdout to TTY should be rejected unless `--force` is provided.
@@ -753,14 +753,14 @@ Implementation should be run by five subagents working in separate git worktrees
 
 #### Agent 04 — TPM Commands
 
-- [ ] `cargo check -p tpmctl-core` succeeds.
-- [ ] `cargo test -p tpmctl-core sign` passes.
-- [ ] `cargo test -p tpmctl-core pubkey` passes.
-- [ ] `cargo test -p tpmctl-core output` passes.
-- [ ] `keygen` supports `sign`, `ecdh`, and `hmac` usages.
-- [ ] `sign` supports DER, raw P1363, and hex P1363 output.
-- [ ] `pubkey` supports raw, hex, PEM, DER, and SSH output.
-- [ ] `ecdh`, `hmac`, `seal`, and `unseal` validate expected key/object usage.
+- [x] `cargo check -p tpmctl-core` succeeds.
+- [x] `cargo test -p tpmctl-core sign` passes.
+- [x] `cargo test -p tpmctl-core pubkey` passes.
+- [x] `cargo test -p tpmctl-core output` passes.
+- [x] `keygen` supports `sign`, `ecdh`, and `hmac` usages.
+- [x] `sign` supports DER, raw P1363, and hex P1363 output.
+- [x] `pubkey` supports raw, hex, PEM, DER, and SSH output.
+- [x] `ecdh`, `hmac`, `seal`, and `unseal` validate expected key/object usage.
 
 #### Agent 05 — Derived Crypto, PKCS#11, Tests, Docs
 
@@ -872,36 +872,36 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 6 — Public key export
 
-- [ ] Export raw ECC SEC1 bytes.
-- [ ] Export hex raw key.
-- [ ] Export PEM SPKI.
-- [ ] Export DER SPKI.
-- [ ] Export OpenSSH key line.
-- [ ] Reject non-asymmetric keys.
+- [x] Export raw ECC SEC1 bytes.
+- [x] Export hex raw key.
+- [x] Export PEM SPKI.
+- [x] Export DER SPKI.
+- [x] Export OpenSSH key line.
+- [x] Reject non-asymmetric keys.
 
 ### Phase 7 — TPM signing
 
-- [ ] Implement input hashing.
-- [ ] Implement digest validation.
+- [x] Implement input hashing.
+- [x] Implement digest validation.
 - [ ] Call TPM `Sign`.
-- [ ] Encode DER.
-- [ ] Encode raw P1363.
-- [ ] Encode hex P1363.
+- [x] Encode DER.
+- [x] Encode raw P1363.
+- [x] Encode hex P1363.
 
 ### Phase 8 — ECDH
 
-- [ ] Parse peer public key.
-- [ ] Validate local key usage.
+- [x] Parse peer public key.
+- [x] Validate local key usage.
 - [ ] Call `ECDH_ZGen`.
-- [ ] Encode raw/hex output.
+- [x] Encode raw/hex output.
 
 ### Phase 9 — HMAC
 
-- [ ] Validate HMAC key usage.
+- [x] Validate HMAC key usage.
 - [ ] Implement one-shot HMAC.
 - [ ] Implement sequence HMAC for large input.
-- [ ] Encode raw/hex output.
-- [ ] Support `--hash`.
+- [x] Encode raw/hex output.
+- [x] Support `--hash`.
 
 ### Phase 10 — Seal/unseal
 
@@ -946,7 +946,7 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 14 — Tests and docs
 
-- [ ] Unit-test format encoders.
+- [x] Unit-test format encoders.
 - [ ] Unit-test ID path safety.
 - [ ] Unit-test CLI parser validation.
 - [ ] Unit-test secp256k1 scalar derivation retry behavior.

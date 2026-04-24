@@ -1,0 +1,110 @@
+use zeroize::Zeroizing;
+
+use crate::{
+    HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result, unsupported_without_tpm,
+};
+
+use crate::output::{SignatureFormat, encode_p256_signature};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SignRequest {
+    pub selector: ObjectSelector,
+    pub input: SignInput,
+    pub hash: HashAlgorithm,
+    pub format: SignatureFormat,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SignInput {
+    Message(Vec<u8>),
+    Digest(Vec<u8>),
+}
+
+impl SignRequest {
+    pub fn digest(&self) -> Result<Zeroizing<Vec<u8>>> {
+        match &self.input {
+            SignInput::Message(message) => Ok(Zeroizing::new(self.hash.digest(message))),
+            SignInput::Digest(digest) => {
+                self.hash.validate_digest(digest)?;
+                Ok(Zeroizing::new(digest.clone()))
+            }
+        }
+    }
+
+    pub fn validate_descriptor(&self, descriptor: &ObjectDescriptor) -> Result<()> {
+        descriptor.require_usage(KeyUsage::Sign)
+    }
+
+    pub fn execute(&self) -> Result<Vec<u8>> {
+        self.digest()?;
+        Err(unsupported_without_tpm("sign"))
+    }
+}
+
+pub fn encode_tpm_p256_signature(p1363: &[u8], format: SignatureFormat) -> Result<Vec<u8>> {
+    encode_p256_signature(p1363, format)
+}
+
+#[cfg(test)]
+mod sign_tests {
+    use super::*;
+    use crate::{PersistentHandle, output::SignatureFormat};
+
+    fn selector() -> ObjectSelector {
+        ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap())
+    }
+
+    #[test]
+    fn sign_hashes_input_with_requested_hash() {
+        let request = SignRequest {
+            selector: selector(),
+            input: SignInput::Message(b"hello".to_vec()),
+            hash: HashAlgorithm::Sha256,
+            format: SignatureFormat::Der,
+        };
+        assert_eq!(request.digest().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn sign_validates_digest_length_against_hash() {
+        let request = SignRequest {
+            selector: selector(),
+            input: SignInput::Digest(vec![0; 31]),
+            hash: HashAlgorithm::Sha256,
+            format: SignatureFormat::Der,
+        };
+        assert!(request.digest().is_err());
+    }
+
+    #[test]
+    fn sign_supports_der_raw_and_hex_p1363_output() {
+        let mut p1363 = vec![0_u8; 64];
+        p1363[31] = 1;
+        p1363[63] = 2;
+
+        assert_eq!(
+            encode_tpm_p256_signature(&p1363, SignatureFormat::Raw).unwrap(),
+            p1363
+        );
+        assert_eq!(
+            encode_tpm_p256_signature(&p1363, SignatureFormat::Hex).unwrap(),
+            hex::encode(&p1363).into_bytes()
+        );
+        assert_eq!(
+            encode_tpm_p256_signature(&p1363, SignatureFormat::Der).unwrap(),
+            vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn sign_execute_reports_tpm_unavailable_without_foundation() {
+        let request = SignRequest {
+            selector: selector(),
+            input: SignInput::Digest(vec![0; 32]),
+            hash: HashAlgorithm::Sha256,
+            format: SignatureFormat::Der,
+        };
+        let error = request.execute().unwrap_err();
+        assert!(error.to_string().contains("TPM unavailable"));
+    }
+}
