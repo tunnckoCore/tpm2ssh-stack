@@ -1,6 +1,6 @@
 use crate::{
     args::{CliError, EcdhArgs},
-    commands::io::{read_input, selector_from_material, write_output},
+    commands::io::{read_input, selector_from_material, write_output_with_force},
 };
 use tpmctl_core::{ecdh as core_ecdh, pubkey::PublicKeyInput};
 
@@ -14,7 +14,7 @@ pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &EcdhArgs) -> Result<(), 
     let store = tpmctl_core::Store::new(runtime.store.root);
     let bytes = request.execute(&store)?;
     let output: tpmctl_core::OutputTarget = (&args.output).into();
-    write_output(&output, &bytes)?;
+    write_output_with_force(&output, &bytes, args.force)?;
     Ok(())
 }
 

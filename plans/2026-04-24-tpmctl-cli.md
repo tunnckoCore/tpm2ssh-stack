@@ -956,6 +956,9 @@ TEST_TCTI=swtpm cargo test --workspace --features simulator-tests
 
 ### Phase 14 — Tests and docs
 
+- [x] Reject existing CLI output files unless `--force` is provided.
+- [x] Keep CLI derive/HMAC commands thin over typed core API wrappers.
+- [x] Use correct prehash signing semantics for derived p256/secp256k1 `--digest` signing.
 - [x] Unit-test format encoders.
 - [x] Unit-test ID path safety.
 - [x] Unit-test CLI parser validation.

@@ -1,6 +1,6 @@
 use crate::{
     args::{CliError, SignArgs},
-    commands::io::{read_input, selector_from_material, write_output},
+    commands::io::{read_input, selector_from_material, write_output_with_force},
 };
 use tpmctl_core::sign as core_sign;
 
@@ -22,7 +22,7 @@ pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &SignArgs) -> Result<(), 
     let store = tpmctl_core::Store::new(runtime.store.root);
     let bytes = request.execute(&store)?;
     let output: tpmctl_core::OutputTarget = (&args.output).into();
-    write_output(&output, &bytes)?;
+    write_output_with_force(&output, &bytes, args.force)?;
     Ok(())
 }
 

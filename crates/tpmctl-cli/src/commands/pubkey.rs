@@ -1,6 +1,6 @@
 use crate::{
     args::{CliError, PubkeyArgs},
-    commands::io::{selector_from_material, write_output},
+    commands::io::{selector_from_material, write_output_with_force},
 };
 use tpmctl_core::{
     EccPublicKey, KeyUsage, MaterialRef, ObjectDescriptor, ObjectSelector, RegistryId, Store,
@@ -21,7 +21,7 @@ pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &PubkeyArgs) -> Result<()
         }
     };
     let output: tpmctl_core::OutputTarget = (&args.output).into();
-    write_output(&output, &bytes)?;
+    write_output_with_force(&output, &bytes, args.force)?;
     Ok(())
 }
 

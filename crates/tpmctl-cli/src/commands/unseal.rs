@@ -1,6 +1,6 @@
 use crate::{
     args::{CliError, UnsealArgs},
-    commands::io::{selector_from_material, write_output},
+    commands::io::{selector_from_material, write_output_with_force},
 };
 use tpmctl_core::{CommandContext, StoreOptions, seal as core_seal};
 
@@ -17,6 +17,6 @@ pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &UnsealArgs) -> Result<()
     };
     let bytes = request.execute_with_context(&command)?;
     let output: tpmctl_core::OutputTarget = (&args.output).into();
-    write_output(&output, &bytes)?;
+    write_output_with_force(&output, &bytes, args.force)?;
     Ok(())
 }

@@ -145,6 +145,8 @@ pub enum DeriveError {
     ScalarExhausted(u32),
     #[error("Ed25519 signing does not accept --hash in v1")]
     HashNotAllowedForEd25519Sign,
+    #[error("invalid ECDSA prehash")]
+    InvalidPrehash,
 }
 
 const HKDF_SALT: &[u8] = b"tpmctl derived software key v1";
