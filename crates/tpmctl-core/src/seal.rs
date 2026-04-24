@@ -1,42 +1,97 @@
-/// Request to create a sealed TPM object.
+use zeroize::Zeroizing;
+
+use crate::{Error, KeyUsage, ObjectDescriptor, ObjectSelector, Result, unsupported_without_tpm};
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SealRequest {
-    pub id: Option<String>,
-    pub handle: Option<crate::PersistentHandle>,
+    pub selector: ObjectSelector,
     pub input: Vec<u8>,
     pub force: bool,
 }
 
-/// Result of creating a sealed TPM object.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SealResponse {
-    pub id: Option<String>,
-    pub handle: Option<crate::PersistentHandle>,
+impl SealRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.input.is_empty() {
+            return Err(Error::invalid("input", "sealed input cannot be empty"));
+        }
+        Ok(())
+    }
+
+    pub fn execute(&self) -> Result<SealResult> {
+        self.validate()?;
+        Err(unsupported_without_tpm("seal"))
+    }
 }
 
-/// Request to unseal a TPM object.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SealResult {
+    pub selector: ObjectSelector,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UnsealRequest {
-    pub object: crate::IdentityRef,
-    pub format: crate::OutputFormat,
+    pub selector: ObjectSelector,
+    pub force_binary_stdout: bool,
 }
 
-/// Unsealed output.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct UnsealResponse {
-    pub secret: crate::EncodedOutput,
+impl UnsealRequest {
+    pub fn validate_descriptor(&self, descriptor: &ObjectDescriptor) -> Result<()> {
+        descriptor.require_usage(KeyUsage::Sealed)
+    }
+
+    pub fn execute(&self) -> Result<Zeroizing<Vec<u8>>> {
+        Err(unsupported_without_tpm("unseal"))
+    }
 }
 
-pub fn seal(
-    _context: &crate::CommandContext,
-    _request: SealRequest,
-) -> crate::Result<SealResponse> {
-    Err(crate::Error::unsupported("seal::seal"))
-}
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+    use crate::{PersistentHandle, RegistryId};
 
-pub fn unseal(
-    _context: &crate::CommandContext,
-    _request: UnsealRequest,
-) -> crate::Result<UnsealResponse> {
-    Err(crate::Error::unsupported("seal::unseal"))
+    fn selector() -> ObjectSelector {
+        ObjectSelector::Id(RegistryId::new("org/acme/alice/sealed/foo").unwrap())
+    }
+
+    #[test]
+    fn seal_requires_non_empty_input() {
+        let request = SealRequest {
+            selector: selector(),
+            input: Vec::new(),
+            force: false,
+        };
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn unseal_validates_expected_object_usage() {
+        let request = UnsealRequest {
+            selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0020).unwrap()),
+            force_binary_stdout: false,
+        };
+        let descriptor = ObjectDescriptor {
+            selector: selector(),
+            usage: KeyUsage::Sealed,
+            curve: None,
+            hash: None,
+            public_key: None,
+        };
+        assert!(request.validate_descriptor(&descriptor).is_ok());
+    }
+
+    #[test]
+    fn unseal_rejects_non_sealed_usage() {
+        let request = UnsealRequest {
+            selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0020).unwrap()),
+            force_binary_stdout: false,
+        };
+        let descriptor = ObjectDescriptor {
+            selector: selector(),
+            usage: KeyUsage::Hmac,
+            curve: None,
+            hash: None,
+            public_key: None,
+        };
+        assert!(request.validate_descriptor(&descriptor).is_err());
+    }
 }

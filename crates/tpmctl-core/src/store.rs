@@ -159,6 +159,10 @@ impl RegistryCollection {
 pub struct RegistryId(String);
 
 impl RegistryId {
+    pub fn new(input: impl Into<String>) -> Result<Self> {
+        Self::parse(input.into())
+    }
+
     pub fn parse(input: impl AsRef<str>) -> Result<Self> {
         let input = input.as_ref();
         validate_registry_id(input)?;
@@ -171,6 +175,10 @@ impl RegistryId {
 
     pub fn as_relative_path(&self) -> PathBuf {
         self.0.split('/').collect()
+    }
+
+    pub fn ssh_comment(&self) -> String {
+        self.0.replace('/', "_")
     }
 }
 

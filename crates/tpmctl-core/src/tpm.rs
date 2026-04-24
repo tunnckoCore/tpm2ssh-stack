@@ -139,6 +139,12 @@ impl PersistentHandle {
     }
 }
 
+impl std::hash::Hash for PersistentHandle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
+    }
+}
+
 impl std::fmt::Display for PersistentHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "0x{:08x}", self.raw)

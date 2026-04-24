@@ -11,6 +11,9 @@ pub enum CoreError {
     #[error("invalid {field}: {reason}")]
     InvalidInput { field: &'static str, reason: String },
 
+    #[error("TPM unavailable: {0}")]
+    TpmUnavailable(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 
@@ -59,11 +62,19 @@ impl CoreError {
         Self::Unsupported { operation }
     }
 
-    pub fn invalid_input(field: &'static str, reason: impl Into<String>) -> Self {
+    pub fn invalid(field: &'static str, reason: impl Into<String>) -> Self {
         Self::InvalidInput {
             field,
             reason: reason.into(),
         }
+    }
+
+    pub fn invalid_input(field: &'static str, reason: impl Into<String>) -> Self {
+        Self::invalid(field, reason)
+    }
+
+    pub fn tpm_unavailable(message: impl Into<String>) -> Self {
+        Self::TpmUnavailable(message.into())
     }
 
     pub fn tpm(operation: &'static str, source: tss_esapi::Error) -> Self {
