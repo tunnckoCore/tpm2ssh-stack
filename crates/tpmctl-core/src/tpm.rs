@@ -4,16 +4,21 @@ use tss_esapi::{
     Context,
     handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
     interface_types::{
-        dynamic_handles::Persistent, resource_handles::Provision, session_handles::AuthSession,
+        algorithm::HashingAlgorithm,
+        dynamic_handles::Persistent,
+        key_bits::RsaKeyBits,
+        resource_handles::{Hierarchy, Provision},
+        session_handles::AuthSession,
     },
-    structures::{Name, Private, Public},
+    structures::{Name, Private, Public, RsaExponent, SymmetricDefinitionObject},
     tcti_ldr::{DeviceConfig, TctiNameConf},
     traits::{Marshall, UnMarshall},
+    utils::create_restricted_decryption_rsa_public,
 };
 
 use crate::{
-    CoreError, Result,
-    store::{RegistryCollection, RegistryId, Store, StoreOptions, StoredObjectEntry},
+    CoreError, EccCurve, Error, HashAlgorithm, ObjectDescriptor, ObjectSelector, Result,
+    store::{ObjectUsage, RegistryCollection, RegistryId, Store, StoreOptions, StoredObjectEntry},
 };
 
 /// Shared execution context passed from frontends into core operations.
@@ -136,6 +141,49 @@ pub fn resolve_tcti(override_value: Option<&str>) -> Result<String> {
 pub fn create_context() -> Result<Context> {
     let tcti = resolve_tcti_name_conf()?;
     Context::new(tcti).map_err(|source| CoreError::tpm("Context::new", source))
+}
+
+pub fn create_context_with_tcti(override_value: Option<&str>) -> Result<Context> {
+    let tcti = match override_value {
+        Some(value) if value.trim().is_empty() => {
+            return Err(CoreError::Tcti("TCTI override is empty".into()));
+        }
+        Some(value) => value.parse::<TctiNameConf>().map_err(|source| {
+            CoreError::Tcti(format!(
+                "failed to parse TCTI override {value:?} as a TCTI configuration: {source}"
+            ))
+        })?,
+        None => resolve_tcti_name_conf()?,
+    };
+    Context::new(tcti).map_err(|source| CoreError::tpm("Context::new", source))
+}
+
+pub fn create_context_for(command: &CommandContext) -> Result<Context> {
+    create_context_with_tcti(command.tcti.as_deref())
+}
+
+pub fn hashing_algorithm(hash: HashAlgorithm) -> HashingAlgorithm {
+    match hash {
+        HashAlgorithm::Sha256 => HashingAlgorithm::Sha256,
+        HashAlgorithm::Sha384 => HashingAlgorithm::Sha384,
+        HashAlgorithm::Sha512 => HashingAlgorithm::Sha512,
+    }
+}
+
+pub fn create_owner_primary(context: &mut Context) -> Result<KeyHandle> {
+    let public = create_restricted_decryption_rsa_public(
+        SymmetricDefinitionObject::AES_128_CFB,
+        RsaKeyBits::Rsa2048,
+        RsaExponent::ZERO_EXPONENT,
+    )
+    .map_err(|source| CoreError::tpm("build owner primary template", source))?;
+
+    context
+        .execute_with_nullauth_session(|ctx| {
+            ctx.create_primary(Hierarchy::Owner, public, None, None, None, None)
+        })
+        .map(|result| result.key_handle)
+        .map_err(|source| CoreError::tpm("CreatePrimary", source))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -293,6 +341,18 @@ pub fn load_key_from_registry(
     load_object_from_registry(context, store, RegistryCollection::Keys, id, parent_handle)
 }
 
+pub fn load_key_from_registry_with_descriptor(
+    context: &mut Context,
+    store: &Store,
+    id: &RegistryId,
+    parent_handle: KeyHandle,
+) -> Result<(KeyHandle, ObjectDescriptor)> {
+    let entry = store.load_entry(RegistryCollection::Keys, id)?;
+    let descriptor = descriptor_from_registry_entry(RegistryCollection::Keys, id, &entry)?;
+    let handle = load_object_from_blobs(context, parent_handle, &ObjectBlobs::from_entry(&entry))?;
+    Ok((handle, descriptor))
+}
+
 pub fn load_sealed_from_registry(
     context: &mut Context,
     store: &Store,
@@ -306,6 +366,18 @@ pub fn load_sealed_from_registry(
         id,
         parent_handle,
     )
+}
+
+pub fn load_sealed_from_registry_with_descriptor(
+    context: &mut Context,
+    store: &Store,
+    id: &RegistryId,
+    parent_handle: KeyHandle,
+) -> Result<(KeyHandle, ObjectDescriptor)> {
+    let entry = store.load_entry(RegistryCollection::Sealed, id)?;
+    let descriptor = descriptor_from_registry_entry(RegistryCollection::Sealed, id, &entry)?;
+    let handle = load_object_from_blobs(context, parent_handle, &ObjectBlobs::from_entry(&entry))?;
+    Ok((handle, descriptor))
 }
 
 pub fn load_persistent_object(
@@ -340,6 +412,91 @@ pub fn persist_object(
             )
         })
         .map_err(|source| CoreError::tpm("EvictControl", source))
+}
+
+pub fn descriptor_from_registry_entry(
+    collection: RegistryCollection,
+    id: &RegistryId,
+    entry: &StoredObjectEntry,
+) -> Result<ObjectDescriptor> {
+    let usage = key_usage_from_metadata(entry.metadata.usage);
+    let expected_kind = match collection {
+        RegistryCollection::Keys => crate::store::StoredObjectKind::Key,
+        RegistryCollection::Sealed => crate::store::StoredObjectKind::Sealed,
+    };
+    if entry.metadata.kind != expected_kind {
+        return Err(Error::invalid(
+            "kind",
+            format!(
+                "registry entry {id} is {:?}, expected {:?}",
+                entry.metadata.kind, expected_kind
+            ),
+        ));
+    }
+
+    Ok(ObjectDescriptor {
+        selector: ObjectSelector::Id(id.clone()),
+        usage,
+        curve: entry
+            .metadata
+            .curve
+            .as_deref()
+            .map(curve_from_metadata)
+            .transpose()?,
+        hash: entry.metadata.hash.as_deref().map(str::parse).transpose()?,
+        public_key: None,
+    })
+}
+
+pub fn descriptor_from_public(
+    selector: ObjectSelector,
+    public: &Public,
+) -> Result<ObjectDescriptor> {
+    let usage = match public {
+        Public::KeyedHash {
+            object_attributes, ..
+        } if object_attributes.sign_encrypt() => crate::KeyUsage::Hmac,
+        Public::KeyedHash { .. } => crate::KeyUsage::Sealed,
+        Public::Ecc { .. } | Public::Rsa { .. } => {
+            return Err(Error::invalid(
+                "usage",
+                "object is not a keyed-hash HMAC key or sealed data object",
+            ));
+        }
+        Public::SymCipher { .. } => {
+            return Err(Error::invalid(
+                "usage",
+                "symmetric-cipher objects are not supported by this operation",
+            ));
+        }
+    };
+
+    Ok(ObjectDescriptor {
+        selector,
+        usage,
+        curve: None,
+        hash: None,
+        public_key: None,
+    })
+}
+
+fn key_usage_from_metadata(usage: ObjectUsage) -> crate::KeyUsage {
+    match usage {
+        ObjectUsage::Sign => crate::KeyUsage::Sign,
+        ObjectUsage::Ecdh => crate::KeyUsage::Ecdh,
+        ObjectUsage::Hmac => crate::KeyUsage::Hmac,
+        ObjectUsage::Sealed => crate::KeyUsage::Sealed,
+    }
+}
+
+fn curve_from_metadata(curve: &str) -> Result<EccCurve> {
+    match curve {
+        "p256" | "P-256" | "nistp256" => Ok(EccCurve::P256),
+        other => Err(Error::invalid(
+            "curve",
+            format!("unsupported curve in registry metadata: {other:?}"),
+        )),
+    }
 }
 
 fn invalid_handle(input: &str, reason: impl Into<String>) -> CoreError {
