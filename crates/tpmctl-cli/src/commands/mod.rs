@@ -5,6 +5,7 @@ use crate::args::{Cli, CliError, Command};
 pub mod derive;
 pub mod ecdh;
 pub mod hmac;
+mod io;
 pub mod keygen;
 pub mod pubkey;
 pub mod seal;

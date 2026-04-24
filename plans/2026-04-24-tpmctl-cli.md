@@ -774,6 +774,16 @@ Implementation should be run by five subagents working in separate git worktrees
 - [x] Secret/scalar/seed/intermediate buffers use `zeroize` where practical.
 - [x] README documents core library, CLI crate, PKCS#11 crate, runtime packages, and derived-key software model.
 
+#### Agent 09 — CLI Real I/O Corrective Wave
+
+- [x] Replaced assigned CLI command placeholder adapters with command handlers that read files/stdin, call typed `tpmctl-core` domain APIs, and write returned bytes/results.
+- [x] Implemented `-` stdin/stdout handling through shared CLI I/O helpers.
+- [x] Implemented `--output` file writing for output-producing command handlers.
+- [x] Preserved primary output on stdout and diagnostics/warnings on stderr, including derive-without-label warnings.
+- [x] Implemented JSON success output wiring for `keygen`, `seal`, and HMAC sealing results when the core operation succeeds.
+- [x] Removed unused placeholder `Unsupported` root command adapters from `tpmctl-core/src/lib.rs`; CLI now dispatches to domain modules directly.
+- [x] Added CLI unit tests for parser validation, I/O helpers, peer public key input parsing, and digest-file validation/output wiring behavior.
+
 ### Final Integration Gate
 
 All subagents must run all checks and tests and make sure they are passing:

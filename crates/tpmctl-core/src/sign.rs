@@ -34,6 +34,7 @@ impl SignRequest {
     }
 
     pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
+        let digest = self.digest()?;
         let mut context = crate::tpm::create_context()?;
         let loaded = match &self.selector {
             ObjectSelector::Id(id) => crate::tpm::load_key_by_id(&mut context, store, id)?,
@@ -42,7 +43,6 @@ impl SignRequest {
             }
         };
         self.validate_descriptor(&loaded.descriptor)?;
-        let digest = self.digest()?;
         let p1363 = crate::tpm::sign_digest(&mut context, loaded.handle, &digest, self.hash)?;
         encode_tpm_p256_signature(&p1363, self.format)
     }

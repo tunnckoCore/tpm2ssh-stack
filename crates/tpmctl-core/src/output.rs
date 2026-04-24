@@ -133,6 +133,28 @@ pub fn encode_p256_signature(p1363: &[u8], format: SignatureFormat) -> Result<Ve
     }
 }
 
+pub fn encode_secp256k1_signature(p1363: &[u8], format: SignatureFormat) -> Result<Vec<u8>> {
+    if p1363.len() != 64 {
+        return Err(Error::invalid(
+            "signature",
+            format!(
+                "secp256k1 ECDSA signatures must be 64-byte P1363 r||s values, got {} bytes",
+                p1363.len()
+            ),
+        ));
+    }
+
+    match format {
+        SignatureFormat::Raw => Ok(p1363.to_vec()),
+        SignatureFormat::Hex => Ok(hex::encode(p1363).into_bytes()),
+        SignatureFormat::Der => {
+            let signature = k256::ecdsa::Signature::from_slice(p1363)
+                .map_err(|error| Error::invalid("signature", error.to_string()))?;
+            Ok(signature.to_der().as_bytes().to_vec())
+        }
+    }
+}
+
 pub fn encode_public_key(
     public_key: &EccPublicKey,
     format: PublicKeyFormat,
