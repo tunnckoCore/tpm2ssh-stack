@@ -8,6 +8,11 @@ use crate::{
 
 use crate::output::{SignatureFormat, encode_p256_signature};
 
+/// Request for signing bytes with a TPM-backed P-256 signing key.
+///
+/// `SignInput::Message` accepts arbitrary bytes and hashes them with `hash` before
+/// asking the TPM to sign. `SignInput::Digest` is for callers that already hashed
+/// their payload; its length is validated against `hash` before signing.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SignRequest {
     pub selector: ObjectSelector,
@@ -16,6 +21,11 @@ pub struct SignRequest {
     pub output_format: SignatureFormat,
 }
 
+/// Byte payload accepted by [`SignRequest`].
+///
+/// Use [`SignInput::Message`] for ordinary byte signing. Use
+/// [`SignInput::Digest`] only when passing a precomputed digest whose size
+/// matches `SignRequest::hash`.
 #[derive(Clone, Eq, PartialEq)]
 pub enum SignInput {
     Message(Zeroizing<Vec<u8>>),
@@ -105,26 +115,68 @@ mod sign_tests {
         ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap())
     }
 
-    #[test]
-    fn sign_hashes_input_with_requested_hash() {
-        let request = SignRequest {
+    fn request(input: SignInput, hash: HashAlgorithm) -> SignRequest {
+        SignRequest {
             selector: selector(),
-            input: SignInput::Message(Zeroizing::new(b"hello".to_vec())),
-            hash: HashAlgorithm::Sha256,
+            input,
+            hash,
             output_format: SignatureFormat::Der,
-        };
-        assert_eq!(request.digest().unwrap().len(), 32);
+        }
     }
 
     #[test]
-    fn sign_validates_digest_length_against_hash() {
-        let request = SignRequest {
-            selector: selector(),
-            input: SignInput::Digest(Zeroizing::new(vec![0; 31])),
-            hash: HashAlgorithm::Sha256,
-            output_format: SignatureFormat::Der,
-        };
-        assert!(request.digest().is_err());
+    fn sign_hashes_message_to_exact_requested_digest() {
+        let cases = [
+            (
+                HashAlgorithm::Sha256,
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            ),
+            (
+                HashAlgorithm::Sha384,
+                "59e1748777448c69de6b800d7a33bbfb9ff1b463e44354c3553bcdb9c666fa90125a3c79f90397bdf5f6a13de828684f",
+            ),
+            (
+                HashAlgorithm::Sha512,
+                "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043",
+            ),
+        ];
+
+        for (hash, expected_hex) in cases {
+            let request = request(SignInput::Message(Zeroizing::new(b"hello".to_vec())), hash);
+            let digest = request.digest().unwrap();
+
+            assert_eq!(digest.len(), hash.digest_len());
+            assert_eq!(hex::encode(&*digest), expected_hex);
+        }
+    }
+
+    #[test]
+    fn sign_uses_direct_digest_without_rehashing_when_length_matches_hash() {
+        let digest = vec![0xA5; HashAlgorithm::Sha384.digest_len()];
+        let request = request(
+            SignInput::Digest(Zeroizing::new(digest.clone())),
+            HashAlgorithm::Sha384,
+        );
+
+        assert_eq!(&*request.digest().unwrap(), digest.as_slice());
+    }
+
+    #[test]
+    fn sign_validates_direct_digest_length_against_hash() {
+        for (hash, invalid_len) in [
+            (
+                HashAlgorithm::Sha256,
+                HashAlgorithm::Sha256.digest_len() - 1,
+            ),
+            (HashAlgorithm::Sha384, HashAlgorithm::Sha256.digest_len()),
+            (HashAlgorithm::Sha512, HashAlgorithm::Sha384.digest_len()),
+        ] {
+            let request = request(
+                SignInput::Digest(Zeroizing::new(vec![0; invalid_len])),
+                hash,
+            );
+            assert!(request.digest().is_err());
+        }
     }
 
     #[test]

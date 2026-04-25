@@ -47,6 +47,7 @@ impl HmacRequest {
         self.validate_descriptor(&descriptor)?;
         let hash = self.effective_hash(Some(&descriptor));
         let output = compute_tpm_hmac(&mut context, object_handle, &self.input, hash)?;
+        drop(context);
 
         match &self.seal_target {
             None => Ok(HmacResult::Output(encode_hmac_output(

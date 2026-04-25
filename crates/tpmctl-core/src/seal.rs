@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 use crate::{
     CommandContext, Error, HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result,
     store::{
-        ObjectUsage, ParentMetadata, RegistryMetadata, Store, StoredObjectEntry, StoredObjectKind,
+        ObjectUsage, ParentRecord, RegistryRecord, Store, StoredObjectEntry, StoredObjectKind,
     },
     tpm,
 };
@@ -112,16 +112,16 @@ pub fn seal_bytes(
         ObjectSelector::Id(id) => {
             let store = Store::resolve(command.store.root.as_deref())?;
             let mut metadata =
-                RegistryMetadata::new(id, StoredObjectKind::Sealed, ObjectUsage::Sealed);
+                RegistryRecord::new(id, StoredObjectKind::Sealed, ObjectUsage::Sealed);
             metadata.hash = hash.map(|hash| hash.to_string());
-            metadata.parent = Some(ParentMetadata {
+            metadata.parent = Some(ParentRecord {
                 hierarchy: "owner".to_string(),
                 template: "rsa2048-restricted-decrypt-aes128cfb-sha256".to_string(),
             });
             metadata.template = Some("keyedhash-sealed-null-sha256".to_string());
 
             let entry = StoredObjectEntry {
-                metadata,
+                record: metadata,
                 public_blob: tpm::marshal_public(&create_result.out_public)?,
                 private_blob: tpm::marshal_private(&create_result.out_private)?,
                 public_pem: None,
@@ -287,7 +287,7 @@ mod seal_tests {
     }
 
     #[test]
-    fn seal_result_carries_optional_hmac_hash_metadata() {
+    fn seal_result_carries_optional_hmac_hash_record() {
         let result = SealResult {
             selector: selector(),
             hash: Some(HashAlgorithm::Sha512),

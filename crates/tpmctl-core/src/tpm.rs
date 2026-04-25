@@ -29,10 +29,10 @@ use tss_esapi::{
     traits::{Marshall, UnMarshall},
     tss2_esys::TPMT_TK_HASHCHECK,
 };
-/// Shared execution context passed from frontends into core operations.
+/// Shared execution context passed into core operations.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct CommandContext {
-    /// Optional store configuration supplied by a frontend.
+    /// Optional store configuration supplied by the caller.
     pub store: StoreOptions,
     /// Optional TCTI override. Environment fallback is handled by TPM helpers.
     pub tcti: Option<String>,
@@ -650,13 +650,13 @@ pub(crate) fn descriptor_from_entry(
     selector: ObjectSelector,
     entry: &StoredObjectEntry,
 ) -> Result<ObjectDescriptor> {
-    let usage = match entry.metadata.usage {
+    let usage = match entry.record.usage {
         ObjectUsage::Sign => KeyUsage::Sign,
         ObjectUsage::Ecdh => KeyUsage::Ecdh,
         ObjectUsage::Hmac => KeyUsage::Hmac,
         ObjectUsage::Sealed => KeyUsage::Sealed,
     };
-    let curve = match entry.metadata.curve.as_deref() {
+    let curve = match entry.record.curve.as_deref() {
         Some("p256" | "P-256" | "nistp256" | "NIST P-256") => Some(crate::EccCurve::P256),
         Some(other) => {
             return Err(CoreError::invalid(
@@ -666,7 +666,7 @@ pub(crate) fn descriptor_from_entry(
         }
         None => None,
     };
-    let hash = match entry.metadata.hash.as_deref() {
+    let hash = match entry.record.hash.as_deref() {
         Some("sha256") => Some(HashAlgorithm::Sha256),
         Some("sha384") => Some(HashAlgorithm::Sha384),
         Some("sha512") => Some(HashAlgorithm::Sha512),
@@ -694,7 +694,7 @@ pub(crate) fn descriptor_from_entry(
 }
 
 fn cached_public_key(entry: &StoredObjectEntry) -> Result<Option<EccPublicKey>> {
-    if let Some(public_key) = &entry.metadata.public_key {
+    if let Some(public_key) = &entry.record.public_key {
         let hex = public_key
             .strip_prefix("hex:")
             .unwrap_or(public_key.as_str());
@@ -716,11 +716,11 @@ fn cached_public_key(entry: &StoredObjectEntry) -> Result<Option<EccPublicKey>> 
 }
 
 fn registry_entry_handle(entry: &StoredObjectEntry) -> Result<Option<PersistentHandle>> {
-    if !entry.metadata.persistent {
+    if !entry.record.persistent {
         return Ok(None);
     }
     entry
-        .metadata
+        .record
         .handle
         .as_deref()
         .map(PersistentHandle::parse)
@@ -858,17 +858,17 @@ pub fn descriptor_from_registry_entry(
     id: &RegistryId,
     entry: &StoredObjectEntry,
 ) -> Result<ObjectDescriptor> {
-    let usage = key_usage_from_metadata(entry.metadata.usage);
+    let usage = key_usage_from_record(entry.record.usage);
     let expected_kind = match collection {
         RegistryCollection::Keys => crate::store::StoredObjectKind::Key,
         RegistryCollection::Sealed => crate::store::StoredObjectKind::Sealed,
     };
-    if entry.metadata.kind != expected_kind {
+    if entry.record.kind != expected_kind {
         return Err(Error::invalid(
             "kind",
             format!(
                 "registry entry {id} is {:?}, expected {:?}",
-                entry.metadata.kind, expected_kind
+                entry.record.kind, expected_kind
             ),
         ));
     }
@@ -877,12 +877,12 @@ pub fn descriptor_from_registry_entry(
         selector: ObjectSelector::Id(id.clone()),
         usage,
         curve: entry
-            .metadata
+            .record
             .curve
             .as_deref()
-            .map(curve_from_metadata)
+            .map(curve_from_record)
             .transpose()?,
-        hash: entry.metadata.hash.as_deref().map(str::parse).transpose()?,
+        hash: entry.record.hash.as_deref().map(str::parse).transpose()?,
         public_key: None,
     })
 }
@@ -919,7 +919,7 @@ pub fn descriptor_from_public(
     })
 }
 
-fn key_usage_from_metadata(usage: ObjectUsage) -> crate::KeyUsage {
+fn key_usage_from_record(usage: ObjectUsage) -> crate::KeyUsage {
     match usage {
         ObjectUsage::Sign => crate::KeyUsage::Sign,
         ObjectUsage::Ecdh => crate::KeyUsage::Ecdh,
@@ -928,12 +928,12 @@ fn key_usage_from_metadata(usage: ObjectUsage) -> crate::KeyUsage {
     }
 }
 
-fn curve_from_metadata(curve: &str) -> Result<EccCurve> {
+fn curve_from_record(curve: &str) -> Result<EccCurve> {
     match curve {
         "p256" | "P-256" | "nistp256" => Ok(EccCurve::P256),
         other => Err(Error::invalid(
             "curve",
-            format!("unsupported curve in registry metadata: {other:?}"),
+            format!("unsupported curve in registry record: {other:?}"),
         )),
     }
 }

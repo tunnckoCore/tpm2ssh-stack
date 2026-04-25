@@ -1,12 +1,9 @@
-//! Shared public contracts for the `tpmctl` workspace.
-//!
-//! This crate is intentionally library-first: TPM semantics, registry access,
-//! output encoders, and derived-key helpers live here. Frontends such as the CLI
-//! and PKCS#11 provider should depend on these typed contracts rather than
-//! shelling out to another binary.
+//! TPM helper library: typed TPM object management, registry access, output
+//! encoders, ECDH/HMAC/signing helpers, and derived software-key operations.
 
 pub mod api;
 pub mod crypto;
+pub mod derive_domain;
 pub mod ecdh;
 pub mod error;
 pub mod hmac;
@@ -18,20 +15,57 @@ pub mod sign;
 pub mod store;
 pub mod tpm;
 
-use std::{
-    fmt, fs,
-    io::{self, Read as _, Write as _},
-    str::FromStr,
-};
+use std::{fmt, str::FromStr};
 
-use sha2::{Digest as _, Sha256, Sha384, Sha512};
-use zeroize::{Zeroize as _, Zeroizing};
-
-pub use api::*;
 pub use error::{CoreError, Error, Result};
 pub use output::{EncodedOutput, OutputFormat};
+use sha2::{Digest as _, Sha256, Sha384, Sha512};
 pub use store::{IdentityRef, ObjectKind, RegistryId, Store, StoreOptions};
 pub use tpm::{CommandContext, KeyUsage, PersistentHandle};
+
+pub type SignatureFormat = output::SignatureFormat;
+pub type PublicKeyFormat = output::PublicKeyFormat;
+pub type BinaryTextFormat = output::BinaryFormat;
+pub type DeriveAlgorithm = crypto::derive::DerivedAlgorithm;
+pub type DeriveUse = crypto::derive::DeriveUse;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InputFormat {
+    Raw,
+    Hex,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DeriveFormat {
+    Raw,
+    Hex,
+    Der,
+    Address,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MaterialRef {
+    Id(String),
+    Handle(PersistentHandle),
+}
+
+impl MaterialRef {
+    pub fn from_id_or_handle(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.starts_with("0x") {
+            Ok(Self::Handle(value.parse::<PersistentHandle>()?))
+        } else {
+            Ok(Self::Id(value))
+        }
+    }
+
+    pub fn selector(self) -> Result<ObjectSelector> {
+        match self {
+            Self::Id(id) => Ok(ObjectSelector::Id(RegistryId::new(id)?)),
+            Self::Handle(handle) => Ok(ObjectSelector::Handle(handle)),
+        }
+    }
+}
 
 impl fmt::Display for KeyUsage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -81,27 +115,6 @@ impl HashAlgorithm {
                     digest.len()
                 ),
             ))
-        }
-    }
-}
-
-fn decode_hex_bytes(field: &'static str, value: &str) -> Result<Vec<u8>> {
-    let normalized = value.trim().strip_prefix("0x").unwrap_or(value.trim());
-    hex::decode(normalized).map_err(|error| Error::invalid(field, format!("invalid hex: {error}")))
-}
-
-fn decode_hex_digest(value: &str) -> Result<Vec<u8>> {
-    decode_hex_bytes("digest", value)
-}
-
-fn decode_input_bytes(input: Vec<u8>, input_format: InputFormat) -> Result<Vec<u8>> {
-    match input_format {
-        InputFormat::Raw => Ok(input),
-        InputFormat::Hex => {
-            let text = std::str::from_utf8(&input).map_err(|error| {
-                Error::invalid("input", format!("hex input is not UTF-8: {error}"))
-            })?;
-            decode_hex_bytes("input", text)
         }
     }
 }
@@ -207,859 +220,57 @@ pub enum SealTarget {
     Handle(PersistentHandle),
 }
 
-// Frontend request contracts used by thin adapters. These are kept at the crate
-// root for source compatibility, but they are intentionally parser-free: values
-// arrive already decoded from CLI flags, config files, or other frontends.
-//
-// Safe extraction boundary for future library-first cleanup:
-// - pure value types and validation helpers can move behind a request/prelude
-//   module with root re-exports;
-// - functions that read stdin, write stdout/stderr, or create command contexts
-//   are adapter orchestration and should be isolated last;
-// - domain modules (`sign`, `seal`, `hmac`, `ecdh`, `keygen`, `pubkey`, `crypto`)
-//   remain the stable core used by CLI and PKCS#11 consumers.
-use std::path::PathBuf;
-
-pub type SignatureFormat = output::SignatureFormat;
-pub type PublicKeyFormat = output::PublicKeyFormat;
-pub type BinaryTextFormat = output::BinaryFormat;
-pub type DeriveAlgorithm = crypto::derive::DerivedAlgorithm;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum InputFormat {
-    Raw,
-    Hex,
-}
-pub type DeriveUse = crypto::derive::DeriveUse;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum DeriveFormat {
-    Raw,
-    Hex,
-    Der,
-    Address,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct StoreConfig {
-    pub root: PathBuf,
-}
-
-impl StoreConfig {
-    pub fn resolve(explicit: Option<PathBuf>) -> Result<Self> {
-        Ok(Self {
-            root: store::resolve_store_root(explicit.as_deref())?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RuntimeOptions {
-    pub store: StoreConfig,
-    pub json: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum MaterialRef {
-    Id(String),
-    Handle(PersistentHandle),
-}
-
-impl MaterialRef {
-    pub fn from_id_or_handle(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        if value.starts_with("0x") {
-            Ok(Self::Handle(value.parse::<PersistentHandle>()?))
-        } else {
-            Ok(Self::Id(value))
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct OutputTarget {
-    pub path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum InputSource {
-    Stdin,
-    File(PathBuf),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum SealDestination {
-    Id(String),
-    Handle(PersistentHandle),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct KeygenRequest {
-    pub runtime: RuntimeOptions,
-    pub usage: KeyUsage,
-    pub id: String,
-    pub persist_at: Option<PersistentHandle>,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SignRequest {
-    pub runtime: RuntimeOptions,
-    pub material: MaterialRef,
-    pub input: SignInput,
-    pub input_format: InputFormat,
-    pub hash: HashAlgorithm,
-    pub output_format: SignatureFormat,
-    pub output: OutputTarget,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum SignInput {
-    Message(InputSource),
-    DigestFile(InputSource),
-    DigestHex(String),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct PubkeyRequest {
-    pub runtime: RuntimeOptions,
-    pub material: MaterialRef,
-    pub output_format: PublicKeyFormat,
-    pub output: OutputTarget,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct EcdhRequest {
-    pub runtime: RuntimeOptions,
-    pub material: MaterialRef,
-    pub peer_pub: InputSource,
-    pub output_format: BinaryTextFormat,
-    pub output: OutputTarget,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct HmacRequest {
-    pub runtime: RuntimeOptions,
-    pub material: MaterialRef,
-    pub input: InputSource,
-    pub input_format: InputFormat,
-    pub hash: Option<HashAlgorithm>,
-    pub output_format: BinaryTextFormat,
-    pub output: OutputTarget,
-    pub seal: Option<SealDestination>,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SealRequest {
-    pub runtime: RuntimeOptions,
-    pub input: InputSource,
-    pub destination: SealDestination,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct UnsealRequest {
-    pub runtime: RuntimeOptions,
-    pub material: MaterialRef,
-    pub output: OutputTarget,
-    pub force: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DeriveRequest {
-    pub runtime: RuntimeOptions,
-    pub material: MaterialRef,
-    pub label: Option<String>,
-    pub algorithm: DeriveAlgorithm,
-    pub usage: DeriveUse,
-    pub input: Option<SignInput>,
-    pub input_format: InputFormat,
-    pub hash: Option<HashAlgorithm>,
-    pub output_format: DeriveFormat,
-    pub compressed: bool,
-    pub output: OutputTarget,
-    pub force: bool,
-}
-
-pub fn keygen(request: KeygenRequest) -> Result<()> {
-    validate_keygen_request(&request)?;
-    let usage = match request.usage {
-        KeyUsage::Sign => keygen::KeygenUsage::Sign,
-        KeyUsage::Ecdh => keygen::KeygenUsage::Ecdh,
-        KeyUsage::Hmac => keygen::KeygenUsage::Hmac,
-        KeyUsage::Sealed => {
-            return Err(Error::invalid(
-                "usage",
-                "keygen supports sign, ecdh, and hmac usages",
-            ));
-        }
-    };
-    let id = RegistryId::new(request.id)?;
-    let store = Store::new(request.runtime.store.root);
-    keygen::KeygenRequest {
-        usage,
-        id,
-        persist_at: request.persist_at,
-        force: request.force,
-    }
-    .execute_with_store(&store)?;
-    Ok(())
-}
-
-fn validate_keygen_request(request: &KeygenRequest) -> Result<()> {
-    if request.id.starts_with("0x") {
-        return Err(Error::invalid(
-            "id",
-            "keygen id cannot start with 0x; use persist_at for persistent TPM handles",
-        ));
-    }
-    Ok(())
-}
-
-pub fn sign(request: SignRequest) -> Result<()> {
-    let store = Store::new(request.runtime.store.root);
-    let input = match request.input {
-        SignInput::Message(source) => sign::SignInput::Message(Zeroizing::new(decode_input_bytes(
-            read_input(&source)?,
-            request.input_format,
-        )?)),
-        SignInput::DigestFile(source) => {
-            sign::SignInput::Digest(Zeroizing::new(read_input(&source)?))
-        }
-        SignInput::DigestHex(hex) => {
-            sign::SignInput::Digest(Zeroizing::new(decode_hex_digest(&hex)?))
-        }
-    };
-    let domain_request = sign::SignRequest {
-        selector: material_selector(request.material)?,
-        input,
-        hash: request.hash,
-        output_format: request.output_format,
-    };
-    let output = domain_request.execute(&store)?;
-    write_output(&request.output, output.as_slice(), request.force)
-}
-
-pub fn pubkey(request: PubkeyRequest) -> Result<()> {
-    let store = Store::new(request.runtime.store.root);
-    let domain_request = pubkey::PubkeyRequest {
-        selector: material_selector(request.material)?,
-        output_format: request.output_format,
-    };
-    let output = domain_request.execute(&store)?;
-    write_output(&request.output, output.as_slice(), request.force)
-}
-
-pub fn ecdh(request: EcdhRequest) -> Result<()> {
-    let store = Store::new(request.runtime.store.root);
-    let peer_public_key = pubkey::PublicKeyInput::parse_bytes(read_input(&request.peer_pub)?)?;
-    let domain_request = ecdh::EcdhRequest {
-        selector: material_selector(request.material)?,
-        peer_public_key,
-        output_format: request.output_format,
-    };
-    let output = domain_request.execute(&store)?;
-    write_output(&request.output, output.as_slice(), request.force)
-}
-
-pub fn hmac(request: HmacRequest) -> Result<()> {
-    let command = command_context(&request.runtime);
-    let selector = material_selector(request.material)?;
-    let input = decode_input_bytes(read_input(&request.input)?, request.input_format)?;
-    let seal_target = request.seal.map(seal_target).transpose()?;
-    let domain = hmac::HmacRequest {
-        selector,
-        input: Zeroizing::new(input),
-        hash: request.hash,
-        output_format: request.output_format,
-        seal_target,
-        emit_prf_when_sealing: false,
-        force: request.force,
-    };
-
-    match domain.execute_with_context(&command)? {
-        hmac::HmacResult::Output(output) => {
-            write_output(&request.output, output.as_slice(), request.force)?;
-        }
-        hmac::HmacResult::Sealed { target, hash } => {
-            write_hmac_sealed_result(&request.runtime, &target, hash)?;
-        }
-        hmac::HmacResult::SealedWithOutput {
-            target,
-            hash,
-            output,
-        } => {
-            write_output(&request.output, output.as_slice(), request.force)?;
-            write_hmac_sealed_result(&request.runtime, &target, hash)?;
-        }
-    }
-    Ok(())
-}
-
-pub fn seal(request: SealRequest) -> Result<()> {
-    let command = command_context(&request.runtime);
-    let input = zeroize::Zeroizing::new(read_input(&request.input)?);
-    let selector = seal_destination_selector(request.destination)?;
-    let domain = seal::SealRequest {
-        selector,
-        input,
-        force: request.force,
-    };
-    let result = domain.execute_with_context(&command)?;
-    write_seal_result(&request.runtime, &result.selector, result.hash)
-}
-
-pub fn unseal(request: UnsealRequest) -> Result<()> {
-    let command = command_context(&request.runtime);
-    let selector = material_selector(request.material)?;
-    let domain = seal::UnsealRequest {
-        selector,
-        force_binary_stdout: request.force,
-    };
-    let bytes = domain.execute_with_context(&command)?;
-    write_output(&request.output, bytes.as_slice(), request.force)
-}
-
-pub fn derive(request: DeriveRequest) -> Result<()> {
-    validate_derive_request(&request)?;
-    if request.label.is_none() && matches!(request.usage, DeriveUse::Pubkey | DeriveUse::Secret) {
-        eprintln!(
-            "warning: --label was not provided; derived material is ephemeral and will change on each invocation"
-        );
-    }
-
-    let command = command_context(&request.runtime);
-    let selector = material_selector(request.material.clone())?;
-    let mode = derive_mode(&request)?;
-    let seed_bytes = derive_prf_seed(&command, &selector, &request)?;
-    let seed = crypto::derive::SecretSeed::new(seed_bytes.as_slice()).map_err(derive_error)?;
-    let output = derive_output(&request, &seed, &mode)?;
-    write_output(&request.output, output.as_slice(), request.force)
-}
-
-fn validate_derive_request(request: &DeriveRequest) -> Result<()> {
-    if request.usage == DeriveUse::Sign && request.input.is_none() {
-        return Err(Error::invalid(
-            "derive",
-            "derive --use sign requires exactly one of --input, --digest-file, or --digest",
-        ));
-    }
-    if request.usage != DeriveUse::Sign && request.input.is_some() {
-        return Err(Error::invalid(
-            "derive",
-            "derive --input/--digest-file/--digest are only valid with --use sign",
-        ));
-    }
-    if request.algorithm == DeriveAlgorithm::Ed25519 && request.usage == DeriveUse::Sign {
-        if request.hash.is_some() {
-            return Err(Error::invalid(
-                "derive",
-                "derive --algorithm ed25519 --use sign does not support --hash in v1",
-            ));
-        }
-        if matches!(
-            request.input,
-            Some(SignInput::DigestFile(_) | SignInput::DigestHex(_))
-        ) {
-            return Err(Error::invalid(
-                "derive",
-                "derive --algorithm ed25519 --use sign supports only --input, not --digest-file or --digest",
-            ));
-        }
-    }
-    if request.usage == DeriveUse::Secret
-        && !matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex)
-    {
-        return Err(Error::invalid(
-            "derive",
-            "derive --use secret supports only --output-format raw or --output-format hex",
-        ));
-    }
-    if request.usage == DeriveUse::Pubkey {
-        match request.algorithm {
-            DeriveAlgorithm::P256 | DeriveAlgorithm::Ed25519 => {
-                if !matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex) {
-                    return Err(Error::invalid(
-                        "derive",
-                        "derive --use pubkey with p256 or ed25519 supports only --output-format raw or --output-format hex",
-                    ));
-                }
-            }
-            DeriveAlgorithm::Secp256k1 => {
-                if !matches!(
-                    request.output_format,
-                    DeriveFormat::Raw | DeriveFormat::Hex | DeriveFormat::Address
-                ) {
-                    return Err(Error::invalid(
-                        "derive",
-                        "derive --use pubkey --algorithm secp256k1 supports --output-format raw, hex, or address",
-                    ));
-                }
-            }
-        }
-    }
-    if request.usage == DeriveUse::Sign {
-        match request.algorithm {
-            DeriveAlgorithm::Ed25519 => {
-                if !matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex) {
-                    return Err(Error::invalid(
-                        "derive",
-                        "derive --algorithm ed25519 --use sign supports only --output-format raw or --output-format hex",
-                    ));
-                }
-            }
-            DeriveAlgorithm::P256 | DeriveAlgorithm::Secp256k1 => {
-                if !matches!(
-                    request.output_format,
-                    DeriveFormat::Der | DeriveFormat::Raw | DeriveFormat::Hex
-                ) {
-                    return Err(Error::invalid(
-                        "derive",
-                        "derive --use sign with p256 or secp256k1 supports --output-format der, raw, or hex",
-                    ));
-                }
-            }
-        }
-    }
-    if request.compressed
-        && !(request.algorithm == DeriveAlgorithm::Secp256k1
-            && request.usage == DeriveUse::Pubkey
-            && matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex))
-    {
-        return Err(Error::invalid(
-            "compressed",
-            "--compressed is valid only for derive --algorithm secp256k1 --use pubkey with --output-format raw or hex",
-        ));
-    }
-    if request.output_format == DeriveFormat::Address
-        && !(request.algorithm == DeriveAlgorithm::Secp256k1 && request.usage == DeriveUse::Pubkey)
-    {
-        return Err(Error::invalid(
-            "output_format",
-            "--output-format address is valid only for derive --algorithm secp256k1 --use pubkey",
-        ));
-    }
-
-    crypto::derive::DeriveRequest::new(
-        request.algorithm,
-        request.usage,
-        request.hash.map(hash_selection),
-    )
-    .map_err(derive_error)?;
-    Ok(())
-}
-
-fn derive_prf_seed(
-    command: &CommandContext,
-    selector: &ObjectSelector,
-    request: &DeriveRequest,
-) -> Result<Zeroizing<Vec<u8>>> {
-    match (seal::UnsealRequest {
-        selector: selector.clone(),
-        force_binary_stdout: false,
-    })
-    .execute_with_context(command)
-    {
-        Ok(seed) => Ok(seed),
-        Err(Error::NotFound(_)) if matches!(selector, ObjectSelector::Id(_)) => {
-            derive_hmac_prf_seed(command, selector, request)
-        }
-        Err(Error::InvalidInput { .. }) | Err(Error::Tpm { .. })
-            if matches!(selector, ObjectSelector::Handle(_)) =>
-        {
-            derive_hmac_prf_seed(command, selector, request)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn derive_hmac_prf_seed(
-    command: &CommandContext,
-    selector: &ObjectSelector,
-    request: &DeriveRequest,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let mut input = Vec::new();
-    input.extend_from_slice(b"tpmctl derive prf v1\0");
-    input.extend_from_slice(match request.algorithm {
-        DeriveAlgorithm::P256 => b"p256".as_slice(),
-        DeriveAlgorithm::Ed25519 => b"ed25519".as_slice(),
-        DeriveAlgorithm::Secp256k1 => b"secp256k1".as_slice(),
-    });
-    input.push(0);
-    if let Some(label) = &request.label {
-        input.extend_from_slice(label.as_bytes());
-    }
-    let seed = hmac::prf_seed_from_hmac_identity(command, selector, &input, None)?;
-    input.zeroize();
-    Ok(seed)
-}
-
-fn derive_mode(request: &DeriveRequest) -> Result<crypto::derive::DeriveMode> {
-    if let Some(label) = &request.label {
-        Ok(crypto::derive::DeriveMode::deterministic(
-            label.as_bytes().to_vec(),
-        ))
-    } else {
-        let mut entropy = Zeroizing::new(vec![0_u8; 32]);
-        getrandom::fill(&mut entropy)
-            .map_err(|error| Error::invalid("entropy", error.to_string()))?;
-        Ok(crypto::derive::DeriveMode::ephemeral(
-            Vec::new(),
-            entropy.to_vec(),
-        ))
-    }
-}
-
-fn derive_output(
-    request: &DeriveRequest,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
-) -> Result<Zeroizing<Vec<u8>>> {
-    match request.usage {
-        DeriveUse::Secret => derive_secret(request, seed, mode),
-        DeriveUse::Pubkey => derive_public_key(request, seed, mode),
-        DeriveUse::Sign => derive_signature(request, seed, mode),
-    }
-}
-
-fn derive_secret(
-    request: &DeriveRequest,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let mut raw = match request.algorithm {
-        DeriveAlgorithm::P256 => crypto::p256::derive_secret_key(seed, mode)
-            .map_err(derive_error)?
-            .to_bytes()
-            .to_vec(),
-        DeriveAlgorithm::Ed25519 => crypto::ed25519::derive_signing_key(seed, mode)
-            .map_err(derive_error)?
-            .to_bytes()
-            .to_vec(),
-        DeriveAlgorithm::Secp256k1 => crypto::secp256k1::derive_secret_key(seed, mode)
-            .map_err(derive_error)?
-            .to_bytes()
-            .to_vec(),
-    };
-    let encoded = encode_raw_or_hex(&raw, request.output_format)?;
-    raw.zeroize();
-    Ok(Zeroizing::new(encoded))
-}
-
-fn derive_public_key(
-    request: &DeriveRequest,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let bytes = match request.algorithm {
-        DeriveAlgorithm::P256 => {
-            let raw =
-                crypto::p256::derive_public_key_sec1(seed, mode, false).map_err(derive_error)?;
-            encode_raw_or_hex(&raw, request.output_format)?
-        }
-        DeriveAlgorithm::Ed25519 => {
-            let raw = crypto::ed25519::derive_public_key_bytes(seed, mode).map_err(derive_error)?;
-            encode_raw_or_hex(&raw, request.output_format)?
-        }
-        DeriveAlgorithm::Secp256k1 if request.output_format == DeriveFormat::Address => {
-            crypto::secp256k1::derive_ethereum_address(seed, mode)
-                .map_err(derive_error)?
-                .into_bytes()
-        }
-        DeriveAlgorithm::Secp256k1 => {
-            let raw = crypto::secp256k1::derive_public_key_sec1(seed, mode, request.compressed)
-                .map_err(derive_error)?;
-            encode_raw_or_hex(&raw, request.output_format)?
-        }
-    };
-    Ok(Zeroizing::new(bytes))
-}
-
-fn derive_signature(
-    request: &DeriveRequest,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let message = derive_sign_message_bytes(request)?;
-    let bytes = match request.algorithm {
-        DeriveAlgorithm::P256 => {
-            let mut p1363 =
-                crypto::p256::sign_prehash(seed, mode, &message).map_err(derive_error)?;
-            let encoded = output::encode_p256_signature(
-                &p1363,
-                signature_output_format(request.output_format)?,
-            )?;
-            p1363.zeroize();
-            encoded
-        }
-        DeriveAlgorithm::Ed25519 => {
-            let mut raw =
-                crypto::ed25519::sign_message(seed, mode, &message).map_err(derive_error)?;
-            let encoded = encode_raw_or_hex(&raw, request.output_format)?;
-            raw.zeroize();
-            encoded
-        }
-        DeriveAlgorithm::Secp256k1 => {
-            let mut p1363 =
-                crypto::secp256k1::sign_prehash(seed, mode, &message).map_err(derive_error)?;
-            let encoded = output::encode_secp256k1_signature(
-                &p1363,
-                signature_output_format(request.output_format)?,
-            )?;
-            p1363.zeroize();
-            encoded
-        }
-    };
-    Ok(Zeroizing::new(bytes))
-}
-
-fn derive_sign_message_bytes(request: &DeriveRequest) -> Result<Zeroizing<Vec<u8>>> {
-    match request
-        .input
-        .as_ref()
-        .expect("derive --use sign input was validated")
-    {
-        SignInput::Message(source) => {
-            let bytes = decode_input_bytes(read_input(source)?, request.input_format)?;
-            if request.algorithm == DeriveAlgorithm::Ed25519 {
-                Ok(Zeroizing::new(bytes))
-            } else {
-                Ok(Zeroizing::new(derive_hash(request).unwrap().digest(&bytes)))
-            }
-        }
-        SignInput::DigestFile(source) => {
-            let bytes = read_input(source)?;
-            derive_hash(request).unwrap().validate_digest(&bytes)?;
-            Ok(Zeroizing::new(bytes))
-        }
-        SignInput::DigestHex(hex) => {
-            let bytes = decode_hex_digest(hex)?;
-            derive_hash(request).unwrap().validate_digest(&bytes)?;
-            Ok(Zeroizing::new(bytes))
-        }
-    }
-}
-
-fn encode_raw_or_hex(raw: &[u8], output_format: DeriveFormat) -> Result<Vec<u8>> {
-    match output_format {
-        DeriveFormat::Raw => Ok(output::encode_binary(raw, BinaryTextFormat::Raw)),
-        DeriveFormat::Hex => Ok(output::encode_binary(raw, BinaryTextFormat::Hex)),
-        DeriveFormat::Der | DeriveFormat::Address => Err(Error::invalid(
-            "output_format",
-            "derive output format is not valid for this operation",
-        )),
-    }
-}
-
-fn signature_output_format(output_format: DeriveFormat) -> Result<SignatureFormat> {
-    match output_format {
-        DeriveFormat::Der => Ok(SignatureFormat::Der),
-        DeriveFormat::Raw => Ok(SignatureFormat::Raw),
-        DeriveFormat::Hex => Ok(SignatureFormat::Hex),
-        DeriveFormat::Address => Err(Error::invalid(
-            "output_format",
-            "derive --use sign does not support --output-format address",
-        )),
-    }
-}
-
-fn derive_hash(request: &DeriveRequest) -> Option<HashAlgorithm> {
-    if request.usage == DeriveUse::Sign
-        && matches!(
-            request.algorithm,
-            DeriveAlgorithm::P256 | DeriveAlgorithm::Secp256k1
-        )
-    {
-        Some(request.hash.unwrap_or(HashAlgorithm::Sha256))
-    } else {
-        request.hash
-    }
-}
-
-fn hash_selection(hash: HashAlgorithm) -> crypto::derive::HashSelection {
-    match hash {
-        HashAlgorithm::Sha256 => crypto::derive::HashSelection::Sha256,
-        HashAlgorithm::Sha384 => crypto::derive::HashSelection::Sha384,
-        HashAlgorithm::Sha512 => crypto::derive::HashSelection::Sha512,
-    }
-}
-
-fn derive_error(error: impl std::fmt::Display) -> Error {
-    Error::invalid("derive", error.to_string())
-}
-
-fn command_context(runtime: &RuntimeOptions) -> CommandContext {
-    CommandContext {
-        store: StoreOptions {
-            root: Some(runtime.store.root.clone()),
-        },
-        tcti: None,
-    }
-}
-
-fn material_selector(material: MaterialRef) -> Result<ObjectSelector> {
-    match material {
-        MaterialRef::Id(id) => Ok(ObjectSelector::Id(RegistryId::new(id)?)),
-        MaterialRef::Handle(handle) => Ok(ObjectSelector::Handle(handle)),
-    }
-}
-
-fn seal_destination_selector(destination: SealDestination) -> Result<ObjectSelector> {
-    match destination {
-        SealDestination::Id(id) => Ok(ObjectSelector::Id(RegistryId::new(id)?)),
-        SealDestination::Handle(handle) => Ok(ObjectSelector::Handle(handle)),
-    }
-}
-
-fn seal_target(destination: SealDestination) -> Result<SealTarget> {
-    match destination {
-        SealDestination::Id(id) => Ok(SealTarget::Id(RegistryId::new(id)?)),
-        SealDestination::Handle(handle) => Ok(SealTarget::Handle(handle)),
-    }
-}
-
-fn read_input(source: &InputSource) -> Result<Vec<u8>> {
-    match source {
-        InputSource::Stdin => {
-            let mut bytes = Vec::new();
-            io::stdin()
-                .read_to_end(&mut bytes)
-                .map_err(|source| CoreError::io("<stdin>", source))?;
-            Ok(bytes)
-        }
-        InputSource::File(path) => fs::read(path).map_err(|source| CoreError::io(path, source)),
-    }
-}
-
-fn write_output(target: &OutputTarget, bytes: &[u8], force: bool) -> Result<()> {
-    match &target.path {
-        None => io::stdout()
-            .write_all(bytes)
-            .map_err(|source| CoreError::io("<stdout>", source)),
-        Some(path) => {
-            if path.exists() && !force {
-                return Err(CoreError::AlreadyExists(path.clone()));
-            }
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                fs::create_dir_all(parent).map_err(|source| CoreError::io(parent, source))?;
-            }
-            fs::write(path, bytes).map_err(|source| CoreError::io(path, source))
-        }
-    }
-}
-
-fn write_hmac_sealed_result(
-    runtime: &RuntimeOptions,
-    target: &SealTarget,
-    hash: HashAlgorithm,
-) -> Result<()> {
-    if runtime.json {
-        let value = match target {
-            SealTarget::Handle(handle) => serde_json::json!({
-                "sealed_at": handle.to_string(),
-                "hash": hash.to_string(),
-            }),
-            SealTarget::Id(id) => serde_json::json!({
-                "sealed_id": id.to_string(),
-                "hash": hash.to_string(),
-            }),
-        };
-        println!("{value}");
-    } else {
-        match target {
-            SealTarget::Handle(handle) => {
-                println!("sealed {} bytes at {handle}", hash.digest_len())
-            }
-            SealTarget::Id(id) => println!("sealed {} bytes as {id}", hash.digest_len()),
-        }
-    }
-    Ok(())
-}
-
-fn write_seal_result(
-    runtime: &RuntimeOptions,
-    selector: &ObjectSelector,
-    hash: Option<HashAlgorithm>,
-) -> Result<()> {
-    if runtime.json {
-        let value = match selector {
-            ObjectSelector::Handle(handle) => {
-                let mut value = serde_json::json!({ "sealed_at": handle.to_string() });
-                if let Some(hash) = hash {
-                    value["hash"] = serde_json::json!(hash.to_string());
-                }
-                value
-            }
-            ObjectSelector::Id(id) => {
-                let mut value = serde_json::json!({ "sealed_id": id.to_string() });
-                if let Some(hash) = hash {
-                    value["hash"] = serde_json::json!(hash.to_string());
-                }
-                value
-            }
-        };
-        println!("{value}");
-    } else {
-        match selector {
-            ObjectSelector::Handle(handle) => println!("sealed at {handle}"),
-            ObjectSelector::Id(id) => println!("sealed as {id}"),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn material_ref_keeps_ids_and_handles_distinct() {
+    fn material_ref_from_id_or_handle_preserves_registry_id() {
         assert_eq!(
-            MaterialRef::from_id_or_handle("signing-key").unwrap(),
-            MaterialRef::Id("signing-key".to_owned())
+            MaterialRef::from_id_or_handle("org/acme/alice/main").unwrap(),
+            MaterialRef::Id("org/acme/alice/main".to_owned())
         );
+    }
 
-        let handle = PersistentHandle::parse("0x81010010").unwrap();
+    #[test]
+    fn material_ref_from_id_or_handle_parses_persistent_handle() {
         assert_eq!(
             MaterialRef::from_id_or_handle("0x81010010").unwrap(),
-            MaterialRef::Handle(handle)
+            MaterialRef::Handle(PersistentHandle::new(0x8101_0010).unwrap())
         );
     }
 
     #[test]
-    fn input_hex_decoding_is_pure_and_adapter_independent() {
+    fn material_ref_from_id_or_handle_rejects_invalid_handle_prefixed_values() {
+        let error = MaterialRef::from_id_or_handle("0xnot-a-handle").unwrap_err();
+        assert!(matches!(error, Error::InvalidHandle { .. }));
+    }
+
+    #[test]
+    fn material_ref_selector_converts_id_to_object_selector_id() {
+        let selector = MaterialRef::Id("org/acme/alice/main".to_owned())
+            .selector()
+            .unwrap();
+
         assert_eq!(
-            decode_input_bytes(b" 0x74657374\n".to_vec(), InputFormat::Hex).unwrap(),
-            b"test"
-        );
-        assert_eq!(
-            decode_input_bytes(b"raw bytes".to_vec(), InputFormat::Raw).unwrap(),
-            b"raw bytes"
+            selector,
+            ObjectSelector::Id(RegistryId::new("org/acme/alice/main").unwrap())
         );
     }
 
     #[test]
-    fn keygen_validation_rejects_handle_shaped_ids() {
-        let request = KeygenRequest {
-            runtime: RuntimeOptions {
-                store: StoreConfig {
-                    root: PathBuf::from("/unused"),
-                },
-                json: false,
-            },
-            usage: KeyUsage::Sign,
-            id: "0x81010010".to_owned(),
-            persist_at: None,
-            force: false,
-        };
+    fn material_ref_selector_converts_handle_to_object_selector_handle() {
+        let handle = PersistentHandle::new(0x8101_0010).unwrap();
+        let selector = MaterialRef::Handle(handle).selector().unwrap();
 
-        assert!(validate_keygen_request(&request).is_err());
+        assert_eq!(selector, ObjectSelector::Handle(handle));
+    }
+
+    #[test]
+    fn material_ref_selector_validates_registry_id() {
+        let error = MaterialRef::Id("../escape".to_owned())
+            .selector()
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidRegistryId { .. }));
     }
 }

@@ -11,12 +11,12 @@ use crate::{CoreError, Result};
 
 pub const STORE_ENV: &str = "TPMCTL_STORE";
 const STORE_DIR_NAME: &str = "tpmctl";
-const META_FILE: &str = "meta.json";
+const REGISTRY_RECORD_FILE: &str = "meta.json";
 const PUBLIC_BLOB_FILE: &str = "public.tpm";
 const PRIVATE_BLOB_FILE: &str = "private.tpm";
 const PUBLIC_PEM_FILE: &str = "public.pem";
 
-/// Store selection supplied by frontends.
+/// Store selection supplied by callers.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct StoreOptions {
     /// Explicit store root, equivalent to `--store <path>`.
@@ -63,7 +63,9 @@ impl Store {
     }
 
     pub fn exists(&self, collection: RegistryCollection, id: &RegistryId) -> bool {
-        self.path_for(collection, id).join(META_FILE).is_file()
+        self.path_for(collection, id)
+            .join(REGISTRY_RECORD_FILE)
+            .is_file()
     }
 
     pub fn save_entry(
@@ -72,14 +74,14 @@ impl Store {
         entry: &StoredObjectEntry,
         overwrite: bool,
     ) -> Result<PathBuf> {
-        let id = RegistryId::parse(&entry.metadata.id)?;
+        let id = RegistryId::parse(&entry.record.id)?;
         let dir = self.path_for(collection, &id);
         if !overwrite && dir.exists() {
             return Err(CoreError::AlreadyExists(dir));
         }
 
         create_secure_dir_all(&dir)?;
-        write_json_atomic(&dir.join(META_FILE), &entry.metadata)?;
+        write_json_atomic(&dir.join(REGISTRY_RECORD_FILE), &entry.record)?;
         write_atomic(&dir.join(PUBLIC_BLOB_FILE), &entry.public_blob)?;
         write_atomic(&dir.join(PRIVATE_BLOB_FILE), entry.private_blob.as_slice())?;
 
@@ -104,12 +106,12 @@ impl Store {
             return Err(CoreError::NotFound(dir));
         }
 
-        let meta_path = dir.join(META_FILE);
+        let record_path = dir.join(REGISTRY_RECORD_FILE);
         let public_path = dir.join(PUBLIC_BLOB_FILE);
         let private_path = dir.join(PRIVATE_BLOB_FILE);
         let pem_path = dir.join(PUBLIC_PEM_FILE);
 
-        let metadata = read_json(&meta_path)?;
+        let metadata = read_json(&record_path)?;
         let public_blob =
             fs::read(&public_path).map_err(|source| CoreError::io(public_path, source))?;
         let private_blob = Zeroizing::new(
@@ -122,7 +124,7 @@ impl Store {
         };
 
         Ok(StoredObjectEntry {
-            metadata,
+            record: metadata,
             public_blob,
             private_blob,
             public_pem,
@@ -222,14 +224,14 @@ pub enum ObjectUsage {
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub struct ParentMetadata {
+pub struct ParentRecord {
     pub hierarchy: String,
     pub template: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub struct RegistryMetadata {
+pub struct RegistryRecord {
     pub id: String,
     pub kind: StoredObjectKind,
     pub usage: ObjectUsage,
@@ -238,12 +240,12 @@ pub struct RegistryMetadata {
     pub curve: Option<String>,
     pub hash: Option<String>,
     pub created_at: String,
-    pub parent: Option<ParentMetadata>,
+    pub parent: Option<ParentRecord>,
     pub template: Option<String>,
     pub public_key: Option<String>,
 }
 
-impl RegistryMetadata {
+impl RegistryRecord {
     pub fn new(id: &RegistryId, kind: StoredObjectKind, usage: ObjectUsage) -> Self {
         Self {
             id: id.to_string(),
@@ -263,7 +265,7 @@ impl RegistryMetadata {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct StoredObjectEntry {
-    pub metadata: RegistryMetadata,
+    pub record: RegistryRecord,
     pub public_blob: Vec<u8>,
     pub private_blob: Zeroizing<Vec<u8>>,
     pub public_pem: Option<Vec<u8>>,
@@ -273,7 +275,7 @@ impl fmt::Debug for StoredObjectEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StoredObjectEntry")
-            .field("metadata", &self.metadata)
+            .field("record", &self.record)
             .field("public_blob", &self.public_blob)
             .field("private_blob", &"<redacted>")
             .field("public_pem", &self.public_pem)
@@ -281,9 +283,9 @@ impl fmt::Debug for StoredObjectEntry {
     }
 }
 
-/// Metadata shared by registry-backed objects in higher-level command contracts.
+/// Shared details for registry-backed objects in higher-level command contracts.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ObjectMetadata {
+pub struct ObjectRecord {
     pub id: String,
     pub kind: ObjectKind,
     pub usage: crate::KeyUsage,
@@ -601,11 +603,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::new(temp.path());
         let id = RegistryId::parse("org/acme/key").unwrap();
-        let mut metadata = RegistryMetadata::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
+        let mut metadata = RegistryRecord::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
         metadata.handle = Some("0x81010010".into());
         metadata.persistent = true;
         let entry = StoredObjectEntry {
-            metadata,
+            record: metadata,
             public_blob: b"public".to_vec(),
             private_blob: Zeroizing::new(b"private".to_vec()),
             public_pem: Some(b"pem".to_vec()),
@@ -624,15 +626,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::new(temp.path());
         let id = RegistryId::parse("org/acme/key").unwrap();
-        let metadata = RegistryMetadata::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
+        let metadata = RegistryRecord::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
         let with_pem = StoredObjectEntry {
-            metadata: metadata.clone(),
+            record: metadata.clone(),
             public_blob: b"public".to_vec(),
             private_blob: Zeroizing::new(b"private".to_vec()),
             public_pem: Some(b"pem".to_vec()),
         };
         let without_pem = StoredObjectEntry {
-            metadata,
+            record: metadata,
             public_blob: b"public2".to_vec(),
             private_blob: Zeroizing::new(b"private2".to_vec()),
             public_pem: None,
@@ -647,18 +649,18 @@ mod tests {
     }
 
     #[test]
-    fn load_key_rejects_malformed_metadata_json() {
+    fn load_key_rejects_malformed_registry_json() {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::new(temp.path());
         let id = RegistryId::parse("org/acme/key").unwrap();
         let entry = test_key_entry(&id);
         let dir = store.save_key(&entry, false).unwrap();
-        fs::write(dir.join(META_FILE), b"{not valid json").unwrap();
+        fs::write(dir.join(REGISTRY_RECORD_FILE), b"{not valid json").unwrap();
 
         let error = store.load_key(&id).unwrap_err();
         assert!(
-            matches!(error, CoreError::Json { ref path, .. } if path == &dir.join(META_FILE)),
-            "expected JSON error for malformed metadata, got {error:?}"
+            matches!(error, CoreError::Json { ref path, .. } if path == &dir.join(REGISTRY_RECORD_FILE)),
+            "expected JSON error for malformed registry record, got {error:?}"
         );
     }
 
@@ -696,7 +698,7 @@ mod tests {
 
     fn test_key_entry(id: &RegistryId) -> StoredObjectEntry {
         StoredObjectEntry {
-            metadata: RegistryMetadata::new(id, StoredObjectKind::Key, ObjectUsage::Sign),
+            record: RegistryRecord::new(id, StoredObjectKind::Key, ObjectUsage::Sign),
             public_blob: b"public".to_vec(),
             private_blob: Zeroizing::new(b"private".to_vec()),
             public_pem: None,
@@ -744,9 +746,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Store::new(temp.path());
         let id = RegistryId::parse("org/acme/key").unwrap();
-        let metadata = RegistryMetadata::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
+        let metadata = RegistryRecord::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
         let entry = StoredObjectEntry {
-            metadata,
+            record: metadata,
             public_blob: b"public".to_vec(),
             private_blob: Zeroizing::new(b"private".to_vec()),
             public_pem: Some(b"pem".to_vec()),
@@ -758,7 +760,7 @@ mod tests {
             0o700
         );
         for file in [
-            META_FILE,
+            REGISTRY_RECORD_FILE,
             PUBLIC_BLOB_FILE,
             PRIVATE_BLOB_FILE,
             PUBLIC_PEM_FILE,

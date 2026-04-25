@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-/// Output encodings shared by core operations and frontends.
+/// Output encodings shared by core operations and callers.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum OutputFormat {
     Raw,

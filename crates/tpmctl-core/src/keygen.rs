@@ -19,8 +19,8 @@ use crate::{
     RegistryId, Result,
     output::{PublicKeyFormat, encode_public_key},
     store::{
-        ObjectUsage, ParentMetadata, RegistryCollection, RegistryMetadata, Store,
-        StoredObjectEntry, StoredObjectKind,
+        ObjectUsage, ParentRecord, RegistryCollection, RegistryRecord, Store, StoredObjectEntry,
+        StoredObjectKind,
     },
     tpm,
 };
@@ -75,7 +75,7 @@ pub enum KeyTemplate {
 }
 
 impl KeyTemplate {
-    fn metadata_name(self) -> &'static str {
+    fn template_name(self) -> &'static str {
         match self {
             Self::EccP256Sign => "ecc-p256-sign",
             Self::EccP256Ecdh => "ecc-p256-ecdh",
@@ -296,7 +296,7 @@ fn stored_key_entry(
     child: &tpm::CreatedChildKey,
     public_key: Option<&EccPublicKey>,
 ) -> Result<StoredObjectEntry> {
-    let mut metadata = RegistryMetadata::new(
+    let mut metadata = RegistryRecord::new(
         &request.id,
         StoredObjectKind::Key,
         request.usage.registry_usage(),
@@ -305,11 +305,11 @@ fn stored_key_entry(
     metadata.persistent = plan.persistent_handle.is_some();
     metadata.curve = public_key.map(|_| "nistp256".to_owned());
     metadata.hash = Some("sha256".to_owned());
-    metadata.parent = Some(ParentMetadata {
+    metadata.parent = Some(ParentRecord {
         hierarchy: "owner".to_owned(),
         template: tpm::OWNER_STORAGE_PARENT_TEMPLATE.to_owned(),
     });
-    metadata.template = Some(plan.template.metadata_name().to_owned());
+    metadata.template = Some(plan.template.template_name().to_owned());
     metadata.public_key = public_key.map(|key| hex::encode(key.sec1()));
 
     let public_pem = public_key
@@ -317,7 +317,7 @@ fn stored_key_entry(
         .transpose()?;
 
     Ok(StoredObjectEntry {
-        metadata,
+        record: metadata,
         public_blob: tpm::marshal_public(&child.public)?,
         private_blob: tpm::marshal_private(&child.private)?,
         public_pem,
@@ -432,9 +432,9 @@ mod keygen_tests {
             persist_at: None,
             force: false,
         };
-        let metadata = RegistryMetadata::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
+        let metadata = RegistryRecord::new(&id, StoredObjectKind::Key, ObjectUsage::Sign);
         let entry = StoredObjectEntry {
-            metadata,
+            record: metadata,
             public_blob: b"public".to_vec(),
             private_blob: zeroize::Zeroizing::new(b"private".to_vec()),
             public_pem: None,
@@ -448,7 +448,7 @@ mod keygen_tests {
     }
 
     #[test]
-    fn stored_entry_contains_blobs_metadata_and_cached_public_key() {
+    fn stored_entry_contains_blobs_registry_record_and_cached_public_key() {
         let public = PublicBuilder::new()
             .with_public_algorithm(PublicAlgorithm::Ecc)
             .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
@@ -500,10 +500,10 @@ mod keygen_tests {
 
         let entry = stored_key_entry(&request, &plan, &child, public_key.as_ref()).unwrap();
 
-        assert_eq!(entry.metadata.id, "org/acme/alice/main");
-        assert_eq!(entry.metadata.handle.as_deref(), Some("0x81010010"));
-        assert!(entry.metadata.persistent);
-        assert_eq!(entry.metadata.public_key.as_ref().unwrap().len(), 130);
+        assert_eq!(entry.record.id, "org/acme/alice/main");
+        assert_eq!(entry.record.handle.as_deref(), Some("0x81010010"));
+        assert!(entry.record.persistent);
+        assert_eq!(entry.record.public_key.as_ref().unwrap().len(), 130);
         assert!(!entry.public_blob.is_empty());
         assert_eq!(entry.private_blob.as_slice(), &[0xaa; 8]);
         assert!(entry.public_pem.is_some());
