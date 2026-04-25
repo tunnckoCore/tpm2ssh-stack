@@ -1,4 +1,4 @@
-use p256::pkcs8::DecodePublicKey as _;
+use p256::pkcs8::DecodePublicKey;
 
 use crate::output::{PublicKeyFormat, encode_public_key};
 use crate::{

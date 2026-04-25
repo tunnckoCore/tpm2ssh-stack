@@ -222,6 +222,50 @@ mod tests {
     }
 
     #[test]
+    fn from_environment_skips_blank_values_and_uses_next_precedence() {
+        let _guard = env_lock();
+        unsafe {
+            env::set_var("TPM2TOOLS_TCTI", "   ");
+            env::set_var("TCTI", "swtpm:port=2321");
+            env::set_var("TEST_TCTI", "mssim:host=localhost,port=2321");
+        }
+
+        let resolution = TctiResolution::from_environment();
+        assert_eq!(resolution.source, TctiSource::Env("TCTI"));
+        assert_eq!(resolution.value.as_deref(), Some("swtpm:port=2321"));
+
+        unsafe {
+            env::remove_var("TPM2TOOLS_TCTI");
+            env::remove_var("TCTI");
+            env::remove_var("TEST_TCTI");
+        }
+    }
+
+    #[test]
+    fn resolve_tcti_prefers_override_then_env_then_default() {
+        let _guard = env_lock();
+        unsafe {
+            env::remove_var("TPM2TOOLS_TCTI");
+            env::remove_var("TCTI");
+            env::set_var("TEST_TCTI", "mssim:host=localhost,port=2321");
+        }
+
+        assert_eq!(
+            resolve_tcti(Some("device:/dev/tpm0")).unwrap(),
+            "device:/dev/tpm0"
+        );
+        assert_eq!(
+            resolve_tcti(None).unwrap(),
+            "mssim:host=localhost,port=2321"
+        );
+
+        unsafe {
+            env::remove_var("TEST_TCTI");
+        }
+        assert_eq!(resolve_tcti(None).unwrap(), "device:/dev/tpmrm0");
+    }
+
+    #[test]
     fn create_context_with_tcti_rejects_empty_override() {
         assert_eq!(
             create_context_with_tcti(Some("  "))

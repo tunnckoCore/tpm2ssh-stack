@@ -1,5 +1,6 @@
 use super::*;
 use crate::CoreError;
+use base64::{Engine, engine::general_purpose::STANDARD};
 
 fn base_point_sec1() -> Vec<u8> {
     hex::decode(concat!(
@@ -8,6 +9,79 @@ fn base_point_sec1() -> Vec<u8> {
         "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
     ))
     .unwrap()
+}
+
+#[test]
+fn encoded_output_new_preserves_format_and_bytes() {
+    let output = EncodedOutput::new(OutputFormat::Ssh, b"payload".to_vec());
+
+    assert_eq!(output.format, OutputFormat::Ssh);
+    assert_eq!(output.bytes, b"payload");
+}
+
+#[test]
+fn output_format_parsers_accept_expected_values_and_reject_invalid_values() {
+    assert_eq!("raw".parse::<BinaryFormat>().unwrap(), BinaryFormat::Raw);
+    assert_eq!("hex".parse::<BinaryFormat>().unwrap(), BinaryFormat::Hex);
+    assert_eq!(
+        "der".parse::<SignatureFormat>().unwrap(),
+        SignatureFormat::Der
+    );
+    assert_eq!(
+        "raw".parse::<SignatureFormat>().unwrap(),
+        SignatureFormat::Raw
+    );
+    assert_eq!(
+        "hex".parse::<SignatureFormat>().unwrap(),
+        SignatureFormat::Hex
+    );
+    assert_eq!(
+        "raw".parse::<PublicKeyFormat>().unwrap(),
+        PublicKeyFormat::Raw
+    );
+    assert_eq!(
+        "hex".parse::<PublicKeyFormat>().unwrap(),
+        PublicKeyFormat::Hex
+    );
+    assert_eq!(
+        "pem".parse::<PublicKeyFormat>().unwrap(),
+        PublicKeyFormat::Pem
+    );
+    assert_eq!(
+        "der".parse::<PublicKeyFormat>().unwrap(),
+        PublicKeyFormat::Der
+    );
+    assert_eq!(
+        "ssh".parse::<PublicKeyFormat>().unwrap(),
+        PublicKeyFormat::Ssh
+    );
+
+    let binary_error = "pem".parse::<BinaryFormat>().unwrap_err();
+    assert!(matches!(
+        binary_error,
+        CoreError::InvalidInput {
+            field: "format",
+            ..
+        }
+    ));
+
+    let signature_error = "pem".parse::<SignatureFormat>().unwrap_err();
+    assert!(matches!(
+        signature_error,
+        CoreError::InvalidInput {
+            field: "format",
+            ..
+        }
+    ));
+
+    let public_key_error = "json".parse::<PublicKeyFormat>().unwrap_err();
+    assert!(matches!(
+        public_key_error,
+        CoreError::InvalidInput {
+            field: "format",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -187,6 +261,32 @@ fn output_public_key_formats() {
     .unwrap();
     assert!(ssh.starts_with("ecdsa-sha2-nistp256 "));
     assert!(ssh.ends_with(" org_acme_alice"));
+}
+
+#[test]
+fn output_ssh_uses_default_comment_and_expected_blob_layout() {
+    let sec1 = base_point_sec1();
+    let ssh = String::from_utf8(encode_p256_public_key(&sec1, PublicKeyFormat::Ssh, None).unwrap())
+        .unwrap();
+    assert!(ssh.ends_with(" tpmctl-key"));
+
+    let mut parts = ssh.splitn(3, ' ');
+    assert_eq!(parts.next(), Some("ecdsa-sha2-nistp256"));
+    let blob = STANDARD.decode(parts.next().unwrap()).unwrap();
+    assert_eq!(parts.next(), Some("tpmctl-key"));
+
+    let mut cursor = blob.as_slice();
+    let read_ssh_string = |cursor: &mut &[u8]| {
+        let len = u32::from_be_bytes(cursor[..4].try_into().unwrap()) as usize;
+        let value = cursor[4..4 + len].to_vec();
+        *cursor = &cursor[4 + len..];
+        value
+    };
+
+    assert_eq!(read_ssh_string(&mut cursor), b"ecdsa-sha2-nistp256");
+    assert_eq!(read_ssh_string(&mut cursor), b"nistp256");
+    assert_eq!(read_ssh_string(&mut cursor), sec1);
+    assert!(cursor.is_empty());
 }
 
 #[test]

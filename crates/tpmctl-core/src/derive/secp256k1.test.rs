@@ -1,5 +1,6 @@
-use super::*;
-use crate::derive::primitives::retry_valid_candidate_for_test;
+use super::{derive_ethereum_address, derive_public_key_sec1, sign_message, sign_prehash};
+use crate::derive::primitives::{DeriveMode, SecretSeed, retry_valid_candidate_for_test};
+use k256::SecretKey;
 
 #[test]
 fn scalar_retry_skips_zero_and_accepts_non_zero() {
@@ -38,7 +39,7 @@ fn derived_signature_is_p1363_width() {
 #[test]
 fn derived_signature_verifies_with_corresponding_public_key() {
     use k256::ecdsa::{Signature, VerifyingKey};
-    use signature::Verifier as _;
+    use signature::Verifier;
 
     let seed = SecretSeed::new(b"secp seed").unwrap();
     let mode = DeriveMode::deterministic(b"secp verify".to_vec());

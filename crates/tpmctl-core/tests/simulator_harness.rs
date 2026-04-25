@@ -1,6 +1,6 @@
 use std::{
     env,
-    io::Read as _,
+    io::Read,
     net::{SocketAddr, TcpListener, TcpStream},
     process::{Child, Command, Stdio},
     sync::{Mutex, OnceLock},
@@ -15,11 +15,11 @@ use p256::{
     ecdh::diffie_hellman,
     ecdsa::{
         Signature as P256Signature, VerifyingKey,
-        signature::{Verifier as _, hazmat::PrehashVerifier as _},
+        signature::{Verifier, hazmat::PrehashVerifier},
     },
-    elliptic_curve::sec1::ToEncodedPoint as _,
+    elliptic_curve::sec1::ToEncodedPoint,
 };
-use sha2::{Digest as _, Sha256, Sha384};
+use sha2::{Digest, Sha256, Sha384};
 use tss_esapi::constants::StartupType;
 use zeroize::Zeroizing;
 

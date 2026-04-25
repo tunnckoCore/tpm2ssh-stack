@@ -10,7 +10,7 @@ use tss_esapi::{
     tss2_esys::TPMT_TK_HASHCHECK,
 };
 
-use super::{ecc_point_from_public_key, left_pad_copy};
+use super::registry::{ecc_point_from_public_key, left_pad_copy};
 
 /// Ask the TPM to produce a P-256 ECDSA signature over a digest.
 pub fn sign_digest(

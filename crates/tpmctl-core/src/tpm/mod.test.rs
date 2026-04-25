@@ -1,6 +1,8 @@
 use super::*;
 use std::{
+    collections::hash_map::DefaultHasher,
     env,
+    hash::{Hash, Hasher},
     sync::{Mutex, OnceLock},
 };
 
@@ -69,4 +71,46 @@ fn tcti_falls_back_to_device() {
     let resolution = TctiResolution::from_environment();
     assert_eq!(resolution.source, TctiSource::DefaultDevice);
     assert_eq!(resolution.value, None);
+}
+
+#[test]
+fn handle_new_round_trips_display_hash_and_conversions() {
+    let handle = PersistentHandle::new(0x8101_0010).unwrap();
+    assert_eq!(handle.to_string(), "0x81010010");
+    assert_eq!(
+        handle.tpm_handle(),
+        tss_esapi::handles::TpmHandle::try_from(0x8101_0010).unwrap()
+    );
+    assert_eq!(
+        handle.persistent_tpm_handle(),
+        tss_esapi::handles::PersistentTpmHandle::new(0x8101_0010).unwrap()
+    );
+
+    let mut left = DefaultHasher::new();
+    handle.hash(&mut left);
+    let mut right = DefaultHasher::new();
+    PersistentHandle::parse("0x81010010")
+        .unwrap()
+        .hash(&mut right);
+    assert_eq!(left.finish(), right.finish());
+}
+
+#[test]
+fn handle_reports_specific_parse_errors() {
+    assert_eq!(
+        PersistentHandle::parse(" 0x81010010")
+            .unwrap_err()
+            .to_string(),
+        "invalid persistent TPM handle \" 0x81010010\": leading or trailing whitespace is not allowed"
+    );
+    assert_eq!(
+        PersistentHandle::parse("81010010").unwrap_err().to_string(),
+        "invalid persistent TPM handle \"81010010\": persistent handles must be hexadecimal and start with 0x"
+    );
+    assert_eq!(
+        PersistentHandle::parse("0xzzzzzzzz")
+            .unwrap_err()
+            .to_string(),
+        "invalid persistent TPM handle \"0xzzzzzzzz\": handle contains non-hexadecimal characters"
+    );
 }

@@ -24,10 +24,10 @@ use tss_esapi::{
     traits::{Marshall, UnMarshall},
 };
 
-use super::{
-    PersistentHandle, descriptor_from_entry, descriptor_from_registry_entry,
-    descriptor_from_tpm_public, registry_entry_handle,
+use super::registry::{
+    descriptor_from_entry, descriptor_from_registry_entry, registry_entry_handle,
 };
+use super::{PersistentHandle, descriptor_from_tpm_public};
 
 /// Template name for the owner-hierarchy restricted decrypt parent used by stored children.
 pub const OWNER_STORAGE_PARENT_TEMPLATE: &str = "owner-rsa2048-aes128cfb-restricted-decrypt";
@@ -395,6 +395,72 @@ pub struct LoadedKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{ObjectKind, ObjectUsage, RegistryRecord};
+
+    #[test]
+    fn created_child_key_debug_redacts_private_blob() {
+        let child = CreatedChildKey {
+            public: owner_storage_parent_template().unwrap(),
+            private: Private::try_from(vec![0xde, 0xad, 0xbe, 0xef]).unwrap(),
+        };
+
+        let debug = format!("{child:?}");
+        assert!(debug.contains("public"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("deadbeef"));
+    }
+
+    #[test]
+    fn hashing_algorithm_maps_all_supported_hashes() {
+        assert_eq!(
+            hashing_algorithm(HashAlgorithm::Sha256),
+            HashingAlgorithm::Sha256
+        );
+        assert_eq!(
+            hashing_algorithm(HashAlgorithm::Sha384),
+            HashingAlgorithm::Sha384
+        );
+        assert_eq!(
+            hashing_algorithm(HashAlgorithm::Sha512),
+            HashingAlgorithm::Sha512
+        );
+    }
+
+    #[test]
+    fn owner_storage_parent_template_round_trips_through_marshal_and_unmarshal() {
+        let public = owner_storage_parent_template().unwrap();
+        let marshaled = marshal_public(&public).unwrap();
+        let unmarshaled = unmarshal_public(&marshaled).unwrap();
+
+        assert_eq!(marshaled, marshal_public(&unmarshaled).unwrap());
+    }
+
+    #[test]
+    fn private_blob_round_trips_through_marshal_and_unmarshal() {
+        let private = Private::try_from(vec![0xaa, 0xbb, 0xcc, 0xdd]).unwrap();
+        let marshaled = marshal_private(&private).unwrap();
+        let unmarshaled = unmarshal_private(&marshaled).unwrap();
+
+        assert_eq!(unmarshaled.value(), private.value());
+    }
+
+    #[test]
+    fn object_blobs_from_entry_clones_public_and_private_blobs() {
+        let entry = StoredObjectEntry {
+            record: RegistryRecord::new(
+                &RegistryId::new("org/acme/alice/main").unwrap(),
+                ObjectKind::Key,
+                ObjectUsage::Sign,
+            ),
+            public_blob: b"public-blob".to_vec(),
+            private_blob: Zeroizing::new(b"private-blob-secret".to_vec()),
+            public_pem: Some(b"pem".to_vec()),
+        };
+
+        let blobs = ObjectBlobs::from_entry(&entry);
+        assert_eq!(blobs.public, entry.public_blob);
+        assert_eq!(blobs.private.as_slice(), entry.private_blob.as_slice());
+    }
 
     #[test]
     fn object_blobs_debug_redacts_private_blob() {

@@ -1,5 +1,9 @@
-use super::*;
+use super::{
+    DeriveFormat, DeriveParams, ObjectSelector, SignPayload, encode_raw_or_hex, signature_format,
+};
 use crate::RegistryId;
+use crate::derive::primitives::{DeriveUse, DerivedAlgorithm};
+use zeroize::Zeroizing;
 
 fn params(
     algorithm: DerivedAlgorithm,
@@ -83,4 +87,26 @@ fn debug_redacts_secret_bearing_derive_fields() {
     assert!(!debug.contains("label-secret"));
     assert!(!debug.contains("message-secret"));
     assert!(!debug.contains("entropy-secret"));
+}
+
+#[test]
+fn encode_raw_or_hex_rejects_non_binary_formats() {
+    for format in [DeriveFormat::Der, DeriveFormat::Address] {
+        assert_eq!(
+            encode_raw_or_hex(b"derived-bytes", format)
+                .unwrap_err()
+                .to_string(),
+            "invalid output_format: derive output format is not valid for this operation"
+        );
+    }
+}
+
+#[test]
+fn signature_format_rejects_address_output() {
+    assert_eq!(
+        signature_format(DeriveFormat::Address)
+            .unwrap_err()
+            .to_string(),
+        "invalid output_format: derive sign does not support address output"
+    );
 }

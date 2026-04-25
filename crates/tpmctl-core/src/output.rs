@@ -28,8 +28,8 @@ impl EncodedOutput {
     }
 }
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use p256::pkcs8::{EncodePublicKey as _, LineEnding};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use p256::pkcs8::{EncodePublicKey, LineEnding};
 
 use zeroize::Zeroizing;
 

@@ -1,5 +1,6 @@
 use super::*;
 use crate::{CoreError, PersistentHandle, RegistryId, output::PublicKeyFormat};
+use p256::elliptic_curve::sec1::ToEncodedPoint as _;
 
 fn sec1() -> Vec<u8> {
     hex::decode(concat!(
@@ -17,6 +18,18 @@ fn descriptor(usage: KeyUsage) -> ObjectDescriptor {
         curve: Some(crate::EccCurve::P256),
         hash: None,
         public_key: Some(EccPublicKey::p256_sec1(sec1()).unwrap()),
+    }
+}
+
+#[test]
+fn pubkey_accepts_sign_and_ecdh_descriptors() {
+    let request = PubkeyRequest {
+        selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
+        output_format: PublicKeyFormat::Pem,
+    };
+
+    for usage in [KeyUsage::Sign, KeyUsage::Ecdh] {
+        request.validate_descriptor(&descriptor(usage)).unwrap();
     }
 }
 
@@ -131,6 +144,28 @@ fn public_key_input_rejects_invalid_pem_utf8() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn public_key_input_into_p256_accepts_valid_sec1_der_and_pem() {
+    let normalized = EccPublicKey::p256_sec1(sec1()).unwrap();
+    let compressed = p256::PublicKey::from_sec1_bytes(normalized.sec1())
+        .unwrap()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    let der = crate::output::encode_public_key(&normalized, PublicKeyFormat::Der, None).unwrap();
+    let pem = String::from_utf8(
+        crate::output::encode_public_key(&normalized, PublicKeyFormat::Pem, None).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        PublicKeyInput::Sec1(compressed).into_p256().unwrap(),
+        normalized
+    );
+    assert_eq!(PublicKeyInput::Der(der).into_p256().unwrap(), normalized);
+    assert_eq!(PublicKeyInput::Pem(pem).into_p256().unwrap(), normalized);
 }
 
 #[test]

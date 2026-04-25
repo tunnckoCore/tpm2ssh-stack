@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
 use super::primitives::{DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_bytes};

@@ -1,5 +1,7 @@
-use super::*;
-use crate::derive::primitives::{DeriveRequest, DeriveUse, HashSelection};
+use super::{derive_public_key_bytes, derive_verifying_key, sign_message};
+use crate::derive::primitives::{
+    DeriveMode, DeriveRequest, DeriveUse, DerivedAlgorithm, HashSelection, SecretSeed,
+};
 
 #[test]
 fn public_key_is_32_bytes() {
@@ -19,7 +21,7 @@ fn signature_is_64_bytes() {
 
 #[test]
 fn derived_signature_verifies_with_corresponding_public_key() {
-    use ed25519_dalek::{Signature, Verifier as _};
+    use ed25519_dalek::{Signature, Verifier};
 
     let seed = SecretSeed::new(b"ed seed").unwrap();
     let mode = DeriveMode::deterministic(b"ed verify".to_vec());

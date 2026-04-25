@@ -300,11 +300,10 @@ fn curve_from_record(curve: &str) -> Result<EccCurve> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::object::owner_storage_parent_template;
     use super::*;
-    use crate::{
-        store::{ObjectUsage, RegistryId, RegistryRecord, StoredObjectKind},
-        tpm::owner_storage_parent_template,
-    };
+    use crate::store::{ObjectUsage, RegistryId, RegistryRecord, StoredObjectKind};
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use tss_esapi::{
         attributes::ObjectAttributesBuilder,
         interface_types::{algorithm::PublicAlgorithm, ecc::EccCurve as TpmEccCurve},
@@ -351,14 +350,14 @@ mod tests {
             .unwrap()
     }
 
-    fn ecc_public_with_curve(curve: TpmEccCurve) -> Public {
+    fn ecc_public(curve: TpmEccCurve, sign_encrypt: bool, decrypt: bool) -> Public {
         let attributes = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)
             .with_sensitive_data_origin(true)
             .with_user_with_auth(true)
-            .with_decrypt(false)
-            .with_sign_encrypt(true)
+            .with_decrypt(decrypt)
+            .with_sign_encrypt(sign_encrypt)
             .with_restricted(false)
             .build()
             .unwrap();
@@ -386,7 +385,7 @@ mod tests {
     fn descriptor_from_tpm_public_rejects_non_p256_ecc_objects() {
         let error = descriptor_from_tpm_public(
             ObjectSelector::Id(RegistryId::new("test/key").unwrap()),
-            ecc_public_with_curve(TpmEccCurve::NistP384),
+            ecc_public(TpmEccCurve::NistP384, true, false),
         )
         .unwrap_err()
         .to_string();
@@ -446,7 +445,7 @@ mod tests {
     fn descriptor_from_public_rejects_ecc_and_rsa_objects() {
         let selector = ObjectSelector::Id(RegistryId::new("test/key").unwrap());
 
-        let ecc_public = ecc_public_with_curve(TpmEccCurve::NistP256);
+        let ecc_public = ecc_public(TpmEccCurve::NistP256, true, false);
         let ecc_error = descriptor_from_public(selector.clone(), &ecc_public)
             .unwrap_err()
             .to_string();
@@ -502,5 +501,122 @@ mod tests {
             error,
             "invalid coordinate: expected at most 32 bytes, got 33"
         );
+    }
+
+    #[test]
+    fn registry_entry_handle_handles_non_persistent_missing_and_invalid_handle() {
+        let mut entry = registry_entry();
+        assert_eq!(registry_entry_handle(&entry).unwrap(), None);
+
+        entry.record.persistent = true;
+        assert_eq!(registry_entry_handle(&entry).unwrap(), None);
+
+        entry.record.handle = Some("0x81010010".to_owned());
+        assert_eq!(
+            registry_entry_handle(&entry).unwrap().unwrap(),
+            PersistentHandle::parse("0x81010010").unwrap()
+        );
+
+        entry.record.handle = Some("not-a-handle".to_owned());
+        assert!(
+            registry_entry_handle(&entry)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid persistent TPM handle")
+        );
+    }
+
+    #[test]
+    fn descriptor_from_registry_entry_validates_kind_and_curve_aliases() {
+        let id = RegistryId::new("test/key").unwrap();
+        let mut entry = registry_entry();
+        entry.record.curve = Some("nistp256".to_owned());
+        let descriptor =
+            descriptor_from_registry_entry(RegistryCollection::Keys, &id, &entry).unwrap();
+        assert_eq!(descriptor.usage, KeyUsage::Sign);
+        assert_eq!(descriptor.curve, Some(EccCurve::P256));
+
+        entry.record.kind = StoredObjectKind::Sealed;
+        let error = descriptor_from_registry_entry(RegistryCollection::Keys, &id, &entry)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid kind: registry entry test/key is Sealed, expected Key"
+        );
+    }
+
+    #[test]
+    fn usage_and_public_updates_cover_ecdh_and_usage_mismatch() {
+        let selector = ObjectSelector::Id(RegistryId::new("test/key").unwrap());
+        let ecdh_public = ecc_public(TpmEccCurve::NistP256, false, true);
+        assert_eq!(usage_from_public(&ecdh_public).unwrap(), KeyUsage::Ecdh);
+
+        let descriptor = ObjectDescriptor {
+            selector,
+            usage: KeyUsage::Sign,
+            curve: None,
+            hash: None,
+            public_key: None,
+        };
+        let error = descriptor
+            .with_public_from_tpm(ecdh_public)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid usage: registry says sign but persistent handle contains ecdh object"
+        );
+    }
+
+    #[test]
+    fn with_public_from_tpm_attaches_public_key_for_sign_objects() {
+        let selector = ObjectSelector::Id(RegistryId::new("test/key").unwrap());
+        let secret = p256::SecretKey::from_slice(&[7_u8; 32]).unwrap();
+        let encoded = secret.public_key().to_encoded_point(false);
+        let public = PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::Ecc)
+            .with_name_hashing_algorithm(
+                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+            )
+            .with_object_attributes(
+                ObjectAttributesBuilder::new()
+                    .with_fixed_tpm(true)
+                    .with_fixed_parent(true)
+                    .with_sensitive_data_origin(true)
+                    .with_user_with_auth(true)
+                    .with_decrypt(false)
+                    .with_sign_encrypt(true)
+                    .with_restricted(false)
+                    .build()
+                    .unwrap(),
+            )
+            .with_ecc_parameters(PublicEccParameters::new(
+                tss_esapi::structures::SymmetricDefinitionObject::Null,
+                tss_esapi::structures::EccScheme::Null,
+                TpmEccCurve::NistP256,
+                KeyDerivationFunctionScheme::Null,
+            ))
+            .with_ecc_unique_identifier(EccPoint::new(
+                tss_esapi::structures::EccParameter::try_from(encoded.x().unwrap().to_vec())
+                    .unwrap(),
+                tss_esapi::structures::EccParameter::try_from(encoded.y().unwrap().to_vec())
+                    .unwrap(),
+            ))
+            .build()
+            .unwrap();
+
+        let descriptor = ObjectDescriptor {
+            selector,
+            usage: KeyUsage::Sign,
+            curve: None,
+            hash: None,
+            public_key: None,
+        }
+        .with_public_from_tpm(public)
+        .unwrap();
+
+        assert_eq!(descriptor.curve, None);
+        assert_eq!(descriptor.public_key.unwrap().sec1(), encoded.as_bytes());
     }
 }

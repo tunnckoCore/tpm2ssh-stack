@@ -18,7 +18,7 @@ use std::{fmt, str::FromStr};
 
 pub use error::{CoreError, Error, Result};
 pub use output::{EncodedOutput, OutputFormat};
-use sha2::{Digest as _, Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 pub use store::{IdentityRef, ObjectKind, RegistryId, Store, StoreOptions};
 pub use tpm::{CommandContext, KeyUsage, PersistentHandle};
 
