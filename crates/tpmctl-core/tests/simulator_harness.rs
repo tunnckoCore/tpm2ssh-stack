@@ -8,11 +8,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use p256::ecdsa::{
-    Signature, VerifyingKey,
-    signature::{Verifier as _, hazmat::PrehashVerifier as _},
+use p256::{
+    PublicKey, SecretKey,
+    ecdh::diffie_hellman,
+    ecdsa::{
+        Signature, VerifyingKey,
+        signature::{Verifier as _, hazmat::PrehashVerifier as _},
+    },
+    elliptic_curve::sec1::ToEncodedPoint as _,
 };
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, Sha256, Sha384};
 use tss_esapi::constants::StartupType;
 use zeroize::Zeroizing;
 
@@ -244,7 +249,7 @@ fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() 
     let digest_signature = api::sign(
         &context,
         SignParams {
-            material: ObjectSelector::Id(sign_id),
+            material: ObjectSelector::Id(sign_id.clone()),
             payload: SignPayload::Digest(digest.clone()),
             hash: HashAlgorithm::Sha256,
             output_format: SignatureFormat::Raw,
@@ -254,6 +259,40 @@ fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() 
     let digest_signature = Signature::from_slice(&digest_signature).unwrap();
     verifying_key
         .verify_prehash(digest.as_slice(), &digest_signature)
+        .unwrap();
+
+    let sha384_message = Zeroizing::new(b"api simulator sha384 message bytes".to_vec());
+    let sha384_message_digest = Zeroizing::new(Sha384::digest(sha384_message.as_slice()).to_vec());
+    let sha384_message_signature = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Id(sign_id.clone()),
+            payload: SignPayload::Message(sha384_message),
+            hash: HashAlgorithm::Sha384,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap();
+    let sha384_message_signature = Signature::from_slice(&sha384_message_signature).unwrap();
+    verifying_key
+        .verify_prehash(sha384_message_digest.as_slice(), &sha384_message_signature)
+        .unwrap();
+
+    let sha384_digest =
+        Zeroizing::new(Sha384::digest(b"api simulator sha384 digest bytes").to_vec());
+    let sha384_digest_signature = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Id(sign_id),
+            payload: SignPayload::Digest(sha384_digest.clone()),
+            hash: HashAlgorithm::Sha384,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap();
+    let sha384_digest_signature = Signature::from_slice(&sha384_digest_signature).unwrap();
+    verifying_key
+        .verify_prehash(sha384_digest.as_slice(), &sha384_digest_signature)
         .unwrap();
 }
 
@@ -481,6 +520,70 @@ fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {
     let second_signature = api::derive::derive(&context, signature_params).unwrap();
     assert_eq!(first_signature, second_signature);
     assert_eq!(first_signature.len(), 64);
+}
+
+#[test]
+fn simulator_ecdh_shared_secret_matches_software_p256_agreement() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let Some(_tcti) = SimulatorTcti::activate() else {
+        eprintln!(
+            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
+        );
+        return;
+    };
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let ecdh_id = RegistryId::new("sim/api/ecdh-software-p256").unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: ecdh_id.clone(),
+            persist_at: None,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let tpm_public_sec1 = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(ecdh_id.clone()),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let tpm_public = PublicKey::from_sec1_bytes(&tpm_public_sec1).unwrap();
+
+    let software_secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
+    let software_public_sec1 = software_secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+
+    let tpm_shared_secret = api::ecdh(
+        &context,
+        EcdhParams {
+            material: ObjectSelector::Id(ecdh_id),
+            peer_public_key: PublicKeyInput::Sec1(software_public_sec1),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+
+    let software_shared_secret =
+        diffie_hellman(software_secret.to_nonzero_scalar(), tpm_public.as_affine());
+    let expected_shared_secret: &[u8] = software_shared_secret.raw_secret_bytes().as_ref();
+    assert_eq!(tpm_shared_secret.as_slice(), expected_shared_secret);
 }
 
 #[test]

@@ -83,7 +83,7 @@ impl PublicKeyInput {
             return Ok(Self::Pem(pem));
         }
 
-        if matches!(bytes.first(), Some(0x02 | 0x03 | 0x04)) {
+        if matches!(bytes.first(), Some(0x02..=0x04)) {
             return Ok(Self::Sec1(bytes));
         }
 

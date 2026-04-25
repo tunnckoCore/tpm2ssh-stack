@@ -3,7 +3,6 @@
 
 pub mod api;
 pub mod crypto;
-pub mod derive_domain;
 pub mod ecdh;
 pub mod error;
 pub mod hmac;
