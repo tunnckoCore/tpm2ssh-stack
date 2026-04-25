@@ -8,11 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use k256::ecdsa::{Signature as Secp256k1Signature, VerifyingKey as Secp256k1VerifyingKey};
 use p256::{
     PublicKey, SecretKey,
     ecdh::diffie_hellman,
     ecdsa::{
-        Signature, VerifyingKey,
+        Signature as P256Signature, VerifyingKey,
         signature::{Verifier as _, hazmat::PrehashVerifier as _},
     },
     elliptic_curve::sec1::ToEncodedPoint as _,
@@ -144,7 +146,7 @@ fn simulator_persistent_handle_keygen_loads_by_handle_and_enforces_lifecycle() {
     }
     .execute(&store)
     .unwrap();
-    let signature = Signature::from_slice(&signature).unwrap();
+    let signature = P256Signature::from_slice(&signature).unwrap();
     verifying_key
         .verify(message.as_slice(), &signature)
         .unwrap();
@@ -179,7 +181,7 @@ fn simulator_persistent_handle_keygen_loads_by_handle_and_enforces_lifecycle() {
     }
     .execute(&store)
     .unwrap();
-    let replacement_signature = Signature::from_slice(&replacement_signature).unwrap();
+    let replacement_signature = P256Signature::from_slice(&replacement_signature).unwrap();
     assert!(
         verifying_key
             .verify(message.as_slice(), &replacement_signature)
@@ -240,7 +242,7 @@ fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() 
         },
     )
     .unwrap();
-    let message_signature = Signature::from_slice(&message_signature).unwrap();
+    let message_signature = P256Signature::from_slice(&message_signature).unwrap();
     verifying_key
         .verify(message.as_slice(), &message_signature)
         .unwrap();
@@ -256,7 +258,7 @@ fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() 
         },
     )
     .unwrap();
-    let digest_signature = Signature::from_slice(&digest_signature).unwrap();
+    let digest_signature = P256Signature::from_slice(&digest_signature).unwrap();
     verifying_key
         .verify_prehash(digest.as_slice(), &digest_signature)
         .unwrap();
@@ -273,7 +275,7 @@ fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() 
         },
     )
     .unwrap();
-    let sha384_message_signature = Signature::from_slice(&sha384_message_signature).unwrap();
+    let sha384_message_signature = P256Signature::from_slice(&sha384_message_signature).unwrap();
     verifying_key
         .verify_prehash(sha384_message_digest.as_slice(), &sha384_message_signature)
         .unwrap();
@@ -290,7 +292,7 @@ fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() 
         },
     )
     .unwrap();
-    let sha384_digest_signature = Signature::from_slice(&sha384_digest_signature).unwrap();
+    let sha384_digest_signature = P256Signature::from_slice(&sha384_digest_signature).unwrap();
     verifying_key
         .verify_prehash(sha384_digest.as_slice(), &sha384_digest_signature)
         .unwrap();
@@ -431,7 +433,211 @@ fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
     )
     .unwrap();
     assert_eq!(signature.len(), 64);
-    let signature = Signature::from_slice(&signature).unwrap();
+    let signature = P256Signature::from_slice(&signature).unwrap();
+    verifying_key
+        .verify(message.as_slice(), &signature)
+        .unwrap();
+}
+
+#[test]
+fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_signature() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let Some(_tcti) = SimulatorTcti::activate() else {
+        eprintln!(
+            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
+        );
+        return;
+    };
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let seed_id = RegistryId::new("sim/api/derive/secp256k1-sealed-seed").unwrap();
+    let label = b"simulator sealed seed secp256k1 derivation".to_vec();
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(seed_id.clone()),
+            input: Zeroizing::new(b"sealed secp256k1 derive integration seed material".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let public_sec1 = derive::derive(
+        &context,
+        derive::DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: derive::DeriveUse::Pubkey,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(public_sec1.len(), 65);
+    assert_eq!(public_sec1[0], 0x04);
+    let verifying_key = Secp256k1VerifyingKey::from_sec1_bytes(&public_sec1).unwrap();
+
+    let compressed_public = derive::derive(
+        &context,
+        derive::DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: derive::DeriveUse::Pubkey,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: true,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(compressed_public.len(), 33);
+    assert!(matches!(compressed_public[0], 0x02 | 0x03));
+
+    let address = derive::derive(
+        &context,
+        derive::DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: derive::DeriveUse::Pubkey,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Address,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(address.len(), 42);
+    assert!(address.starts_with(b"0x"));
+
+    let message = Zeroizing::new(b"api derive simulator secp256k1 signature payload".to_vec());
+    let digest = Zeroizing::new(Sha256::digest(message.as_slice()).to_vec());
+    let signature = derive::derive(
+        &context,
+        derive::DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: derive::DeriveUse::Sign,
+            payload: Some(derive::SignPayload::Message(message.clone())),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(signature.len(), 64);
+    let signature = Secp256k1Signature::from_slice(&signature).unwrap();
+    verifying_key
+        .verify_prehash(digest.as_slice(), &signature)
+        .unwrap();
+
+    let digest_signature = derive::derive(
+        &context,
+        derive::DeriveParams {
+            material: ObjectSelector::Id(seed_id),
+            label: Some(label),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: derive::DeriveUse::Sign,
+            payload: Some(derive::SignPayload::Digest(digest.clone())),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(digest_signature.len(), 64);
+    let digest_signature = Secp256k1Signature::from_slice(&digest_signature).unwrap();
+    verifying_key
+        .verify_prehash(digest.as_slice(), &digest_signature)
+        .unwrap();
+}
+
+#[test]
+fn simulator_api_derive_from_sealed_seed_emits_ed25519_pubkey_and_signature() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let Some(_tcti) = SimulatorTcti::activate() else {
+        eprintln!(
+            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
+        );
+        return;
+    };
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let seed_id = RegistryId::new("sim/api/derive/ed25519-sealed-seed").unwrap();
+    let label = b"simulator sealed seed ed25519 derivation".to_vec();
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(seed_id.clone()),
+            input: Zeroizing::new(b"sealed ed25519 derive integration seed material".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let public_key = derive::derive(
+        &context,
+        derive::DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Ed25519,
+            usage: derive::DeriveUse::Pubkey,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(public_key.len(), 32);
+    let public_key: [u8; 32] = public_key.as_slice().try_into().unwrap();
+    let verifying_key = Ed25519VerifyingKey::from_bytes(&public_key).unwrap();
+
+    let message = Zeroizing::new(b"api derive simulator ed25519 signature payload".to_vec());
+    let signature = derive::derive(
+        &context,
+        derive::DeriveParams {
+            material: ObjectSelector::Id(seed_id),
+            label: Some(label),
+            algorithm: DeriveAlgorithm::Ed25519,
+            usage: derive::DeriveUse::Sign,
+            payload: Some(derive::SignPayload::Message(message.clone())),
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(signature.len(), 64);
+    let signature = Ed25519Signature::try_from(signature.as_slice()).unwrap();
     verifying_key
         .verify(message.as_slice(), &signature)
         .unwrap();
@@ -638,7 +844,7 @@ fn simulator_api_facade_keygen_pubkey_sign_hmac_seal_and_ecdh_roundtrip() {
         },
     )
     .unwrap();
-    let signature = Signature::from_slice(&signature).unwrap();
+    let signature = P256Signature::from_slice(&signature).unwrap();
     verifying_key
         .verify(message.as_slice(), &signature)
         .unwrap();

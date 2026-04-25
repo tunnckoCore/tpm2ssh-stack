@@ -26,6 +26,7 @@
           rustToolchain = pkgs.rust-bin.stable."1.88.0".default.override {
             extensions = [
               "clippy"
+              "llvm-tools-preview"
               "rust-src"
               "rustfmt"
             ];
@@ -40,6 +41,8 @@
             packages = with pkgs; [
               rustToolchain
               rust-analyzer
+              cargo-llvm-cov
+              cargo-tarpaulin
               pkg-config
               openssl
               swtpm
