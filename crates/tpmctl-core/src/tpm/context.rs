@@ -87,7 +87,7 @@ impl TctiResolution {
     }
 }
 
-pub(crate) fn resolve_tcti_name_conf() -> Result<TctiNameConf> {
+fn resolve_tcti_name_conf() -> Result<TctiNameConf> {
     TctiResolution::from_environment().to_name_conf()
 }
 
@@ -147,7 +147,7 @@ pub fn create_context() -> Result<Context> {
     Context::new(tcti).map_err(|source| CoreError::tpm("Context::new", source))
 }
 
-pub(crate) fn create_context_with_tcti(override_value: Option<&str>) -> Result<Context> {
+fn create_context_with_tcti(override_value: Option<&str>) -> Result<Context> {
     let tcti = match override_value {
         Some(value) if value.trim().is_empty() => {
             return Err(CoreError::Tcti("TCTI override is empty".into()));
@@ -165,4 +165,118 @@ pub(crate) fn create_context_with_tcti(override_value: Option<&str>) -> Result<C
 /// Create a tss-esapi context for a command context.
 pub fn create_context_for(command: &CommandContext) -> Result<Context> {
     create_context_with_tcti(command.tcti.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn to_name_conf_rejects_invalid_env_override() {
+        let resolution = TctiResolution {
+            source: TctiSource::Env("TCTI"),
+            value: Some("not-a-valid-tcti".to_owned()),
+        };
+
+        let error = resolution.to_name_conf().unwrap_err().to_string();
+        assert!(error.contains("failed to parse TCTI"));
+        assert!(error.contains("not-a-valid-tcti"));
+    }
+
+    #[test]
+    fn to_name_conf_rejects_inconsistent_resolution_state() {
+        let resolution = TctiResolution {
+            source: TctiSource::DefaultDevice,
+            value: Some("device:/dev/tpmrm0".to_owned()),
+        };
+
+        assert_eq!(
+            resolution.to_name_conf().unwrap_err().to_string(),
+            "failed to resolve TCTI: inconsistent TCTI resolution state"
+        );
+    }
+
+    #[test]
+    fn tcti_name_conf_from_env_reports_parse_error() {
+        let _guard = env_lock();
+        unsafe {
+            env::remove_var("TPM2TOOLS_TCTI");
+            env::remove_var("TCTI");
+            env::remove_var("TEST_TCTI");
+            env::set_var("TCTI", "not-a-valid-tcti");
+        }
+
+        let error = tcti_name_conf_from_env().unwrap_err();
+        assert!(error.contains("failed to parse TCTI=\"not-a-valid-tcti\""));
+
+        unsafe {
+            env::remove_var("TCTI");
+        }
+    }
+
+    #[test]
+    fn create_context_with_tcti_rejects_empty_override() {
+        assert_eq!(
+            create_context_with_tcti(Some("  "))
+                .unwrap_err()
+                .to_string(),
+            "failed to resolve TCTI: TCTI override is empty"
+        );
+    }
+
+    #[test]
+    fn create_context_with_tcti_rejects_invalid_override() {
+        let error = create_context_with_tcti(Some("not-a-valid-tcti"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to parse TCTI override \"not-a-valid-tcti\""));
+    }
+
+    #[test]
+    fn parse_tpm_handle_literal_accepts_hex_and_decimal() {
+        assert_eq!(
+            parse_tpm_handle_literal("0x81010010").unwrap(),
+            Some(TpmHandle::try_from(0x8101_0010).unwrap())
+        );
+        assert_eq!(
+            parse_tpm_handle_literal("2164326416").unwrap(),
+            Some(TpmHandle::try_from(0x8101_0010).unwrap())
+        );
+        assert_eq!(
+            parse_tpm_handle_literal("0X81010010").unwrap(),
+            Some(TpmHandle::try_from(0x8101_0010).unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_tpm_handle_literal_handles_empty_nonnumeric_and_invalid_numbers() {
+        assert_eq!(
+            parse_tpm_handle_literal("").unwrap_err(),
+            "empty TPM handle"
+        );
+        assert_eq!(parse_tpm_handle_literal("signing-key").unwrap(), None);
+        assert!(
+            parse_tpm_handle_literal("0xzzzz")
+                .unwrap_err()
+                .contains("invalid digit")
+        );
+        assert!(
+            parse_tpm_handle_literal("4294967296")
+                .unwrap_err()
+                .contains("number too large")
+        );
+    }
+
+    #[test]
+    fn parse_tpm_handle_literal_rejects_unsupported_numeric_handle() {
+        let error = parse_tpm_handle_literal("0xFFFF0000").unwrap_err();
+        assert!(error.contains("unsupported TPM handle 0xFFFF0000"));
+    }
 }

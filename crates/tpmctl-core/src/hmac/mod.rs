@@ -152,11 +152,11 @@ impl fmt::Debug for HmacResult {
     }
 }
 
-pub(crate) fn encode_hmac_output(bytes: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
+fn encode_hmac_output(bytes: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
     encode_secret_binary(bytes, output_format)
 }
 
-pub(crate) fn compute_tpm_hmac(
+fn compute_tpm_hmac(
     context: &mut tss_esapi::Context,
     object_handle: ObjectHandle,
     input: &[u8],
@@ -188,19 +188,6 @@ pub(crate) fn compute_tpm_hmac(
     Ok(Zeroizing::new(digest.value().to_vec()))
 }
 
-pub(crate) fn prf_seed_from_hmac_identity(
-    command: &CommandContext,
-    selector: &ObjectSelector,
-    input: &[u8],
-    hash: Option<HashAlgorithm>,
-) -> Result<Zeroizing<Vec<u8>>> {
-    let mut context = tpm::create_context_for(command)?;
-    let (object_handle, descriptor) = load_hmac_key(&mut context, command, selector)?;
-    descriptor.require_usage(KeyUsage::Hmac)?;
-    let hash = hash.or(descriptor.hash).unwrap_or(HashAlgorithm::Sha256);
-    compute_tpm_hmac(&mut context, object_handle, input, hash)
-}
-
 fn load_hmac_key(
     context: &mut tss_esapi::Context,
     command: &CommandContext,
@@ -224,7 +211,7 @@ fn load_hmac_key(
 }
 
 #[cfg(test)]
-pub(crate) fn compute_software_hmac_for_tests(
+fn compute_software_hmac_for_tests(
     key: &[u8],
     input: &[u8],
     hash: HashAlgorithm,

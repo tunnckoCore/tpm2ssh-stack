@@ -11,7 +11,7 @@ use tss_esapi::{
 
 use super::{KeyUsage, PersistentHandle, unmarshal_public};
 
-pub(crate) fn ecc_public_key_from_public(public: &Public) -> Result<EccPublicKey> {
+fn ecc_public_key_from_public(public: &Public) -> Result<EccPublicKey> {
     match public {
         Public::Ecc {
             parameters, unique, ..
@@ -212,7 +212,7 @@ impl ObjectDescriptor {
     }
 }
 
-pub(crate) fn descriptor_from_registry_entry(
+pub(in crate::tpm) fn descriptor_from_registry_entry(
     collection: RegistryCollection,
     id: &RegistryId,
     entry: &StoredObjectEntry,
@@ -295,5 +295,212 @@ fn curve_from_record(curve: &str) -> Result<EccCurve> {
             "curve",
             format!("unsupported curve in registry record: {other:?}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        store::{ObjectUsage, RegistryId, RegistryRecord, StoredObjectKind},
+        tpm::owner_storage_parent_template,
+    };
+    use tss_esapi::{
+        attributes::ObjectAttributesBuilder,
+        interface_types::{algorithm::PublicAlgorithm, ecc::EccCurve as TpmEccCurve},
+        structures::{
+            Digest, EccPoint, KeyDerivationFunctionScheme, PublicBuilder, PublicEccParameters,
+            PublicKeyedHashParameters,
+        },
+    };
+
+    fn registry_entry() -> StoredObjectEntry {
+        let id = RegistryId::new("test/key").unwrap();
+        StoredObjectEntry {
+            record: RegistryRecord::new(&id, StoredObjectKind::Key, ObjectUsage::Sign),
+            public_blob: Vec::new(),
+            private_blob: zeroize::Zeroizing::new(Vec::new()),
+            public_pem: None,
+        }
+    }
+
+    fn hmac_public() -> Public {
+        let attributes = ObjectAttributesBuilder::new()
+            .with_fixed_tpm(true)
+            .with_fixed_parent(true)
+            .with_user_with_auth(true)
+            .with_sign_encrypt(true)
+            .build()
+            .unwrap();
+        PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::KeyedHash)
+            .with_name_hashing_algorithm(
+                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+            )
+            .with_object_attributes(attributes)
+            .with_keyed_hash_parameters(PublicKeyedHashParameters::new(
+                tss_esapi::structures::KeyedHashScheme::Hmac {
+                    hmac_scheme: tss_esapi::structures::HashScheme::new(
+                        tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+                    )
+                    .into(),
+                },
+            ))
+            .with_keyed_hash_unique_identifier(Digest::default())
+            .build()
+            .unwrap()
+    }
+
+    fn ecc_public_with_curve(curve: TpmEccCurve) -> Public {
+        let attributes = ObjectAttributesBuilder::new()
+            .with_fixed_tpm(true)
+            .with_fixed_parent(true)
+            .with_sensitive_data_origin(true)
+            .with_user_with_auth(true)
+            .with_decrypt(false)
+            .with_sign_encrypt(true)
+            .with_restricted(false)
+            .build()
+            .unwrap();
+
+        let parameters = PublicEccParameters::new(
+            tss_esapi::structures::SymmetricDefinitionObject::Null,
+            tss_esapi::structures::EccScheme::Null,
+            curve,
+            KeyDerivationFunctionScheme::Null,
+        );
+
+        PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::Ecc)
+            .with_name_hashing_algorithm(
+                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+            )
+            .with_object_attributes(attributes)
+            .with_ecc_parameters(parameters)
+            .with_ecc_unique_identifier(EccPoint::default())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn descriptor_from_tpm_public_rejects_non_p256_ecc_objects() {
+        let error = descriptor_from_tpm_public(
+            ObjectSelector::Id(RegistryId::new("test/key").unwrap()),
+            ecc_public_with_curve(TpmEccCurve::NistP384),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("expected NIST P-256"));
+    }
+
+    #[test]
+    fn descriptor_from_tpm_public_rejects_unsupported_rsa_object() {
+        let error = descriptor_from_tpm_public(
+            ObjectSelector::Id(RegistryId::new("test/key").unwrap()),
+            owner_storage_parent_template().unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(
+            error,
+            "invalid usage: unable to infer supported key usage from TPM public area"
+        );
+    }
+
+    #[test]
+    fn descriptor_from_entry_rejects_unsupported_curve_hash_and_cached_public_key() {
+        let mut entry = registry_entry();
+        entry.record.curve = Some("p384".to_owned());
+        let curve_error = descriptor_from_entry(
+            ObjectSelector::Id(RegistryId::new("test/key").unwrap()),
+            &entry,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(curve_error, "invalid curve: unsupported curve \"p384\"");
+
+        let mut entry = registry_entry();
+        entry.record.hash = Some("sha1".to_owned());
+        let hash_error = descriptor_from_entry(
+            ObjectSelector::Id(RegistryId::new("test/key").unwrap()),
+            &entry,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(hash_error, "invalid hash: unsupported hash \"sha1\"");
+
+        let mut entry = registry_entry();
+        entry.record.public_key = Some("hex:not-hex".to_owned());
+        let public_key_error = descriptor_from_entry(
+            ObjectSelector::Id(RegistryId::new("test/key").unwrap()),
+            &entry,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(public_key_error.starts_with("invalid public_key:"));
+    }
+
+    #[test]
+    fn descriptor_from_public_rejects_ecc_and_rsa_objects() {
+        let selector = ObjectSelector::Id(RegistryId::new("test/key").unwrap());
+
+        let ecc_public = ecc_public_with_curve(TpmEccCurve::NistP256);
+        let ecc_error = descriptor_from_public(selector.clone(), &ecc_public)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            ecc_error,
+            "invalid usage: object is not a keyed-hash HMAC key or sealed data object"
+        );
+
+        let rsa_error = descriptor_from_public(selector, &owner_storage_parent_template().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            rsa_error,
+            "invalid usage: object is not a keyed-hash HMAC key or sealed data object"
+        );
+    }
+
+    #[test]
+    fn descriptor_from_public_maps_hmac_and_sealed_keyed_hash_objects() {
+        let selector = ObjectSelector::Id(RegistryId::new("test/key").unwrap());
+        let hmac = descriptor_from_public(selector.clone(), &hmac_public()).unwrap();
+        assert_eq!(hmac.usage, KeyUsage::Hmac);
+
+        let attributes = ObjectAttributesBuilder::new()
+            .with_fixed_tpm(true)
+            .with_fixed_parent(true)
+            .with_user_with_auth(true)
+            .build()
+            .unwrap();
+        let sealed_public = PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::KeyedHash)
+            .with_name_hashing_algorithm(
+                tss_esapi::interface_types::algorithm::HashingAlgorithm::Sha256,
+            )
+            .with_object_attributes(attributes)
+            .with_keyed_hash_parameters(PublicKeyedHashParameters::new(
+                tss_esapi::structures::KeyedHashScheme::Null,
+            ))
+            .with_keyed_hash_unique_identifier(Digest::default())
+            .build()
+            .unwrap();
+        let sealed = descriptor_from_public(selector, &sealed_public).unwrap();
+        assert_eq!(sealed.usage, KeyUsage::Sealed);
+    }
+
+    #[test]
+    fn left_pad_copy_rejects_oversized_coordinate() {
+        let mut out = [0_u8; 32];
+        let error = left_pad_copy(&[7_u8; 33], &mut out, "coordinate")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid coordinate: expected at most 32 bytes, got 33"
+        );
     }
 }

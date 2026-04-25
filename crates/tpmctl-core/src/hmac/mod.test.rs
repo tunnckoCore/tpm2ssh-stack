@@ -30,6 +30,27 @@ fn hmac_validates_expected_key_usage() {
 }
 
 #[test]
+fn hmac_effective_hash_prefers_request_override_and_otherwise_defaults() {
+    let descriptor = ObjectDescriptor {
+        selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
+        usage: KeyUsage::Hmac,
+        curve: None,
+        hash: Some(HashAlgorithm::Sha256),
+        public_key: None,
+    };
+
+    let mut override_request = request();
+    override_request.hash = Some(HashAlgorithm::Sha384);
+    assert_eq!(
+        override_request.effective_hash(Some(&descriptor)),
+        HashAlgorithm::Sha384
+    );
+
+    let default_request = request();
+    assert_eq!(default_request.effective_hash(None), HashAlgorithm::Sha256);
+}
+
+#[test]
 fn hmac_rejects_non_hmac_usage() {
     let descriptor = ObjectDescriptor {
         selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),

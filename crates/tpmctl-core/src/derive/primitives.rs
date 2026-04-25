@@ -17,7 +17,7 @@ impl SecretSeed {
         Ok(Self(Zeroizing::new(bytes.to_vec())))
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -60,7 +60,7 @@ impl DeriveMode {
         }
     }
 
-    pub(crate) fn info_prefix(&self) -> Vec<u8> {
+    fn info_prefix(&self) -> Vec<u8> {
         let mut info = Vec::new();
         match self {
             Self::Deterministic { label } => {
@@ -90,7 +90,7 @@ pub enum DerivedAlgorithm {
 }
 
 impl DerivedAlgorithm {
-    pub(crate) fn domain(self) -> &'static [u8] {
+    pub(super) fn domain(self) -> &'static [u8] {
         match self {
             Self::P256 => b"p256",
             Self::Ed25519 => b"ed25519",
@@ -173,7 +173,7 @@ pub enum DeriveError {
 const HKDF_SALT: &[u8] = b"tpmctl derived software key v1";
 const MAX_SCALAR_ATTEMPTS: u32 = 1024;
 
-pub(crate) fn derive_bytes(
+pub(super) fn derive_bytes(
     seed: &SecretSeed,
     mode: &DeriveMode,
     algorithm: DerivedAlgorithm,
@@ -196,7 +196,7 @@ pub(crate) fn derive_bytes(
     Ok(out)
 }
 
-pub(crate) fn derive_valid_secret_key<K, F>(
+pub(in crate::derive) fn derive_valid_secret_key<K, F>(
     seed: &SecretSeed,
     mode: &DeriveMode,
     algorithm: DerivedAlgorithm,
@@ -216,7 +216,7 @@ where
 }
 
 #[cfg(test)]
-pub(crate) fn retry_valid_candidate_for_test<K, F>(mut try_key: F) -> Result<K, DeriveError>
+pub(super) fn retry_valid_candidate_for_test<K, F>(mut try_key: F) -> Result<K, DeriveError>
 where
     F: FnMut(&[u8; 32]) -> Option<K>,
 {

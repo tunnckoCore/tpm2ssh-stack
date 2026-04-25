@@ -2,7 +2,7 @@ use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
 #[derive(Debug, Error, Eq, PartialEq)]
-pub(crate) enum EthereumError {
+pub(super) enum EthereumError {
     #[error("Ethereum public key must be 64 raw bytes or 65 uncompressed SEC1 bytes")]
     InvalidPublicKeyLength,
 }
@@ -10,7 +10,7 @@ pub(crate) enum EthereumError {
 /// Returns the 20-byte Ethereum address for a secp256k1 public key.
 ///
 /// Accepts either raw `x || y` (64 bytes) or uncompressed SEC1 (`0x04 || x || y`).
-pub(crate) fn ethereum_address_bytes(public_key: &[u8]) -> Result<[u8; 20], EthereumError> {
+fn ethereum_address_bytes(public_key: &[u8]) -> Result<[u8; 20], EthereumError> {
     let raw = match public_key.len() {
         64 => public_key,
         65 if public_key[0] == 0x04 => &public_key[1..],
@@ -24,7 +24,7 @@ pub(crate) fn ethereum_address_bytes(public_key: &[u8]) -> Result<[u8; 20], Ethe
 }
 
 /// Formats a 20-byte address with EIP-55 checksum casing.
-pub(crate) fn to_checksum_address(address: &[u8; 20]) -> String {
+fn to_checksum_address(address: &[u8; 20]) -> String {
     let lower = hex::encode(address);
     let hash = Keccak256::digest(lower.as_bytes());
 
@@ -47,7 +47,7 @@ pub(crate) fn to_checksum_address(address: &[u8; 20]) -> String {
 }
 
 /// Derives and formats an EIP-55 address from a secp256k1 public key.
-pub(crate) fn checksum_address_from_public_key(public_key: &[u8]) -> Result<String, EthereumError> {
+pub(super) fn checksum_address_from_public_key(public_key: &[u8]) -> Result<String, EthereumError> {
     Ok(to_checksum_address(&ethereum_address_bytes(public_key)?))
 }
 

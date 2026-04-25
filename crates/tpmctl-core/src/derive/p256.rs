@@ -10,7 +10,7 @@ use super::primitives::{
 
 /// Derives a valid non-zero P-256 scalar, retrying HKDF output until accepted by
 /// the curve implementation.
-pub(crate) fn derive_secret_key(
+pub(super) fn derive_secret_key(
     seed: &SecretSeed,
     mode: &DeriveMode,
 ) -> Result<SecretKey, DeriveError> {
@@ -19,7 +19,7 @@ pub(crate) fn derive_secret_key(
     })
 }
 
-pub(crate) fn derive_public_key_sec1(
+pub(super) fn derive_public_key_sec1(
     seed: &SecretSeed,
     mode: &DeriveMode,
     compressed: bool,
@@ -32,7 +32,7 @@ pub(crate) fn derive_public_key_sec1(
 #[cfg(test)]
 /// Signs message bytes using ECDSA/P-256. The `p256` ECDSA implementation hashes
 /// the message internally according to its signature crate semantics.
-pub(crate) fn sign_message(
+fn sign_message(
     seed: &SecretSeed,
     mode: &DeriveMode,
     message: &[u8],
@@ -44,7 +44,7 @@ pub(crate) fn sign_message(
 }
 
 /// Signs a caller-supplied digest using ECDSA/P-256 prehash semantics.
-pub(crate) fn sign_prehash(
+pub(super) fn sign_prehash(
     seed: &SecretSeed,
     mode: &DeriveMode,
     digest: &[u8],

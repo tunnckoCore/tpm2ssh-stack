@@ -16,6 +16,21 @@ fn seal_requires_non_empty_input() {
 }
 
 #[test]
+fn seal_rejects_input_larger_than_tpm_sensitive_data_limit() {
+    let request = SealRequest {
+        selector: selector(),
+        input: Zeroizing::new(vec![
+            0_u8;
+            tss_esapi::structures::SensitiveData::MAX_SIZE + 1
+        ]),
+        force: false,
+    };
+
+    let error = request.validate().unwrap_err().to_string();
+    assert!(error.contains("sealed input is too large"));
+}
+
+#[test]
 fn unseal_validates_expected_object_usage() {
     let request = UnsealRequest {
         selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0020).unwrap()),

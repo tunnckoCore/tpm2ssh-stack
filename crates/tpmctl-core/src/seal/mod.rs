@@ -149,10 +149,7 @@ pub(crate) fn seal_bytes(
     Ok(SealResult { selector, hash })
 }
 
-pub(crate) fn unseal_bytes(
-    command: &CommandContext,
-    selector: &ObjectSelector,
-) -> Result<Zeroizing<Vec<u8>>> {
+fn unseal_bytes(command: &CommandContext, selector: &ObjectSelector) -> Result<Zeroizing<Vec<u8>>> {
     let mut context = tpm::create_context_for(command)?;
 
     let (object_handle, descriptor) = match selector {

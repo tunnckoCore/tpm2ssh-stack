@@ -344,7 +344,7 @@ pub fn evict_persistent_object(
         .map_err(|source| CoreError::tpm("EvictControl evict persistent object", source))
 }
 
-pub(crate) fn create_default_parent(context: &mut Context) -> Result<KeyHandle> {
+fn create_default_parent(context: &mut Context) -> Result<KeyHandle> {
     create_owner_storage_parent(context)
 }
 

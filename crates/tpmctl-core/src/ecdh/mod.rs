@@ -66,10 +66,7 @@ impl EcdhRequest {
     }
 }
 
-pub(crate) fn encode_shared_secret(
-    secret: &[u8],
-    output_format: BinaryFormat,
-) -> Zeroizing<Vec<u8>> {
+fn encode_shared_secret(secret: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
     encode_secret_binary(secret, output_format)
 }
 

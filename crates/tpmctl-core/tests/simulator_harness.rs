@@ -214,6 +214,129 @@ fn simulator_persistent_handle_keygen_loads_by_handle_and_enforces_lifecycle() {
 }
 
 #[test]
+fn simulator_seal_rejects_existing_registry_target_without_overwrite_and_preserves_original() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let Some(_tcti) = SimulatorTcti::activate() else {
+        eprintln!(
+            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
+        );
+        return;
+    };
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let sealed_id = RegistryId::new("sim/negative/sealed-duplicate").unwrap();
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: Zeroizing::new(b"first sealed secret".to_vec()),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let duplicate = api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: Zeroizing::new(b"second sealed secret".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(duplicate.contains("already exists"));
+
+    let unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id),
+        },
+    )
+    .unwrap();
+    assert_eq!(unsealed.as_slice(), b"first sealed secret");
+}
+
+#[test]
+fn simulator_sign_and_hmac_reject_wrong_object_usages() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let Some(_tcti) = SimulatorTcti::activate() else {
+        eprintln!(
+            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
+        );
+        return;
+    };
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+
+    let store = Store::new(temp_store.path());
+    let sign_id = RegistryId::new("sim/negative/sign-key").unwrap();
+    let hmac_id = RegistryId::new("sim/negative/hmac-key").unwrap();
+
+    KeygenRequest {
+        usage: KeygenUsage::Sign,
+        id: sign_id.clone(),
+        persist_at: None,
+        force: false,
+    }
+    .execute_with_store(&store)
+    .unwrap();
+
+    KeygenRequest {
+        usage: KeygenUsage::Hmac,
+        id: hmac_id.clone(),
+        persist_at: None,
+        force: false,
+    }
+    .execute_with_store(&store)
+    .unwrap();
+
+    let sign_with_hmac = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Id(hmac_id.clone()),
+            payload: SignPayload::Message(Zeroizing::new(b"wrong usage sign".to_vec())),
+            hash: HashAlgorithm::Sha256,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(sign_with_hmac.contains("expected sign object, got hmac"));
+
+    let hmac_with_sign = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(sign_id.clone()),
+            input: Zeroizing::new(b"wrong usage hmac".to_vec()),
+            hash: None,
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(hmac_with_sign.contains("expected hmac object, got sign"));
+}
+
+#[test]
 fn simulator_force_replacement_allows_manual_evict_of_replacement_only() {
     let _guard = simulator_test_lock().lock().unwrap();
     let Some(_tcti) = SimulatorTcti::activate() else {

@@ -198,3 +198,7 @@ fn hash_selection(hash: HashAlgorithm) -> HashSelection {
         HashAlgorithm::Sha512 => HashSelection::Sha512,
     }
 }
+
+#[cfg(test)]
+#[path = "validation.test.rs"]
+mod tests;

@@ -15,11 +15,11 @@ use crate::{
 
 use crate::api::Context;
 
-pub(crate) mod ed25519;
-pub(crate) mod ethereum;
-pub(crate) mod p256;
+mod ed25519;
+mod ethereum;
+mod p256;
 pub mod primitives;
-pub(crate) mod secp256k1;
+mod secp256k1;
 mod seed;
 mod validation;
 

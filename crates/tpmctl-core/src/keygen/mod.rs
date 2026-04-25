@@ -179,7 +179,7 @@ pub struct KeygenResult {
     pub persistent_handle: Option<PersistentHandle>,
 }
 
-pub(crate) fn template_for_usage(usage: KeygenUsage) -> KeyTemplate {
+fn template_for_usage(usage: KeygenUsage) -> KeyTemplate {
     match usage {
         KeygenUsage::Sign => KeyTemplate::EccP256Sign,
         KeygenUsage::Ecdh => KeyTemplate::EccP256Ecdh,
@@ -187,7 +187,7 @@ pub(crate) fn template_for_usage(usage: KeygenUsage) -> KeyTemplate {
     }
 }
 
-pub(crate) fn public_template_for_usage(usage: KeygenUsage) -> Result<Public> {
+fn public_template_for_usage(usage: KeygenUsage) -> Result<Public> {
     match usage {
         KeygenUsage::Sign => ecc_p256_sign_template(),
         KeygenUsage::Ecdh => ecc_p256_ecdh_template(),
@@ -195,7 +195,7 @@ pub(crate) fn public_template_for_usage(usage: KeygenUsage) -> Result<Public> {
     }
 }
 
-pub(crate) fn ecc_p256_sign_template() -> Result<Public> {
+fn ecc_p256_sign_template() -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -224,7 +224,7 @@ pub(crate) fn ecc_p256_sign_template() -> Result<Public> {
         .map_err(|source| CoreError::tpm("build ECC signing public template", source))
 }
 
-pub(crate) fn ecc_p256_ecdh_template() -> Result<Public> {
+fn ecc_p256_ecdh_template() -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -256,7 +256,7 @@ pub(crate) fn ecc_p256_ecdh_template() -> Result<Public> {
         .map_err(|source| CoreError::tpm("build ECC ECDH public template", source))
 }
 
-pub(crate) fn keyed_hash_hmac_template() -> Result<Public> {
+fn keyed_hash_hmac_template() -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -353,7 +353,7 @@ fn stored_key_entry(
     })
 }
 
-pub(crate) fn ecc_public_key_from_tpm_public(public: &Public) -> Result<Option<EccPublicKey>> {
+fn ecc_public_key_from_tpm_public(public: &Public) -> Result<Option<EccPublicKey>> {
     let Public::Ecc { unique, .. } = public else {
         return Ok(None);
     };

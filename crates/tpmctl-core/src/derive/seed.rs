@@ -1,7 +1,9 @@
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
-    CommandContext, Error, ObjectSelector, Result, hmac::prf_seed_from_hmac_identity,
+    CommandContext, Error, ObjectSelector, Result,
+    hmac::{HmacRequest, HmacResult},
+    output::BinaryFormat,
     seal::UnsealRequest,
 };
 
@@ -43,9 +45,24 @@ fn hmac_prf_seed(
     if let Some(label) = &params.label {
         input.extend_from_slice(label);
     }
-    let seed = prf_seed_from_hmac_identity(command, selector, &input, None)?;
-    input.zeroize();
-    Ok(seed)
+    let result = HmacRequest {
+        selector: selector.clone(),
+        input: Zeroizing::new(input),
+        hash: None,
+        output_format: BinaryFormat::Raw,
+        seal_target: None,
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(command)?;
+
+    match result {
+        HmacResult::Output(seed) => Ok(seed),
+        HmacResult::Sealed { .. } | HmacResult::SealedWithOutput { .. } => Err(Error::invalid(
+            "derive",
+            "HMAC PRF seed derivation unexpectedly sealed its output",
+        )),
+    }
 }
 
 pub(super) fn resolve_mode(params: &DeriveParams) -> Result<DeriveMode> {
@@ -61,3 +78,7 @@ pub(super) fn resolve_mode(params: &DeriveParams) -> Result<DeriveMode> {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "seed.test.rs"]
+mod tests;

@@ -86,7 +86,7 @@ fn null_hashcheck_ticket() -> Result<HashcheckTicket> {
 }
 
 impl HashAlgorithm {
-    pub(crate) fn to_tpm_hash(self) -> HashingAlgorithm {
+    fn to_tpm_hash(self) -> HashingAlgorithm {
         match self {
             Self::Sha256 => HashingAlgorithm::Sha256,
             Self::Sha384 => HashingAlgorithm::Sha384,

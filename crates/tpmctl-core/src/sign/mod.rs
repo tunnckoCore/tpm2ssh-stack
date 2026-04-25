@@ -113,10 +113,7 @@ impl SignRequest {
     }
 }
 
-pub(crate) fn encode_tpm_p256_signature(
-    p1363: &[u8],
-    output_format: SignatureFormat,
-) -> Result<Vec<u8>> {
+fn encode_tpm_p256_signature(p1363: &[u8], output_format: SignatureFormat) -> Result<Vec<u8>> {
     encode_p256_signature(p1363, output_format)
 }
 

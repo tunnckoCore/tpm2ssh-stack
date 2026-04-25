@@ -106,3 +106,26 @@ fn sign_validates_sign_usage() {
     };
     assert!(request.validate_descriptor(&descriptor).is_ok());
 }
+
+#[test]
+fn sign_rejects_non_sign_usage() {
+    let request = SignRequest {
+        selector: selector(),
+        input: SignInput::Digest(Zeroizing::new(vec![0; 32])),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Der,
+    };
+    let descriptor = ObjectDescriptor {
+        selector: selector(),
+        usage: KeyUsage::Hmac,
+        curve: None,
+        hash: Some(HashAlgorithm::Sha256),
+        public_key: None,
+    };
+
+    let error = request
+        .validate_descriptor(&descriptor)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expected sign object, got hmac"));
+}
