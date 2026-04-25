@@ -88,3 +88,25 @@ impl CoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CoreError;
+
+    #[test]
+    fn invalid_input_alias_matches_invalid_constructor() {
+        assert!(matches!(
+            CoreError::invalid_input("field", "reason"),
+            CoreError::InvalidInput { field: "field", ref reason }
+                if reason == "reason"
+        ));
+    }
+
+    #[test]
+    fn tpm_unavailable_wraps_message() {
+        assert!(matches!(
+            CoreError::tpm_unavailable("simulator offline"),
+            CoreError::TpmUnavailable(ref message) if message == "simulator offline"
+        ));
+    }
+}

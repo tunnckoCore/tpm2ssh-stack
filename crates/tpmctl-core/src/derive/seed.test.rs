@@ -30,6 +30,16 @@ fn resolve_mode_requires_entropy_when_label_is_omitted() {
 }
 
 #[test]
+fn resolve_mode_uses_deterministic_label_when_present() {
+    let params = params();
+
+    assert_eq!(
+        resolve_mode(&params).unwrap(),
+        DeriveMode::deterministic(b"label".to_vec())
+    );
+}
+
+#[test]
 fn resolve_mode_uses_ephemeral_entropy_when_label_is_omitted() {
     let mut params = params();
     params.label = None;
