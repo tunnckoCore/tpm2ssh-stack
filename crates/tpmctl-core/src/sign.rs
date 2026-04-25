@@ -1,10 +1,14 @@
+use std::fmt;
+
 use zeroize::Zeroizing;
 
-use crate::{HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store};
+use crate::{
+    CommandContext, HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store,
+};
 
 use crate::output::{SignatureFormat, encode_p256_signature};
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SignRequest {
     pub selector: ObjectSelector,
     pub input: SignInput,
@@ -12,10 +16,37 @@ pub struct SignRequest {
     pub output_format: SignatureFormat,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum SignInput {
-    Message(Vec<u8>),
-    Digest(Vec<u8>),
+    Message(Zeroizing<Vec<u8>>),
+    Digest(Zeroizing<Vec<u8>>),
+}
+
+impl fmt::Debug for SignRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignRequest")
+            .field("selector", &self.selector)
+            .field("input", &self.input)
+            .field("hash", &self.hash)
+            .field("output_format", &self.output_format)
+            .finish()
+    }
+}
+
+impl fmt::Debug for SignInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(_) => formatter
+                .debug_tuple("Message")
+                .field(&"<redacted>")
+                .finish(),
+            Self::Digest(_) => formatter
+                .debug_tuple("Digest")
+                .field(&"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl SignRequest {
@@ -24,7 +55,7 @@ impl SignRequest {
             SignInput::Message(message) => Ok(Zeroizing::new(self.hash.digest(message))),
             SignInput::Digest(digest) => {
                 self.hash.validate_digest(digest)?;
-                Ok(Zeroizing::new(digest.clone()))
+                Ok(Zeroizing::new(digest.to_vec()))
             }
         }
     }
@@ -34,8 +65,21 @@ impl SignRequest {
     }
 
     pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
+        self.execute_with_store_and_context(store, &CommandContext::default())
+    }
+
+    pub fn execute_with_context(&self, command: &CommandContext) -> Result<Vec<u8>> {
+        let store = Store::resolve(command.store.root.as_deref())?;
+        self.execute_with_store_and_context(&store, command)
+    }
+
+    pub fn execute_with_store_and_context(
+        &self,
+        store: &Store,
+        command: &CommandContext,
+    ) -> Result<Vec<u8>> {
         let digest = self.digest()?;
-        let mut context = crate::tpm::create_context()?;
+        let mut context = crate::tpm::create_context_for(command)?;
         let loaded = match &self.selector {
             ObjectSelector::Id(id) => crate::tpm::load_key_by_id(&mut context, store, id)?,
             ObjectSelector::Handle(handle) => {
@@ -65,7 +109,7 @@ mod sign_tests {
     fn sign_hashes_input_with_requested_hash() {
         let request = SignRequest {
             selector: selector(),
-            input: SignInput::Message(b"hello".to_vec()),
+            input: SignInput::Message(Zeroizing::new(b"hello".to_vec())),
             hash: HashAlgorithm::Sha256,
             output_format: SignatureFormat::Der,
         };
@@ -76,7 +120,7 @@ mod sign_tests {
     fn sign_validates_digest_length_against_hash() {
         let request = SignRequest {
             selector: selector(),
-            input: SignInput::Digest(vec![0; 31]),
+            input: SignInput::Digest(Zeroizing::new(vec![0; 31])),
             hash: HashAlgorithm::Sha256,
             output_format: SignatureFormat::Der,
         };
@@ -107,7 +151,7 @@ mod sign_tests {
     fn sign_validates_sign_usage() {
         let request = SignRequest {
             selector: selector(),
-            input: SignInput::Digest(vec![0; 32]),
+            input: SignInput::Digest(Zeroizing::new(vec![0; 32])),
             hash: HashAlgorithm::Sha256,
             output_format: SignatureFormat::Der,
         };

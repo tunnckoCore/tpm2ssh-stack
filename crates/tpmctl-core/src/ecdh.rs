@@ -1,6 +1,9 @@
-use crate::output::{BinaryFormat, encode_binary};
+use crate::output::{BinaryFormat, encode_secret_binary};
 use crate::pubkey::PublicKeyInput;
-use crate::{EccPublicKey, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store};
+use crate::{
+    CommandContext, EccCurve, EccPublicKey, Error, KeyUsage, ObjectDescriptor, ObjectSelector,
+    Result, Store,
+};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -12,7 +15,14 @@ pub struct EcdhRequest {
 
 impl EcdhRequest {
     pub fn validate_descriptor(&self, descriptor: &ObjectDescriptor) -> Result<()> {
-        descriptor.require_usage(KeyUsage::Ecdh)
+        descriptor.require_usage(KeyUsage::Ecdh)?;
+        match descriptor.curve {
+            Some(EccCurve::P256) => Ok(()),
+            None => Err(Error::invalid(
+                "curve",
+                "expected P-256 ECDH object descriptor, got missing curve",
+            )),
+        }
     }
 
     pub fn parse_peer_public_key(&self) -> Result<EccPublicKey> {
@@ -20,8 +30,21 @@ impl EcdhRequest {
     }
 
     pub fn execute(&self, store: &Store) -> Result<Zeroizing<Vec<u8>>> {
+        self.execute_with_store_and_context(store, &CommandContext::default())
+    }
+
+    pub fn execute_with_context(&self, command: &CommandContext) -> Result<Zeroizing<Vec<u8>>> {
+        let store = Store::resolve(command.store.root.as_deref())?;
+        self.execute_with_store_and_context(&store, command)
+    }
+
+    pub fn execute_with_store_and_context(
+        &self,
+        store: &Store,
+        command: &CommandContext,
+    ) -> Result<Zeroizing<Vec<u8>>> {
         let peer_public_key = self.parse_peer_public_key()?;
-        let mut context = crate::tpm::create_context()?;
+        let mut context = crate::tpm::create_context_for(command)?;
         let loaded = match &self.selector {
             ObjectSelector::Id(id) => crate::tpm::load_key_by_id(&mut context, store, id)?,
             ObjectSelector::Handle(handle) => {
@@ -35,7 +58,7 @@ impl EcdhRequest {
 }
 
 pub fn encode_shared_secret(secret: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(encode_binary(secret, output_format))
+    encode_secret_binary(secret, output_format)
 }
 
 #[cfg(test)]
@@ -82,6 +105,19 @@ mod ecdh_tests {
             public_key: None,
         };
         assert!(request().validate_descriptor(&descriptor).is_err());
+    }
+
+    #[test]
+    fn ecdh_rejects_missing_curve_descriptor() {
+        let descriptor = ObjectDescriptor {
+            selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
+            usage: KeyUsage::Ecdh,
+            curve: None,
+            hash: None,
+            public_key: None,
+        };
+        let error = request().validate_descriptor(&descriptor).unwrap_err();
+        assert!(error.to_string().contains("expected P-256"));
     }
 
     #[test]

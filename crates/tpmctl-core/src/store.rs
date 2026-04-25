@@ -1,10 +1,11 @@
 use std::{
-    env, fs,
+    env, fmt, fs,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{CoreError, Result};
 
@@ -80,7 +81,7 @@ impl Store {
         create_secure_dir_all(&dir)?;
         write_json_atomic(&dir.join(META_FILE), &entry.metadata)?;
         write_atomic(&dir.join(PUBLIC_BLOB_FILE), &entry.public_blob)?;
-        write_atomic(&dir.join(PRIVATE_BLOB_FILE), &entry.private_blob)?;
+        write_atomic(&dir.join(PRIVATE_BLOB_FILE), entry.private_blob.as_slice())?;
 
         let public_pem_path = dir.join(PUBLIC_PEM_FILE);
         if let Some(public_pem) = &entry.public_pem {
@@ -111,8 +112,9 @@ impl Store {
         let metadata = read_json(&meta_path)?;
         let public_blob =
             fs::read(&public_path).map_err(|source| CoreError::io(public_path, source))?;
-        let private_blob =
-            fs::read(&private_path).map_err(|source| CoreError::io(private_path, source))?;
+        let private_blob = Zeroizing::new(
+            fs::read(&private_path).map_err(|source| CoreError::io(private_path, source))?,
+        );
         let public_pem = if pem_path.is_file() {
             Some(fs::read(&pem_path).map_err(|source| CoreError::io(pem_path, source))?)
         } else {
@@ -259,12 +261,24 @@ impl RegistryMetadata {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct StoredObjectEntry {
     pub metadata: RegistryMetadata,
     pub public_blob: Vec<u8>,
-    pub private_blob: Vec<u8>,
+    pub private_blob: Zeroizing<Vec<u8>>,
     pub public_pem: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for StoredObjectEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredObjectEntry")
+            .field("metadata", &self.metadata)
+            .field("public_blob", &self.public_blob)
+            .field("private_blob", &"<redacted>")
+            .field("public_pem", &self.public_pem)
+            .finish()
+    }
 }
 
 /// Metadata shared by registry-backed objects in higher-level command contracts.
@@ -587,7 +601,7 @@ mod tests {
         let entry = StoredObjectEntry {
             metadata,
             public_blob: b"public".to_vec(),
-            private_blob: b"private".to_vec(),
+            private_blob: Zeroizing::new(b"private".to_vec()),
             public_pem: Some(b"pem".to_vec()),
         };
 
@@ -608,13 +622,13 @@ mod tests {
         let with_pem = StoredObjectEntry {
             metadata: metadata.clone(),
             public_blob: b"public".to_vec(),
-            private_blob: b"private".to_vec(),
+            private_blob: Zeroizing::new(b"private".to_vec()),
             public_pem: Some(b"pem".to_vec()),
         };
         let without_pem = StoredObjectEntry {
             metadata,
             public_blob: b"public2".to_vec(),
-            private_blob: b"private2".to_vec(),
+            private_blob: Zeroizing::new(b"private2".to_vec()),
             public_pem: None,
         };
 
@@ -638,7 +652,7 @@ mod tests {
         let entry = StoredObjectEntry {
             metadata,
             public_blob: b"public".to_vec(),
-            private_blob: b"private".to_vec(),
+            private_blob: Zeroizing::new(b"private".to_vec()),
             public_pem: Some(b"pem".to_vec()),
         };
 

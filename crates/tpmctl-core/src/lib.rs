@@ -5,6 +5,7 @@
 //! and PKCS#11 provider should depend on these typed contracts rather than
 //! shelling out to another binary.
 
+pub mod api;
 pub mod crypto;
 pub mod ecdh;
 pub mod error;
@@ -26,6 +27,7 @@ use std::{
 use sha2::{Digest as _, Sha256, Sha384, Sha512};
 use zeroize::{Zeroize as _, Zeroizing};
 
+pub use api::*;
 pub use error::{CoreError, Error, Result};
 pub use output::{EncodedOutput, OutputFormat};
 pub use store::{IdentityRef, ObjectKind, RegistryId, Store, StoreOptions};
@@ -413,12 +415,16 @@ fn validate_keygen_request(request: &KeygenRequest) -> Result<()> {
 pub fn sign(request: SignRequest) -> Result<()> {
     let store = Store::new(request.runtime.store.root);
     let input = match request.input {
-        SignInput::Message(source) => sign::SignInput::Message(decode_input_bytes(
+        SignInput::Message(source) => sign::SignInput::Message(Zeroizing::new(decode_input_bytes(
             read_input(&source)?,
             request.input_format,
-        )?),
-        SignInput::DigestFile(source) => sign::SignInput::Digest(read_input(&source)?),
-        SignInput::DigestHex(hex) => sign::SignInput::Digest(decode_hex_digest(&hex)?),
+        )?)),
+        SignInput::DigestFile(source) => {
+            sign::SignInput::Digest(Zeroizing::new(read_input(&source)?))
+        }
+        SignInput::DigestHex(hex) => {
+            sign::SignInput::Digest(Zeroizing::new(decode_hex_digest(&hex)?))
+        }
     };
     let domain_request = sign::SignRequest {
         selector: material_selector(request.material)?,
@@ -459,7 +465,7 @@ pub fn hmac(request: HmacRequest) -> Result<()> {
     let seal_target = request.seal.map(seal_target).transpose()?;
     let domain = hmac::HmacRequest {
         selector,
-        input,
+        input: Zeroizing::new(input),
         hash: request.hash,
         output_format: request.output_format,
         seal_target,
@@ -469,11 +475,7 @@ pub fn hmac(request: HmacRequest) -> Result<()> {
 
     match domain.execute_with_context(&command)? {
         hmac::HmacResult::Output(output) => {
-            let encoded = zeroize::Zeroizing::new(hmac::encode_hmac_output(
-                output.as_slice(),
-                request.output_format,
-            ));
-            write_output(&request.output, encoded.as_slice(), request.force)?;
+            write_output(&request.output, output.as_slice(), request.force)?;
         }
         hmac::HmacResult::Sealed { target, hash } => {
             write_hmac_sealed_result(&request.runtime, &target, hash)?;
@@ -483,11 +485,7 @@ pub fn hmac(request: HmacRequest) -> Result<()> {
             hash,
             output,
         } => {
-            let encoded = zeroize::Zeroizing::new(hmac::encode_hmac_output(
-                output.as_slice(),
-                request.output_format,
-            ));
-            write_output(&request.output, encoded.as_slice(), request.force)?;
+            write_output(&request.output, output.as_slice(), request.force)?;
             write_hmac_sealed_result(&request.runtime, &target, hash)?;
         }
     }

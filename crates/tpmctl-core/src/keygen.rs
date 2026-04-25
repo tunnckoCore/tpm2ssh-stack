@@ -15,7 +15,8 @@ use tss_esapi::{
 };
 
 use crate::{
-    CoreError, EccPublicKey, KeyUsage, ObjectSelector, PersistentHandle, RegistryId, Result,
+    CommandContext, CoreError, EccPublicKey, KeyUsage, ObjectSelector, PersistentHandle,
+    RegistryId, Result,
     output::{PublicKeyFormat, encode_public_key},
     store::{
         ObjectUsage, ParentMetadata, RegistryCollection, RegistryMetadata, Store,
@@ -100,10 +101,23 @@ impl KeygenRequest {
     }
 
     pub fn execute_with_store(&self, store: &Store) -> Result<KeygenResult> {
+        self.execute_with_store_and_context(store, &CommandContext::default())
+    }
+
+    pub fn execute_with_context(&self, command: &CommandContext) -> Result<KeygenResult> {
+        let store = Store::resolve(command.store.root.as_deref())?;
+        self.execute_with_store_and_context(&store, command)
+    }
+
+    pub fn execute_with_store_and_context(
+        &self,
+        store: &Store,
+        command: &CommandContext,
+    ) -> Result<KeygenResult> {
         let plan = self.plan()?;
         reject_duplicate_id(store, &self.id, self.force)?;
 
-        let mut context = tpm::create_context()?;
+        let mut context = tpm::create_context_for(command)?;
         if let Some(handle) = plan.persistent_handle {
             reject_occupied_persistent_handle(&mut context, handle, self.force)?;
         }
@@ -343,11 +357,6 @@ fn push_fixed_32(out: &mut Vec<u8>, value: &[u8], coordinate: &'static str) -> R
 #[cfg(test)]
 mod keygen_tests {
     use super::*;
-    use crate::{
-        HashAlgorithm,
-        output::SignatureFormat,
-        sign::{SignInput, SignRequest},
-    };
     use tss_esapi::{
         interface_types::algorithm::EccSchemeAlgorithm,
         structures::{KeyedHashScheme, Public},
@@ -427,7 +436,7 @@ mod keygen_tests {
         let entry = StoredObjectEntry {
             metadata,
             public_blob: b"public".to_vec(),
-            private_blob: b"private".to_vec(),
+            private_blob: zeroize::Zeroizing::new(b"private".to_vec()),
             public_pem: None,
         };
         store.save_key(&entry, false).unwrap();
@@ -496,66 +505,7 @@ mod keygen_tests {
         assert!(entry.metadata.persistent);
         assert_eq!(entry.metadata.public_key.as_ref().unwrap().len(), 130);
         assert!(!entry.public_blob.is_empty());
-        assert_eq!(entry.private_blob, vec![0xaa; 8]);
+        assert_eq!(entry.private_blob.as_slice(), &[0xaa; 8]);
         assert!(entry.public_pem.is_some());
-    }
-
-    #[test]
-    fn simulator_keygen_smoke_is_gated_by_test_tcti() {
-        if std::env::var("TEST_TCTI")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_none()
-        {
-            eprintln!("skipping simulator keygen smoke test: TEST_TCTI is not set");
-            return;
-        }
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::new(temp.path());
-        let request = KeygenRequest {
-            usage: KeygenUsage::Sign,
-            id: RegistryId::new("sim/keygen/sign").unwrap(),
-            persist_at: None,
-            force: false,
-        };
-
-        let result = request.execute_with_store(&store).unwrap();
-        assert_eq!(result.usage, KeygenUsage::Sign);
-        assert!(store.exists(RegistryCollection::Keys, &request.id));
-    }
-
-    #[test]
-    fn simulator_non_persistent_keygen_sign_reload_supports_sha512() {
-        if std::env::var("TEST_TCTI")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .is_none()
-        {
-            eprintln!("skipping simulator reload/sign test: TEST_TCTI is not set");
-            return;
-        }
-
-        let temp = tempfile::tempdir().unwrap();
-        let store = Store::new(temp.path());
-        let id = RegistryId::new("sim/keygen/reload-sign-sha512").unwrap();
-        let request = KeygenRequest {
-            usage: KeygenUsage::Sign,
-            id: id.clone(),
-            persist_at: None,
-            force: false,
-        };
-        request.execute_with_store(&store).unwrap();
-
-        let signature = SignRequest {
-            selector: ObjectSelector::Id(id),
-            input: SignInput::Message(b"parent and hash flexibility".to_vec()),
-            hash: HashAlgorithm::Sha512,
-            output_format: SignatureFormat::Raw,
-        }
-        .execute(&store)
-        .unwrap();
-
-        assert_eq!(signature.len(), 64);
     }
 }

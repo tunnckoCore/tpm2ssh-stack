@@ -5,6 +5,8 @@ use crate::{
     Result,
     store::{ObjectUsage, RegistryCollection, RegistryId, Store, StoreOptions, StoredObjectEntry},
 };
+use zeroize::Zeroizing;
+
 use tss_esapi::{
     Context,
     attributes::ObjectAttributesBuilder,
@@ -359,7 +361,7 @@ impl FromStr for PersistentHandle {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ObjectBlobs {
     pub public: Vec<u8>,
-    pub private: Vec<u8>,
+    pub private: Zeroizing<Vec<u8>>,
 }
 
 impl ObjectBlobs {
@@ -377,8 +379,8 @@ pub fn marshal_public(public: &Public) -> Result<Vec<u8>> {
         .map_err(|source| CoreError::tpm("marshal public object", source))
 }
 
-pub fn marshal_private(private: &Private) -> Result<Vec<u8>> {
-    Ok(private.value().to_vec())
+pub fn marshal_private(private: &Private) -> Result<Zeroizing<Vec<u8>>> {
+    Ok(Zeroizing::new(private.value().to_vec()))
 }
 
 pub fn unmarshal_public(bytes: &[u8]) -> Result<Public> {
@@ -574,15 +576,15 @@ pub fn ecdh_z_gen(
     context: &mut Context,
     key_handle: KeyHandle,
     peer_public_key: &EccPublicKey,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     let point = ecc_point_from_public_key(peer_public_key)?;
     let z = context
         .execute_with_session(Some(AuthSession::Password), |ctx| {
             ctx.ecdh_z_gen(key_handle, point)
         })
         .map_err(|source| CoreError::tpm("ECDH_ZGen", source))?;
-    let mut x = vec![0_u8; 32];
-    left_pad_copy(z.x().value(), &mut x, "ECDH_ZGen x coordinate")?;
+    let mut x = Zeroizing::new(vec![0_u8; 32]);
+    left_pad_copy(z.x().value(), x.as_mut_slice(), "ECDH_ZGen x coordinate")?;
     Ok(x)
 }
 

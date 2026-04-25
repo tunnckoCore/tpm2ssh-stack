@@ -31,6 +31,8 @@ impl EncodedOutput {
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use p256::pkcs8::{EncodePublicKey as _, LineEnding};
 
+use zeroize::Zeroizing;
+
 use crate::{EccCurve, EccPublicKey, Error, Result};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -108,6 +110,18 @@ pub fn encode_binary(bytes: &[u8], format: BinaryFormat) -> Vec<u8> {
     match format {
         BinaryFormat::Raw => bytes.to_vec(),
         BinaryFormat::Hex => hex::encode(bytes).into_bytes(),
+    }
+}
+
+pub fn encode_secret_binary(bytes: &[u8], format: BinaryFormat) -> Zeroizing<Vec<u8>> {
+    match format {
+        BinaryFormat::Raw => Zeroizing::new(bytes.to_vec()),
+        BinaryFormat::Hex => {
+            let mut encoded = Zeroizing::new(vec![0_u8; bytes.len() * 2]);
+            hex::encode_to_slice(bytes, encoded.as_mut_slice())
+                .expect("hex output buffer length is exactly twice the input length");
+            encoded
+        }
     }
 }
 

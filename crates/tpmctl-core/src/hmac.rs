@@ -1,18 +1,20 @@
+use std::fmt;
+
 use hmac_crate::{Hmac, Mac};
 use sha2::{Sha256, Sha384, Sha512};
 use tss_esapi::{handles::ObjectHandle, structures::MaxBuffer};
 use zeroize::Zeroizing;
 
-use crate::output::{BinaryFormat, encode_binary};
+use crate::output::{BinaryFormat, encode_secret_binary};
 use crate::{
     CommandContext, Error, HashAlgorithm, KeyUsage, ObjectDescriptor, ObjectSelector, Result,
     SealTarget, seal::seal_bytes, store::Store, tpm,
 };
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct HmacRequest {
     pub selector: ObjectSelector,
-    pub input: Vec<u8>,
+    pub input: Zeroizing<Vec<u8>>,
     pub hash: Option<HashAlgorithm>,
     pub output_format: BinaryFormat,
     pub seal_target: Option<SealTarget>,
@@ -47,10 +49,10 @@ impl HmacRequest {
         let output = compute_tpm_hmac(&mut context, object_handle, &self.input, hash)?;
 
         match &self.seal_target {
-            None => Ok(HmacResult::Output(Zeroizing::new(encode_hmac_output(
+            None => Ok(HmacResult::Output(encode_hmac_output(
                 output.as_slice(),
                 self.output_format,
-            )))),
+            ))),
             Some(target) => {
                 let selector = match target {
                     SealTarget::Id(id) => ObjectSelector::Id(id.clone()),
@@ -61,10 +63,7 @@ impl HmacRequest {
                     Ok(HmacResult::SealedWithOutput {
                         target: target.clone(),
                         hash,
-                        output: Zeroizing::new(encode_hmac_output(
-                            output.as_slice(),
-                            self.output_format,
-                        )),
+                        output: encode_hmac_output(output.as_slice(), self.output_format),
                     })
                 } else {
                     Ok(HmacResult::Sealed {
@@ -77,7 +76,7 @@ impl HmacRequest {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum HmacResult {
     Output(Zeroizing<Vec<u8>>),
     Sealed {
@@ -91,8 +90,45 @@ pub enum HmacResult {
     },
 }
 
-pub fn encode_hmac_output(bytes: &[u8], output_format: BinaryFormat) -> Vec<u8> {
-    encode_binary(bytes, output_format)
+impl fmt::Debug for HmacRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HmacRequest")
+            .field("selector", &self.selector)
+            .field("input", &"<redacted>")
+            .field("hash", &self.hash)
+            .field("output_format", &self.output_format)
+            .field("seal_target", &self.seal_target)
+            .field("emit_prf_when_sealing", &self.emit_prf_when_sealing)
+            .field("force", &self.force)
+            .finish()
+    }
+}
+
+impl fmt::Debug for HmacResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Output(_) => formatter
+                .debug_tuple("Output")
+                .field(&"<redacted>")
+                .finish(),
+            Self::Sealed { target, hash } => formatter
+                .debug_struct("Sealed")
+                .field("target", target)
+                .field("hash", hash)
+                .finish(),
+            Self::SealedWithOutput { target, hash, .. } => formatter
+                .debug_struct("SealedWithOutput")
+                .field("target", target)
+                .field("hash", hash)
+                .field("output", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+pub fn encode_hmac_output(bytes: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
+    encode_secret_binary(bytes, output_format)
 }
 
 pub fn compute_tpm_hmac(
@@ -193,7 +229,7 @@ mod hmac_tests {
     fn request() -> HmacRequest {
         HmacRequest {
             selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
-            input: b"ctx".to_vec(),
+            input: Zeroizing::new(b"ctx".to_vec()),
             hash: None,
             output_format: BinaryFormat::Raw,
             seal_target: None,
@@ -232,8 +268,14 @@ mod hmac_tests {
 
     #[test]
     fn hmac_encodes_raw_and_hex_output() {
-        assert_eq!(encode_hmac_output(&[0xab], BinaryFormat::Raw), vec![0xab]);
-        assert_eq!(encode_hmac_output(&[0xab], BinaryFormat::Hex), b"ab");
+        assert_eq!(
+            encode_hmac_output(&[0xab], BinaryFormat::Raw).as_slice(),
+            &[0xab]
+        );
+        assert_eq!(
+            encode_hmac_output(&[0xab], BinaryFormat::Hex).as_slice(),
+            b"ab"
+        );
     }
 
     #[test]

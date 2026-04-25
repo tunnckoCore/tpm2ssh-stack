@@ -1,7 +1,9 @@
 use p256::pkcs8::DecodePublicKey as _;
 
 use crate::output::{PublicKeyFormat, encode_public_key};
-use crate::{EccPublicKey, Error, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store};
+use crate::{
+    CommandContext, EccPublicKey, Error, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PubkeyRequest {
@@ -37,6 +39,19 @@ impl PubkeyRequest {
     }
 
     pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
+        self.execute_with_store_and_context(store, &CommandContext::default())
+    }
+
+    pub fn execute_with_context(&self, command: &CommandContext) -> Result<Vec<u8>> {
+        let store = Store::resolve(command.store.root.as_deref())?;
+        self.execute_with_store_and_context(&store, command)
+    }
+
+    pub fn execute_with_store_and_context(
+        &self,
+        store: &Store,
+        command: &CommandContext,
+    ) -> Result<Vec<u8>> {
         if let ObjectSelector::Id(id) = &self.selector {
             let entry = store.load_key(id)?;
             let descriptor =
@@ -44,7 +59,7 @@ impl PubkeyRequest {
             return self.encode_descriptor_public_key(&descriptor);
         }
 
-        let mut context = crate::tpm::create_context()?;
+        let mut context = crate::tpm::create_context_for(command)?;
         let ObjectSelector::Handle(handle) = self.selector else {
             unreachable!("id selector returned above")
         };
