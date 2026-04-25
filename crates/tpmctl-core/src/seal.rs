@@ -16,11 +16,22 @@ use crate::{
     tpm,
 };
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SealRequest {
     pub selector: ObjectSelector,
     pub input: Zeroizing<Vec<u8>>,
     pub force: bool,
+}
+
+impl std::fmt::Debug for SealRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SealRequest")
+            .field("selector", &self.selector)
+            .field("input", &"<redacted>")
+            .field("force", &self.force)
+            .finish()
+    }
 }
 
 impl SealRequest {

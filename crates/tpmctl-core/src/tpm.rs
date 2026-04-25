@@ -1,4 +1,4 @@
-use std::{env, str::FromStr};
+use std::{env, fmt, str::FromStr};
 
 use crate::{
     CoreError, EccCurve, EccPublicKey, Error, HashAlgorithm, ObjectDescriptor, ObjectSelector,
@@ -153,10 +153,20 @@ pub fn create_context() -> Result<Context> {
 
 pub const OWNER_STORAGE_PARENT_TEMPLATE: &str = "owner-rsa2048-aes128cfb-restricted-decrypt";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreatedChildKey {
     pub public: Public,
     pub private: Private,
+}
+
+impl fmt::Debug for CreatedChildKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreatedChildKey")
+            .field("public", &self.public)
+            .field("private", &"<redacted>")
+            .finish()
+    }
 }
 
 pub fn create_context_with_tcti(override_value: Option<&str>) -> Result<Context> {
@@ -358,10 +368,20 @@ impl FromStr for PersistentHandle {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ObjectBlobs {
     pub public: Vec<u8>,
     pub private: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for ObjectBlobs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectBlobs")
+            .field("public", &self.public)
+            .field("private", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ObjectBlobs {

@@ -128,6 +128,22 @@ mod tests {
     }
 
     #[test]
+    fn derived_signature_verifies_with_corresponding_public_key() {
+        use k256::ecdsa::{Signature, VerifyingKey};
+        use signature::Verifier as _;
+
+        let seed = SecretSeed::new(b"secp seed").unwrap();
+        let mode = DeriveMode::deterministic(b"secp verify".to_vec());
+        let message = b"message";
+        let public = derive_public_key_sec1(&seed, &mode, false).unwrap();
+        let signature =
+            Signature::from_slice(&sign_message(&seed, &mode, message).unwrap()).unwrap();
+        let verifying_key = VerifyingKey::from_sec1_bytes(&public).unwrap();
+
+        verifying_key.verify(message, &signature).unwrap();
+    }
+
+    #[test]
     fn prehash_matches_internal_sha256_message_signing() {
         let seed = SecretSeed::new(b"secp seed").unwrap();
         let mode = DeriveMode::deterministic(b"secp prehash".to_vec());

@@ -251,6 +251,26 @@ mod output_tests {
     }
 
     #[test]
+    fn secret_hex_encoding_is_exact_lowercase_bytes_without_newline() {
+        let encoded =
+            encode_secret_binary(&[0x00, 0x0f, 0x10, 0xab, 0xcd, 0xef], BinaryFormat::Hex);
+
+        assert_eq!(encoded.as_slice(), b"000f10abcdef");
+        assert!(!encoded.as_slice().contains(&b'\n'));
+        assert!(!encoded.as_slice().iter().any(u8::is_ascii_uppercase));
+    }
+
+    #[test]
+    fn secret_raw_encoding_is_exact_input_bytes() {
+        let bytes = [0x00, b'\n', 0xff, b'A'];
+
+        assert_eq!(
+            encode_secret_binary(&bytes, BinaryFormat::Raw).as_slice(),
+            bytes
+        );
+    }
+
+    #[test]
     fn output_signature_formats_raw_hex_and_der() {
         let mut p1363 = vec![0_u8; 64];
         p1363[31] = 1;

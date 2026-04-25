@@ -429,8 +429,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default()
     ));
-    write_secure_temp_file(&tmp, bytes)?;
-    fs::rename(&tmp, path).map_err(|source| CoreError::io(path, source))?;
+    if let Err(error) = write_secure_temp_file(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(source) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(CoreError::io(path, source));
+    }
     set_secure_file_permissions(path)?;
     Ok(())
 }
@@ -638,6 +644,96 @@ mod tests {
 
         assert!(!dir.join(PUBLIC_PEM_FILE).exists());
         assert_eq!(store.load_key(&id).unwrap(), without_pem);
+    }
+
+    #[test]
+    fn load_key_rejects_malformed_metadata_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path());
+        let id = RegistryId::parse("org/acme/key").unwrap();
+        let entry = test_key_entry(&id);
+        let dir = store.save_key(&entry, false).unwrap();
+        fs::write(dir.join(META_FILE), b"{not valid json").unwrap();
+
+        let error = store.load_key(&id).unwrap_err();
+        assert!(
+            matches!(error, CoreError::Json { ref path, .. } if path == &dir.join(META_FILE)),
+            "expected JSON error for malformed metadata, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn load_key_reports_missing_public_blob_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path());
+        let id = RegistryId::parse("org/acme/key").unwrap();
+        let entry = test_key_entry(&id);
+        let dir = store.save_key(&entry, false).unwrap();
+        fs::remove_file(dir.join(PUBLIC_BLOB_FILE)).unwrap();
+
+        let error = store.load_key(&id).unwrap_err();
+        assert!(
+            matches!(error, CoreError::Io { ref path, .. } if path == &dir.join(PUBLIC_BLOB_FILE)),
+            "expected I/O error for missing public blob, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn load_key_reports_missing_private_blob_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::new(temp.path());
+        let id = RegistryId::parse("org/acme/key").unwrap();
+        let entry = test_key_entry(&id);
+        let dir = store.save_key(&entry, false).unwrap();
+        fs::remove_file(dir.join(PRIVATE_BLOB_FILE)).unwrap();
+
+        let error = store.load_key(&id).unwrap_err();
+        assert!(
+            matches!(error, CoreError::Io { ref path, .. } if path == &dir.join(PRIVATE_BLOB_FILE)),
+            "expected I/O error for missing private blob, got {error:?}"
+        );
+    }
+
+    fn test_key_entry(id: &RegistryId) -> StoredObjectEntry {
+        StoredObjectEntry {
+            metadata: RegistryMetadata::new(id, StoredObjectKind::Key, ObjectUsage::Sign),
+            public_blob: b"public".to_vec(),
+            private_blob: Zeroizing::new(b"private".to_vec()),
+            public_pem: None,
+        }
+    }
+
+    #[test]
+    fn write_atomic_writes_exact_bytes_and_leaves_no_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("target");
+
+        write_atomic(&path, b"old").unwrap();
+        write_atomic(&path, b"new\nbytes").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new\nbytes");
+        assert_target_tmp_files_empty(temp.path(), "target");
+    }
+
+    #[test]
+    fn write_atomic_removes_temp_file_when_rename_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("target");
+        fs::create_dir(&path).unwrap();
+
+        assert!(write_atomic(&path, b"data").is_err());
+        assert!(path.is_dir());
+        assert_target_tmp_files_empty(temp.path(), "target");
+    }
+
+    fn assert_target_tmp_files_empty(dir: &Path, target_name: &str) {
+        let prefix = format!("{target_name}.tmp-");
+        let leftovers = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(&prefix))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 
     #[cfg(unix)]

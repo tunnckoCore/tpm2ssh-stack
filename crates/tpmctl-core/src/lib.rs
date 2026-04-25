@@ -207,9 +207,17 @@ pub enum SealTarget {
     Handle(PersistentHandle),
 }
 
-// Frontend request contracts used by the thin CLI adapter. These are kept at the
-// crate root to preserve a stable, parser-free API surface while TPM semantics
-// remain in the domain modules above.
+// Frontend request contracts used by thin adapters. These are kept at the crate
+// root for source compatibility, but they are intentionally parser-free: values
+// arrive already decoded from CLI flags, config files, or other frontends.
+//
+// Safe extraction boundary for future library-first cleanup:
+// - pure value types and validation helpers can move behind a request/prelude
+//   module with root re-exports;
+// - functions that read stdin, write stdout/stderr, or create command contexts
+//   are adapter orchestration and should be isolated last;
+// - domain modules (`sign`, `seal`, `hmac`, `ecdh`, `keygen`, `pubkey`, `crypto`)
+//   remain the stable core used by CLI and PKCS#11 consumers.
 use std::path::PathBuf;
 
 pub type SignatureFormat = output::SignatureFormat;
@@ -1005,4 +1013,53 @@ fn write_seal_result(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn material_ref_keeps_ids_and_handles_distinct() {
+        assert_eq!(
+            MaterialRef::from_id_or_handle("signing-key").unwrap(),
+            MaterialRef::Id("signing-key".to_owned())
+        );
+
+        let handle = PersistentHandle::parse("0x81010010").unwrap();
+        assert_eq!(
+            MaterialRef::from_id_or_handle("0x81010010").unwrap(),
+            MaterialRef::Handle(handle)
+        );
+    }
+
+    #[test]
+    fn input_hex_decoding_is_pure_and_adapter_independent() {
+        assert_eq!(
+            decode_input_bytes(b" 0x74657374\n".to_vec(), InputFormat::Hex).unwrap(),
+            b"test"
+        );
+        assert_eq!(
+            decode_input_bytes(b"raw bytes".to_vec(), InputFormat::Raw).unwrap(),
+            b"raw bytes"
+        );
+    }
+
+    #[test]
+    fn keygen_validation_rejects_handle_shaped_ids() {
+        let request = KeygenRequest {
+            runtime: RuntimeOptions {
+                store: StoreConfig {
+                    root: PathBuf::from("/unused"),
+                },
+                json: false,
+            },
+            usage: KeyUsage::Sign,
+            id: "0x81010010".to_owned(),
+            persist_at: None,
+            force: false,
+        };
+
+        assert!(validate_keygen_request(&request).is_err());
+    }
 }
