@@ -9,13 +9,19 @@ use std::{
 };
 
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
-use k256::ecdsa::{Signature as Secp256k1Signature, VerifyingKey as Secp256k1VerifyingKey};
+use k256::ecdsa::{
+    Signature as Secp256k1Signature, SigningKey as Secp256k1SigningKey,
+    VerifyingKey as Secp256k1VerifyingKey,
+};
 use p256::{
     PublicKey, SecretKey,
     ecdh::diffie_hellman,
     ecdsa::{
-        Signature as P256Signature, VerifyingKey,
-        signature::{Verifier, hazmat::PrehashVerifier},
+        Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey,
+        signature::{
+            Verifier,
+            hazmat::{PrehashSigner, PrehashVerifier},
+        },
     },
     elliptic_curve::sec1::ToEncodedPoint,
 };
@@ -48,12 +54,7 @@ fn simulator_test_lock() -> &'static Mutex<()> {
 #[test]
 fn simulator_or_test_tcti_opens_esapi_context_and_gets_random() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
 
     startup_and_get_random();
 }
@@ -61,12 +62,7 @@ fn simulator_or_test_tcti_opens_esapi_context_and_gets_random() {
 #[test]
 fn simulator_non_persistent_keygen_sign_reload_supports_sha512() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -97,12 +93,7 @@ fn simulator_non_persistent_keygen_sign_reload_supports_sha512() {
 #[test]
 fn simulator_persistent_handle_keygen_loads_by_handle_and_enforces_lifecycle() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -216,12 +207,7 @@ fn simulator_persistent_handle_keygen_loads_by_handle_and_enforces_lifecycle() {
 #[test]
 fn simulator_seal_rejects_existing_registry_target_without_overwrite_and_preserves_original() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -243,6 +229,9 @@ fn simulator_seal_rejects_existing_registry_target_without_overwrite_and_preserv
     )
     .unwrap();
 
+    let store = Store::new(temp_store.path());
+    let original_entry = store.load_sealed(&sealed_id).unwrap();
+
     let duplicate = api::seal(
         &context,
         SealParams {
@@ -255,6 +244,9 @@ fn simulator_seal_rejects_existing_registry_target_without_overwrite_and_preserv
     .to_string();
     assert!(duplicate.contains("already exists"));
 
+    let preserved_entry = store.load_sealed(&sealed_id).unwrap();
+    assert_eq!(preserved_entry, original_entry);
+
     let unsealed = api::unseal(
         &context,
         UnsealParams {
@@ -266,14 +258,162 @@ fn simulator_seal_rejects_existing_registry_target_without_overwrite_and_preserv
 }
 
 #[test]
+fn simulator_api_rejects_wrong_selector_kinds_and_wrong_usages() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+
+    let sign_id = RegistryId::new("sim/negative/api-misuse/sign").unwrap();
+    let hmac_id = RegistryId::new("sim/negative/api-misuse/hmac").unwrap();
+    let ecdh_id = RegistryId::new("sim/negative/api-misuse/ecdh").unwrap();
+    let sealed_id = RegistryId::new("sim/negative/api-misuse/sealed").unwrap();
+    let hmac_handle = PersistentHandle::new(0x8101_0043).unwrap();
+    let sign_handle = PersistentHandle::new(0x8101_0045).unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Sign,
+            id: sign_id.clone(),
+            persist_at: Some(sign_handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Hmac,
+            id: hmac_id.clone(),
+            persist_at: Some(hmac_handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: ecdh_id.clone(),
+            persist_at: None,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: Zeroizing::new(b"sealed misuse secret".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let sign_with_hmac = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Handle(hmac_handle),
+            payload: SignPayload::Message(Zeroizing::new(b"wrong usage sign".to_vec())),
+            hash: HashAlgorithm::Sha256,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(sign_with_hmac.contains("expected sign object, got hmac"));
+
+    let hmac_with_sign = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(sign_id.clone()),
+            input: Zeroizing::new(b"wrong usage hmac".to_vec()),
+            hash: None,
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(hmac_with_sign.contains("expected hmac object, got sign"));
+
+    let ecdh_with_sign = api::ecdh(
+        &context,
+        EcdhParams {
+            material: ObjectSelector::Id(sign_id.clone()),
+            peer_public_key: PublicKeyInput::Sec1(
+                SecretKey::from_slice(&[0x24; 32])
+                    .unwrap()
+                    .public_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(ecdh_with_sign.contains("expected ecdh object, got sign"));
+
+    let unseal_sign_key = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Handle(sign_handle),
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(unseal_sign_key.contains("object is not a keyed-hash HMAC key or sealed data object"));
+
+    let pubkey_from_hmac_handle = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(hmac_handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(pubkey_from_hmac_handle.contains("cannot export a public key for hmac objects"));
+
+    let pubkey_from_sealed_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(sealed_id),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        pubkey_from_sealed_id,
+        tpmctl_core::Error::NotFound(_)
+    ));
+
+    let ecdh_pubkey = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(ecdh_id),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_eq!(ecdh_pubkey.len(), 65);
+}
+
+#[test]
 fn simulator_sign_and_hmac_reject_wrong_object_usages() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -337,14 +477,115 @@ fn simulator_sign_and_hmac_reject_wrong_object_usages() {
 }
 
 #[test]
+fn simulator_handle_and_id_resolution_reject_stale_or_mismatched_persistent_metadata() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let store = Store::new(temp_store.path());
+    let handle = PersistentHandle::new(0x8101_0044).unwrap();
+    let sign_id = RegistryId::new("sim/negative/handle-id/sign").unwrap();
+    let ecdh_id = RegistryId::new("sim/negative/handle-id/ecdh").unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Sign,
+            id: sign_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+    let original_entry = store.load_key(&sign_id).unwrap();
+
+    let mut tpm_context = tpmctl_core::tpm::create_context().unwrap();
+    let persistent_object = tpmctl_core::tpm::load_persistent_object(&mut tpm_context, handle)
+        .expect("sign key should be present at persistent handle");
+    tpmctl_core::tpm::evict_persistent_object(&mut tpm_context, persistent_object, handle)
+        .expect("test should be able to evict persistent object");
+
+    let by_handle_missing = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(by_handle_missing, tpmctl_core::Error::Tpm { .. }));
+
+    let by_id_missing = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Id(sign_id.clone()),
+            payload: SignPayload::Message(Zeroizing::new(b"missing persistent backing".to_vec())),
+            hash: HashAlgorithm::Sha256,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(by_id_missing, tpmctl_core::Error::Tpm { .. }));
+    assert_eq!(store.load_key(&sign_id).unwrap(), original_entry);
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: ecdh_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let replacement_pubkey = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_eq!(replacement_pubkey.len(), 65);
+
+    let stale_by_id = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Id(sign_id),
+            payload: SignPayload::Message(Zeroizing::new(
+                b"stale metadata should reject mismatched replacement".to_vec(),
+            )),
+            hash: HashAlgorithm::Sha256,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(stale_by_id.contains("registry says sign but persistent handle contains ecdh object"));
+
+    let ecdh_by_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(ecdh_id),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_eq!(replacement_pubkey, ecdh_by_id);
+}
+
+#[test]
 fn simulator_force_replacement_allows_manual_evict_of_replacement_only() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -410,12 +651,7 @@ fn simulator_force_replacement_allows_manual_evict_of_replacement_only() {
 #[test]
 fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -518,12 +754,7 @@ fn simulator_api_signs_message_and_digest_bytes_with_exported_p256_public_key() 
 #[test]
 fn simulator_api_hmac_seal_target_seals_and_emits_prf() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -586,12 +817,7 @@ fn simulator_api_hmac_seal_target_seals_and_emits_prf() {
 #[test]
 fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -614,13 +840,47 @@ fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
     )
     .unwrap();
 
-    let public_sec1 = derive::derive(
+    let secret = derive::derive(
         &context,
-        derive::DeriveParams {
+        DeriveParams {
             material: ObjectSelector::Id(seed_id.clone()),
             label: Some(label.clone()),
             algorithm: DeriveAlgorithm::P256,
-            usage: derive::DeriveUse::Pubkey,
+            usage: DeriveUse::Secret,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    let repeated_secret = derive::derive(
+        &context,
+        DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::P256,
+            usage: DeriveUse::Secret,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(secret, repeated_secret);
+    assert_eq!(secret.len(), 32);
+    let software_secret = SecretKey::from_slice(secret.as_slice()).unwrap();
+
+    let public_sec1 = derive::derive(
+        &context,
+        DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::P256,
+            usage: DeriveUse::Pubkey,
             payload: None,
             hash: None,
             output_format: DeriveFormat::Raw,
@@ -631,17 +891,24 @@ fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
     .unwrap();
     assert_eq!(public_sec1.len(), 65);
     assert_eq!(public_sec1[0], 0x04);
+    let expected_public_sec1 = software_secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    assert_eq!(public_sec1.as_slice(), expected_public_sec1.as_slice());
     let verifying_key = VerifyingKey::from_sec1_bytes(&public_sec1).unwrap();
 
     let message = Zeroizing::new(b"api derive simulator signature payload".to_vec());
+    let digest = Sha256::digest(message.as_slice());
     let signature = derive::derive(
         &context,
-        derive::DeriveParams {
+        DeriveParams {
             material: ObjectSelector::Id(seed_id),
             label: Some(label),
             algorithm: DeriveAlgorithm::P256,
-            usage: derive::DeriveUse::Sign,
-            payload: Some(derive::SignPayload::Message(message.clone())),
+            usage: DeriveUse::Sign,
+            payload: Some(DeriveSignPayload::Message(message.clone())),
             hash: Some(HashAlgorithm::Sha256),
             output_format: DeriveFormat::Raw,
             compressed: false,
@@ -650,6 +917,11 @@ fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
     )
     .unwrap();
     assert_eq!(signature.len(), 64);
+    let software_signature: P256Signature = P256SigningKey::from(software_secret)
+        .sign_prehash(&digest)
+        .unwrap();
+    let software_signature_bytes = software_signature.to_bytes();
+    assert_eq!(signature.as_slice(), &software_signature_bytes[..]);
     let signature = P256Signature::from_slice(&signature).unwrap();
     verifying_key
         .verify(message.as_slice(), &signature)
@@ -659,12 +931,7 @@ fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
 #[test]
 fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_signature() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -687,13 +954,31 @@ fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_sign
     )
     .unwrap();
 
-    let public_sec1 = derive::derive(
+    let secret = derive::derive(
         &context,
-        derive::DeriveParams {
+        DeriveParams {
             material: ObjectSelector::Id(seed_id.clone()),
             label: Some(label.clone()),
             algorithm: DeriveAlgorithm::Secp256k1,
-            usage: derive::DeriveUse::Pubkey,
+            usage: DeriveUse::Secret,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(secret.len(), 32);
+    let software_secret = k256::SecretKey::from_slice(secret.as_slice()).unwrap();
+
+    let public_sec1 = derive::derive(
+        &context,
+        DeriveParams {
+            material: ObjectSelector::Id(seed_id.clone()),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: DeriveUse::Pubkey,
             payload: None,
             hash: None,
             output_format: DeriveFormat::Raw,
@@ -704,6 +989,12 @@ fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_sign
     .unwrap();
     assert_eq!(public_sec1.len(), 65);
     assert_eq!(public_sec1[0], 0x04);
+    let expected_public_sec1 = software_secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    assert_eq!(public_sec1.as_slice(), expected_public_sec1.as_slice());
     let verifying_key = Secp256k1VerifyingKey::from_sec1_bytes(&public_sec1).unwrap();
 
     let compressed_public = derive::derive(
@@ -746,12 +1037,12 @@ fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_sign
     let digest = Zeroizing::new(Sha256::digest(message.as_slice()).to_vec());
     let signature = derive::derive(
         &context,
-        derive::DeriveParams {
+        DeriveParams {
             material: ObjectSelector::Id(seed_id.clone()),
             label: Some(label.clone()),
             algorithm: DeriveAlgorithm::Secp256k1,
-            usage: derive::DeriveUse::Sign,
-            payload: Some(derive::SignPayload::Message(message.clone())),
+            usage: DeriveUse::Sign,
+            payload: Some(DeriveSignPayload::Message(message.clone())),
             hash: Some(HashAlgorithm::Sha256),
             output_format: DeriveFormat::Raw,
             compressed: false,
@@ -760,6 +1051,11 @@ fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_sign
     )
     .unwrap();
     assert_eq!(signature.len(), 64);
+    let software_signature: Secp256k1Signature = Secp256k1SigningKey::from(software_secret.clone())
+        .sign_prehash(&digest)
+        .unwrap();
+    let software_signature_bytes = software_signature.to_bytes();
+    assert_eq!(signature.as_slice(), &software_signature_bytes[..]);
     let signature = Secp256k1Signature::from_slice(&signature).unwrap();
     verifying_key
         .verify_prehash(digest.as_slice(), &signature)
@@ -790,12 +1086,7 @@ fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_sign
 #[test]
 fn simulator_api_derive_from_sealed_seed_emits_ed25519_pubkey_and_signature() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -863,12 +1154,7 @@ fn simulator_api_derive_from_sealed_seed_emits_ed25519_pubkey_and_signature() {
 #[test]
 fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -948,12 +1234,7 @@ fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {
 #[test]
 fn simulator_api_derive_uses_hmac_identity_seed_via_persistent_handle() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -978,6 +1259,23 @@ fn simulator_api_derive_uses_hmac_identity_seed_via_persistent_handle() {
     )
     .unwrap();
 
+    let by_handle_secret_params = DeriveParams {
+        material: ObjectSelector::Handle(handle),
+        label: Some(label.clone()),
+        algorithm: DeriveAlgorithm::P256,
+        usage: DeriveUse::Secret,
+        payload: None,
+        hash: None,
+        output_format: DeriveFormat::Raw,
+        compressed: false,
+        entropy: None,
+    };
+    let handle_secret = derive::derive(&context, by_handle_secret_params.clone()).unwrap();
+    let repeated_handle_secret = derive::derive(&context, by_handle_secret_params).unwrap();
+    assert_eq!(handle_secret, repeated_handle_secret);
+    assert_eq!(handle_secret.len(), 32);
+    let software_secret = SecretKey::from_slice(handle_secret.as_slice()).unwrap();
+
     let by_handle_params = DeriveParams {
         material: ObjectSelector::Handle(handle),
         label: Some(label.clone()),
@@ -994,6 +1292,12 @@ fn simulator_api_derive_uses_hmac_identity_seed_via_persistent_handle() {
     assert_eq!(handle_pubkey, repeated_handle_pubkey);
     assert_eq!(handle_pubkey.len(), 65);
     assert_eq!(handle_pubkey[0], 0x04);
+    let expected_public = software_secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    assert_eq!(handle_pubkey.as_slice(), expected_public.as_slice());
 
     let by_id_pubkey = derive::derive(
         &context,
@@ -1013,6 +1317,7 @@ fn simulator_api_derive_uses_hmac_identity_seed_via_persistent_handle() {
     assert_eq!(handle_pubkey, by_id_pubkey);
 
     let message = Zeroizing::new(b"derive with persistent HMAC identity handle".to_vec());
+    let digest = Sha256::digest(message.as_slice());
     let public_key = VerifyingKey::from_sec1_bytes(&handle_pubkey).unwrap();
     let signature = derive::derive(
         &context,
@@ -1030,19 +1335,282 @@ fn simulator_api_derive_uses_hmac_identity_seed_via_persistent_handle() {
     )
     .unwrap();
     assert_eq!(signature.len(), 64);
+    let software_signature: P256Signature = P256SigningKey::from(software_secret)
+        .sign_prehash(&digest)
+        .unwrap();
+    let software_signature_bytes = software_signature.to_bytes();
+    assert_eq!(signature.as_slice(), &software_signature_bytes[..]);
     let signature = P256Signature::from_slice(&signature).unwrap();
     public_key.verify(message.as_slice(), &signature).unwrap();
+
+    cleanup_persistent_handle(handle);
+}
+
+#[test]
+fn simulator_persistent_hmac_handle_survives_reload_and_force_replaces_handle_binding_only() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let store = Store::new(temp_store.path());
+    let handle = PersistentHandle::new(0x8101_0043).unwrap();
+    let first_id = RegistryId::new("sim/api/persistent-hmac-handle/first").unwrap();
+    let second_id = RegistryId::new("sim/api/persistent-hmac-handle/second").unwrap();
+    let input = b"persistent hmac simulator input".to_vec();
+
+    let first = api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Hmac,
+            id: first_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(first.persistent_handle, Some(handle));
+
+    let stored = store.load_key(&first_id).unwrap();
+    assert_eq!(stored.record.handle.as_deref(), Some("0x81010043"));
+    assert!(stored.record.persistent);
+
+    let by_id = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(first_id.clone()),
+            input: Zeroizing::new(input.clone()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let HmacResult::Output(by_id) = by_id else {
+        panic!("expected raw HMAC output by id")
+    };
+
+    let reloaded_context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let by_handle = api::hmac(
+        &reloaded_context,
+        HmacParams {
+            material: ObjectSelector::Handle(handle),
+            input: Zeroizing::new(input.clone()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let HmacResult::Output(by_handle) = by_handle else {
+        panic!("expected raw HMAC output by handle")
+    };
+    assert_eq!(by_id, by_handle);
+
+    api::keygen(
+        &reloaded_context,
+        KeygenParams {
+            usage: KeygenUsage::Hmac,
+            id: second_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let replaced = api::hmac(
+        &reloaded_context,
+        HmacParams {
+            material: ObjectSelector::Handle(handle),
+            input: Zeroizing::new(input.clone()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let HmacResult::Output(replaced) = replaced else {
+        panic!("expected replacement HMAC output by handle")
+    };
+    assert_ne!(replaced, by_handle);
+
+    let original_by_id = api::hmac(
+        &reloaded_context,
+        HmacParams {
+            material: ObjectSelector::Id(first_id),
+            input: Zeroizing::new(input),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let HmacResult::Output(original_by_id) = original_by_id else {
+        panic!("expected original HMAC output by id after handle replacement")
+    };
+    assert_eq!(original_by_id, by_handle);
+    assert_ne!(original_by_id, replaced);
+
+    cleanup_persistent_handle(handle);
+}
+
+#[test]
+fn simulator_persistent_ecdh_handle_reload_and_force_replacement_changes_shared_secret() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let handle = PersistentHandle::new(0x8101_0045).unwrap();
+    let first_id = RegistryId::new("sim/api/persistent-ecdh-handle/first").unwrap();
+    let second_id = RegistryId::new("sim/api/persistent-ecdh-handle/second").unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: first_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let software_secret = SecretKey::from_slice(&[0x24; 32]).unwrap();
+    let peer_public_key = PublicKeyInput::Sec1(
+        software_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let by_id = api::ecdh(
+        &context,
+        EcdhParams {
+            material: ObjectSelector::Id(first_id.clone()),
+            peer_public_key: peer_public_key.clone(),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+
+    let reloaded_context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let handle_public_sec1 = api::pubkey(
+        &reloaded_context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let handle_public = PublicKey::from_sec1_bytes(&handle_public_sec1).unwrap();
+
+    let by_handle = api::ecdh(
+        &reloaded_context,
+        EcdhParams {
+            material: ObjectSelector::Handle(handle),
+            peer_public_key: peer_public_key.clone(),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_eq!(by_id, by_handle);
+
+    let expected = diffie_hellman(
+        software_secret.to_nonzero_scalar(),
+        handle_public.as_affine(),
+    );
+    let expected_bytes: &[u8; 32] = expected.raw_secret_bytes().as_ref();
+    assert_eq!(by_handle.as_slice(), expected_bytes.as_slice());
+
+    api::keygen(
+        &reloaded_context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: second_id,
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let replaced_public_sec1 = api::pubkey(
+        &reloaded_context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_ne!(handle_public_sec1, replaced_public_sec1);
+
+    let replaced_by_handle = api::ecdh(
+        &reloaded_context,
+        EcdhParams {
+            material: ObjectSelector::Handle(handle),
+            peer_public_key,
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_ne!(by_handle, replaced_by_handle);
+
+    let original_by_id = api::ecdh(
+        &reloaded_context,
+        EcdhParams {
+            material: ObjectSelector::Id(first_id),
+            peer_public_key: PublicKeyInput::Sec1(
+                software_secret
+                    .public_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_eq!(original_by_id, replaced_by_handle);
+    assert_ne!(original_by_id, by_handle);
+
+    cleanup_persistent_handle(handle);
 }
 
 #[test]
 fn simulator_ecdh_shared_secret_matches_software_p256_agreement() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -1101,12 +1669,7 @@ fn simulator_ecdh_shared_secret_matches_software_p256_agreement() {
 #[test]
 fn simulator_ecdh_rejects_invalid_peer_public_key_before_zgen() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -1155,12 +1718,7 @@ fn simulator_ecdh_rejects_invalid_peer_public_key_before_zgen() {
 #[test]
 fn simulator_api_facade_keygen_pubkey_sign_hmac_seal_and_ecdh_roundtrip() {
     let _guard = simulator_test_lock().lock().unwrap();
-    let Some(_tcti) = SimulatorTcti::activate() else {
-        eprintln!(
-            "skipping TPM simulator integration test: install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI/TCTI/TPM2TOOLS_TCTI"
-        );
-        return;
-    };
+    let _tcti = require_simulator_tcti();
     startup_and_get_random();
 
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
@@ -1303,6 +1861,15 @@ fn startup_and_get_random() {
     assert_eq!(random.value().len(), 8);
 }
 
+fn cleanup_persistent_handle(handle: PersistentHandle) {
+    let mut context =
+        tpmctl_core::tpm::create_context().expect("configured TCTI should open an ESAPI context");
+    if let Ok(object) = tpmctl_core::tpm::load_persistent_object(&mut context, handle) {
+        tpmctl_core::tpm::evict_persistent_object(&mut context, object, handle)
+            .expect("cleanup should evict persistent handle");
+    }
+}
+
 struct SimulatorTcti {
     _child: Option<Child>,
     _state_dir: Option<tempfile::TempDir>,
@@ -1310,10 +1877,17 @@ struct SimulatorTcti {
     restore_tcti_env: bool,
 }
 
+fn require_simulator_tcti() -> SimulatorTcti {
+    SimulatorTcti::activate().unwrap_or_else(|message| panic!("{message}"))
+}
+
 impl SimulatorTcti {
-    fn activate() -> Option<Self> {
-        if allow_external_tcti() && existing_tcti().is_some() {
-            return Some(Self {
+    fn activate() -> Result<Self, String> {
+        if allow_external_tcti() {
+            existing_tcti().ok_or_else(|| {
+                "TPMCTL_TEST_EXTERNAL_TCTI=1 requires TEST_TCTI, TCTI, or TPM2TOOLS_TCTI to be set to a non-empty TCTI string".to_string()
+            })?;
+            return Ok(Self {
                 _child: None,
                 _state_dir: None,
                 previous_tcti_env: Vec::new(),
@@ -1321,7 +1895,12 @@ impl SimulatorTcti {
             });
         }
 
-        let swtpm = find_on_path("swtpm")?;
+        let swtpm = find_on_path("swtpm").ok_or_else(|| {
+            let configured = existing_tcti().map(|value| format!(" Found existing TCTI={value:?}, but external mode is disabled; set TPMCTL_TEST_EXTERNAL_TCTI=1 to use it." )).unwrap_or_default();
+            format!(
+                "simulator tests require swtpm on PATH by default. Install swtpm or set TPMCTL_TEST_EXTERNAL_TCTI=1 with TEST_TCTI, TCTI, or TPM2TOOLS_TCTI configured.{configured}"
+            )
+        })?;
         let state_dir = tempfile::tempdir().expect("create swtpm state directory");
         let (server_port, ctrl_port) = free_adjacent_local_ports();
 
@@ -1342,9 +1921,10 @@ impl SimulatorTcti {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("start swtpm simulator");
+            .map_err(|error| format!("failed to start swtpm simulator: {error}"))?;
 
-        wait_for_tcp_port(SocketAddr::from(([127, 0, 0, 1], server_port)), &mut child);
+        wait_for_tcp_port(SocketAddr::from(([127, 0, 0, 1], server_port)), &mut child)
+            .map_err(|error| format!("failed to initialize swtpm simulator: {error}"))?;
 
         let tcti = format!("swtpm:host=127.0.0.1,port={server_port}");
         let previous_tcti_env = capture_tcti_env();
@@ -1355,7 +1935,7 @@ impl SimulatorTcti {
             env::set_var("TEST_TCTI", tcti);
         }
 
-        Some(Self {
+        Ok(Self {
             _child: Some(child),
             _state_dir: Some(state_dir),
             previous_tcti_env,
@@ -1427,21 +2007,28 @@ fn free_adjacent_local_ports() -> (u16, u16) {
     panic!("failed to find adjacent free local TCP ports for swtpm");
 }
 
-fn wait_for_tcp_port(addr: SocketAddr, child: &mut Child) {
+fn wait_for_tcp_port(addr: SocketAddr, child: &mut Child) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {
-            return;
+            return Ok(());
         }
-        if let Some(status) = child.try_wait().expect("poll swtpm child") {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("failed to poll swtpm child process: {error}"))?
+        {
             let stderr = read_child_stderr(child);
-            panic!("swtpm exited before accepting connections: {status}; stderr:\n{stderr}");
+            return Err(format!(
+                "swtpm exited before accepting connections: {status}; stderr:\n{stderr}"
+            ));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             let stderr = read_child_stderr(child);
-            panic!("timed out waiting for swtpm at {addr}; stderr:\n{stderr}");
+            return Err(format!(
+                "timed out waiting for swtpm at {addr}; stderr:\n{stderr}"
+            ));
         }
         thread::sleep(Duration::from_millis(25));
     }
