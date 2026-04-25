@@ -26,6 +26,7 @@ use p256::{
     elliptic_curve::sec1::ToEncodedPoint,
 };
 use sha2::{Digest, Sha256, Sha384};
+use sha3::Keccak256;
 use tss_esapi::constants::StartupType;
 use zeroize::Zeroizing;
 
@@ -49,6 +50,256 @@ const TCTI_ENV_PRECEDENCE: [&str; 3] = ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"];
 fn simulator_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn derive_p256_workflow_and_assert_consistency(
+    context: &ApiContext,
+    material: ObjectSelector,
+    label: Vec<u8>,
+    message: &[u8],
+) {
+    let secret_params = DeriveParams {
+        material: material.clone(),
+        label: Some(label.clone()),
+        algorithm: DeriveAlgorithm::P256,
+        usage: DeriveUse::Secret,
+        payload: None,
+        hash: None,
+        output_format: DeriveFormat::Raw,
+        compressed: false,
+        entropy: None,
+    };
+    let secret = derive::derive(context, secret_params.clone()).unwrap();
+    let repeated_secret = derive::derive(context, secret_params).unwrap();
+    assert_eq!(secret, repeated_secret);
+    assert_eq!(secret.len(), 32);
+
+    let software_secret = SecretKey::from_slice(secret.as_slice()).unwrap();
+    let expected_public = software_secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+
+    let pubkey_params = DeriveParams {
+        material: material.clone(),
+        label: Some(label.clone()),
+        algorithm: DeriveAlgorithm::P256,
+        usage: DeriveUse::Pubkey,
+        payload: None,
+        hash: None,
+        output_format: DeriveFormat::Raw,
+        compressed: false,
+        entropy: None,
+    };
+    let public = derive::derive(context, pubkey_params.clone()).unwrap();
+    let repeated_public = derive::derive(context, pubkey_params).unwrap();
+    assert_eq!(public, repeated_public);
+    assert_eq!(public.as_slice(), expected_public.as_slice());
+
+    let digest = Zeroizing::new(Sha256::digest(message).to_vec());
+    let sign_message_params = DeriveParams {
+        material: material.clone(),
+        label: Some(label.clone()),
+        algorithm: DeriveAlgorithm::P256,
+        usage: DeriveUse::Sign,
+        payload: Some(DeriveSignPayload::Message(Zeroizing::new(message.to_vec()))),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: DeriveFormat::Raw,
+        compressed: false,
+        entropy: None,
+    };
+    let message_signature = derive::derive(context, sign_message_params.clone()).unwrap();
+    let repeated_message_signature = derive::derive(context, sign_message_params).unwrap();
+    assert_eq!(message_signature, repeated_message_signature);
+    assert_eq!(message_signature.len(), 64);
+
+    let digest_signature = derive::derive(
+        context,
+        DeriveParams {
+            material,
+            label: Some(label),
+            algorithm: DeriveAlgorithm::P256,
+            usage: DeriveUse::Sign,
+            payload: Some(DeriveSignPayload::Digest(digest.clone())),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(message_signature, digest_signature);
+
+    let software_signature: P256Signature = P256SigningKey::from(software_secret)
+        .sign_prehash(digest.as_slice())
+        .unwrap();
+    let software_signature_bytes = software_signature.to_bytes();
+    assert_eq!(message_signature.as_slice(), &software_signature_bytes[..]);
+
+    let verifying_key = VerifyingKey::from_sec1_bytes(public.as_slice()).unwrap();
+    let signature = P256Signature::from_slice(message_signature.as_slice()).unwrap();
+    verifying_key.verify(message, &signature).unwrap();
+}
+
+fn checksum_address_from_uncompressed_secp256k1(public_key: &[u8]) -> String {
+    let digest = Keccak256::digest(&public_key[1..]);
+    let lower = hex::encode(&digest[12..]);
+    let hash = Keccak256::digest(lower.as_bytes());
+
+    let mut out = String::from("0x");
+    for (index, ch) in lower.chars().enumerate() {
+        let hash_byte = hash[index / 2];
+        let nibble = if index % 2 == 0 {
+            hash_byte >> 4
+        } else {
+            hash_byte & 0x0f
+        };
+        if ch.is_ascii_alphabetic() && nibble >= 8 {
+            out.push(ch.to_ascii_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn derive_secp256k1_workflow_and_assert_consistency(
+    context: &ApiContext,
+    material: ObjectSelector,
+    label: Vec<u8>,
+    message: &[u8],
+) {
+    let secret_params = DeriveParams {
+        material: material.clone(),
+        label: Some(label.clone()),
+        algorithm: DeriveAlgorithm::Secp256k1,
+        usage: DeriveUse::Secret,
+        payload: None,
+        hash: None,
+        output_format: DeriveFormat::Raw,
+        compressed: false,
+        entropy: None,
+    };
+    let secret = derive::derive(context, secret_params.clone()).unwrap();
+    let repeated_secret = derive::derive(context, secret_params).unwrap();
+    assert_eq!(secret, repeated_secret);
+    assert_eq!(secret.len(), 32);
+
+    let software_secret = k256::SecretKey::from_slice(secret.as_slice()).unwrap();
+    let expected_public = software_secret
+        .public_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    let expected_compressed_public = software_secret
+        .public_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+
+    let pubkey_params = DeriveParams {
+        material: material.clone(),
+        label: Some(label.clone()),
+        algorithm: DeriveAlgorithm::Secp256k1,
+        usage: DeriveUse::Pubkey,
+        payload: None,
+        hash: None,
+        output_format: DeriveFormat::Raw,
+        compressed: false,
+        entropy: None,
+    };
+    let public = derive::derive(context, pubkey_params.clone()).unwrap();
+    let repeated_public = derive::derive(context, pubkey_params).unwrap();
+    assert_eq!(public, repeated_public);
+    assert_eq!(public.as_slice(), expected_public.as_slice());
+
+    let compressed_public = derive::derive(
+        context,
+        DeriveParams {
+            material: material.clone(),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: DeriveUse::Pubkey,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Raw,
+            compressed: true,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        compressed_public.as_slice(),
+        expected_compressed_public.as_slice()
+    );
+
+    let address = derive::derive(
+        context,
+        DeriveParams {
+            material: material.clone(),
+            label: Some(label.clone()),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: DeriveUse::Pubkey,
+            payload: None,
+            hash: None,
+            output_format: DeriveFormat::Address,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    let expected_address = checksum_address_from_uncompressed_secp256k1(expected_public.as_slice());
+    assert_eq!(
+        std::str::from_utf8(address.as_slice()).unwrap(),
+        expected_address
+    );
+
+    let digest = Zeroizing::new(Sha256::digest(message).to_vec());
+    let sign_message_params = DeriveParams {
+        material: material.clone(),
+        label: Some(label.clone()),
+        algorithm: DeriveAlgorithm::Secp256k1,
+        usage: DeriveUse::Sign,
+        payload: Some(DeriveSignPayload::Message(Zeroizing::new(message.to_vec()))),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: DeriveFormat::Raw,
+        compressed: false,
+        entropy: None,
+    };
+    let message_signature = derive::derive(context, sign_message_params.clone()).unwrap();
+    let repeated_message_signature = derive::derive(context, sign_message_params).unwrap();
+    assert_eq!(message_signature, repeated_message_signature);
+    assert_eq!(message_signature.len(), 64);
+
+    let digest_signature = derive::derive(
+        context,
+        DeriveParams {
+            material,
+            label: Some(label),
+            algorithm: DeriveAlgorithm::Secp256k1,
+            usage: DeriveUse::Sign,
+            payload: Some(DeriveSignPayload::Digest(digest.clone())),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: DeriveFormat::Raw,
+            compressed: false,
+            entropy: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(message_signature, digest_signature);
+
+    let software_signature: Secp256k1Signature = Secp256k1SigningKey::from(software_secret)
+        .sign_prehash(digest.as_slice())
+        .unwrap();
+    let software_signature_bytes = software_signature.to_bytes();
+    assert_eq!(message_signature.as_slice(), &software_signature_bytes[..]);
+
+    let verifying_key = Secp256k1VerifyingKey::from_sec1_bytes(public.as_slice()).unwrap();
+    let signature = Secp256k1Signature::from_slice(message_signature.as_slice()).unwrap();
+    verifying_key
+        .verify_prehash(digest.as_slice(), &signature)
+        .unwrap();
 }
 
 #[test]
@@ -255,6 +506,223 @@ fn simulator_seal_rejects_existing_registry_target_without_overwrite_and_preserv
     )
     .unwrap();
     assert_eq!(unsealed.as_slice(), b"first sealed secret");
+}
+
+#[test]
+fn simulator_api_seal_then_unseal_roundtrips_exact_bytes() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let sealed_id = RegistryId::new("sim/api/seal-roundtrip/exact-bytes").unwrap();
+    let expected = Zeroizing::new(vec![0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, b's', b'e', 0x00]);
+
+    let sealed = api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: expected.clone(),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(sealed.selector, ObjectSelector::Id(sealed_id.clone()));
+    assert_eq!(sealed.hash, None);
+
+    let reloaded_context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let unsealed = api::unseal(
+        &reloaded_context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id),
+        },
+    )
+    .unwrap();
+    assert_eq!(unsealed.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn simulator_api_seal_overwrite_replaces_unsealed_value() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let sealed_id = RegistryId::new("sim/api/seal-overwrite/replaced-value").unwrap();
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: Zeroizing::new(b"first sealed bytes".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let first_unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(first_unsealed.as_slice(), b"first sealed bytes");
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: Zeroizing::new(b"second sealed bytes".to_vec()),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+    let replaced_unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id),
+        },
+    )
+    .unwrap();
+    assert_eq!(replaced_unsealed.as_slice(), b"second sealed bytes");
+    assert_ne!(replaced_unsealed.as_slice(), first_unsealed.as_slice());
+}
+
+#[test]
+fn simulator_api_seal_hmac_output_then_unseal_matches_exact_bytes() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let hmac_id = RegistryId::new("sim/api/seal-hmac-output/key").unwrap();
+    let sealed_id = RegistryId::new("sim/api/seal-hmac-output/sealed-prf").unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Hmac,
+            id: hmac_id.clone(),
+            persist_at: None,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let expected_hmac = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(hmac_id),
+            input: Zeroizing::new(b"seal raw hmac bytes".to_vec()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let HmacResult::Output(expected_hmac) = expected_hmac else {
+        panic!("expected raw HMAC output")
+    };
+    assert_eq!(expected_hmac.len(), HashAlgorithm::Sha256.digest_len());
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: expected_hmac.clone(),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id),
+        },
+    )
+    .unwrap();
+    assert_eq!(unsealed.as_slice(), expected_hmac.as_slice());
+}
+
+#[test]
+fn simulator_api_unseal_by_id_is_stable_across_repeated_calls() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let sealed_id = RegistryId::new("sim/api/unseal-repeat/stable-id").unwrap();
+    let expected = b"repeatable unseal bytes".to_vec();
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(sealed_id.clone()),
+            input: Zeroizing::new(expected.clone()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let first = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id.clone()),
+        },
+    )
+    .unwrap();
+    let second = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id.clone()),
+        },
+    )
+    .unwrap();
+    let third = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(first.as_slice(), expected.as_slice());
+    assert_eq!(second.as_slice(), expected.as_slice());
+    assert_eq!(third.as_slice(), expected.as_slice());
+    assert_eq!(first, second);
+    assert_eq!(second, third);
 }
 
 #[test]
@@ -1232,6 +1700,103 @@ fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {
 }
 
 #[test]
+fn simulator_api_derive_outputs_are_consistent_for_sealed_seed_material() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+
+    let p256_seed_id = RegistryId::new("sim/api/derive/consistency/sealed-seed/p256").unwrap();
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(p256_seed_id.clone()),
+            input: Zeroizing::new(
+                b"sealed consistency integration seed material for p256".to_vec(),
+            ),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    derive_p256_workflow_and_assert_consistency(
+        &context,
+        ObjectSelector::Id(p256_seed_id),
+        b"simulator sealed seed consistency label p256".to_vec(),
+        b"simulator sealed seed consistency message p256",
+    );
+
+    let secp256k1_seed_id =
+        RegistryId::new("sim/api/derive/consistency/sealed-seed/secp256k1").unwrap();
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Id(secp256k1_seed_id.clone()),
+            input: Zeroizing::new(
+                b"sealed consistency integration seed material for secp256k1".to_vec(),
+            ),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    derive_secp256k1_workflow_and_assert_consistency(
+        &context,
+        ObjectSelector::Id(secp256k1_seed_id),
+        b"simulator sealed seed consistency label secp256k1".to_vec(),
+        b"simulator sealed seed consistency message secp256k1",
+    );
+}
+
+#[test]
+fn simulator_api_derive_outputs_are_consistent_for_hmac_persistent_handle_material() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let hmac_id = RegistryId::new("sim/api/derive/consistency/hmac-handle/key").unwrap();
+    let handle = PersistentHandle::new(0x8101_0044).unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Hmac,
+            id: hmac_id,
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    derive_p256_workflow_and_assert_consistency(
+        &context,
+        ObjectSelector::Handle(handle),
+        b"simulator hmac handle consistency label p256".to_vec(),
+        b"simulator hmac handle consistency message p256",
+    );
+    derive_secp256k1_workflow_and_assert_consistency(
+        &context,
+        ObjectSelector::Handle(handle),
+        b"simulator hmac handle consistency label secp256k1".to_vec(),
+        b"simulator hmac handle consistency message secp256k1",
+    );
+
+    cleanup_persistent_handle(handle);
+}
+
+#[test]
 fn simulator_api_derive_uses_hmac_identity_seed_via_persistent_handle() {
     let _guard = simulator_test_lock().lock().unwrap();
     let _tcti = require_simulator_tcti();
@@ -1603,6 +2168,275 @@ fn simulator_persistent_ecdh_handle_reload_and_force_replacement_changes_shared_
     .unwrap();
     assert_eq!(original_by_id, replaced_by_handle);
     assert_ne!(original_by_id, by_handle);
+
+    cleanup_persistent_handle(handle);
+}
+
+#[test]
+fn simulator_persistent_sign_handle_overwrite_diverges_between_pubkey_and_sign_by_id() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let handle = PersistentHandle::new(0x8101_0046).unwrap();
+    let first_id = RegistryId::new("sim/api/persistent-sign-overwrite/first").unwrap();
+    let second_id = RegistryId::new("sim/api/persistent-sign-overwrite/second").unwrap();
+    let message = Zeroizing::new(b"persistent sign overwrite divergence".to_vec());
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Sign,
+            id: first_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let first_pubkey_by_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(first_id.clone()),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let first_pubkey_by_handle = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    assert_eq!(first_pubkey_by_id, first_pubkey_by_handle);
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Sign,
+            id: second_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let stale_pubkey_by_first_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(first_id.clone()),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let replacement_pubkey_by_second_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(second_id.clone()),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let replacement_pubkey_by_handle = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(stale_pubkey_by_first_id, first_pubkey_by_id);
+    assert_ne!(replacement_pubkey_by_handle, first_pubkey_by_handle);
+    assert_eq!(
+        replacement_pubkey_by_second_id,
+        replacement_pubkey_by_handle
+    );
+
+    let stale_verifying_key = VerifyingKey::from_sec1_bytes(&stale_pubkey_by_first_id).unwrap();
+    let replacement_verifying_key =
+        VerifyingKey::from_sec1_bytes(&replacement_pubkey_by_handle).unwrap();
+
+    let signature_by_first_id = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Id(first_id),
+            payload: SignPayload::Message(message.clone()),
+            hash: HashAlgorithm::Sha256,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap();
+    let signature_by_first_id = P256Signature::from_slice(&signature_by_first_id).unwrap();
+    assert!(
+        stale_verifying_key
+            .verify(message.as_slice(), &signature_by_first_id)
+            .is_err(),
+        "sign by stale id should not match the stale registry pubkey after handle overwrite"
+    );
+    replacement_verifying_key
+        .verify(message.as_slice(), &signature_by_first_id)
+        .expect("sign by stale id should resolve through the overwritten persistent handle");
+
+    let signature_by_handle = api::sign(
+        &context,
+        SignParams {
+            material: ObjectSelector::Handle(handle),
+            payload: SignPayload::Message(message),
+            hash: HashAlgorithm::Sha256,
+            output_format: SignatureFormat::Raw,
+        },
+    )
+    .unwrap();
+    let signature_by_handle = P256Signature::from_slice(&signature_by_handle).unwrap();
+    replacement_verifying_key
+        .verify(
+            b"persistent sign overwrite divergence",
+            &signature_by_handle,
+        )
+        .unwrap();
+
+    cleanup_persistent_handle(handle);
+}
+
+#[test]
+fn simulator_persistent_ecdh_handle_overwrite_diverges_between_pubkey_and_ecdh_by_id() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let handle = PersistentHandle::new(0x8101_0047).unwrap();
+    let first_id = RegistryId::new("sim/api/persistent-ecdh-overwrite/first").unwrap();
+    let second_id = RegistryId::new("sim/api/persistent-ecdh-overwrite/second").unwrap();
+    let peer_secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
+    let peer_public_key = PublicKeyInput::Sec1(
+        peer_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec(),
+    );
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: first_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let first_pubkey_by_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(first_id.clone()),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let first_secret_by_id = api::ecdh(
+        &context,
+        EcdhParams {
+            material: ObjectSelector::Id(first_id.clone()),
+            peer_public_key: peer_public_key.clone(),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: second_id.clone(),
+            persist_at: Some(handle),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let stale_pubkey_by_first_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(first_id.clone()),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let replacement_pubkey_by_second_id = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Id(second_id.clone()),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let replacement_pubkey_by_handle = api::pubkey(
+        &context,
+        PubkeyParams {
+            material: ObjectSelector::Handle(handle),
+            output_format: PublicKeyFormat::Raw,
+        },
+    )
+    .unwrap();
+    let replacement_secret_by_handle = api::ecdh(
+        &context,
+        EcdhParams {
+            material: ObjectSelector::Handle(handle),
+            peer_public_key: peer_public_key.clone(),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+    let replacement_secret_by_first_id = api::ecdh(
+        &context,
+        EcdhParams {
+            material: ObjectSelector::Id(first_id),
+            peer_public_key: peer_public_key.clone(),
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+    let replacement_secret_by_second_id = api::ecdh(
+        &context,
+        EcdhParams {
+            material: ObjectSelector::Id(second_id),
+            peer_public_key,
+            output_format: BinaryFormat::Raw,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(stale_pubkey_by_first_id, first_pubkey_by_id);
+    assert_ne!(replacement_pubkey_by_handle, first_pubkey_by_id);
+    assert_eq!(
+        replacement_pubkey_by_second_id,
+        replacement_pubkey_by_handle
+    );
+    assert_ne!(replacement_secret_by_handle, first_secret_by_id);
+    assert_eq!(replacement_secret_by_handle, replacement_secret_by_first_id);
+    assert_eq!(
+        replacement_secret_by_handle,
+        replacement_secret_by_second_id
+    );
 
     cleanup_persistent_handle(handle);
 }

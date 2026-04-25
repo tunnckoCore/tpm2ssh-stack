@@ -1,4 +1,4 @@
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
 use super::primitives::{DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_bytes};
@@ -30,7 +30,7 @@ pub(super) fn sign_message(
     message: &[u8],
 ) -> Result<Vec<u8>, DeriveError> {
     let signing_key = derive_signing_key(seed, mode)?;
-    let signature = Zeroizing::new(ed25519_dalek::Signer::sign(&signing_key, message).to_bytes());
+    let signature = Zeroizing::new(signing_key.sign(message).to_bytes());
     Ok(signature.as_slice().to_vec())
 }
 
