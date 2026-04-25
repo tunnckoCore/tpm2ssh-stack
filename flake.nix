@@ -43,7 +43,13 @@
               pkg-config
               openssl
               swtpm
+              tree
+              ripgrep
+              fzf
+              fd
+              htop
               tpm2-tss
+              tpm2-tss.dev
               tpm2-tools
             ];
 
