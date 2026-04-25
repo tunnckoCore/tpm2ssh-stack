@@ -9,8 +9,7 @@ use std::fmt;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
-    CommandContext, DeriveAlgorithm, Error, HashAlgorithm, ObjectSelector, Result, crypto,
-    crypto::derive::DerivedAlgorithm,
+    CommandContext, DeriveAlgorithm, Error, HashAlgorithm, ObjectSelector, Result,
     hmac::prf_seed_from_hmac_identity,
     output::{self, BinaryFormat, SignatureFormat},
     seal::UnsealRequest,
@@ -18,8 +17,16 @@ use crate::{
 
 use crate::api::Context;
 
+pub mod ed25519;
+pub mod ethereum;
+pub mod p256;
+pub mod primitives;
+pub mod secp256k1;
+
 pub use crate::DeriveFormat;
-pub use crate::crypto::derive::{DeriveUse, HashSelection};
+pub use primitives::{
+    DeriveError, DeriveMode, DeriveRequest, DeriveUse, DerivedAlgorithm, HashSelection, SecretSeed,
+};
 
 /// Payload used by [`derive()`] when [`DeriveParams::usage`] is [`DeriveUse::Sign`].
 #[derive(Clone, Eq, PartialEq)]
@@ -165,12 +172,8 @@ impl Validation {
                 "compressed output is valid only for secp256k1 pubkey raw/hex derivation",
             ));
         }
-        crypto::derive::DeriveRequest::new(
-            self.algorithm,
-            self.usage,
-            self.hash.map(hash_selection),
-        )
-        .map_err(derive_error)?;
+        DeriveRequest::new(self.algorithm, self.usage, self.hash.map(hash_selection))
+            .map_err(derive_error)?;
         Ok(())
     }
 }
@@ -182,7 +185,7 @@ fn derive_with_command(
     validate_params(&params)?;
     let mode = derive_mode(&params)?;
     let seed_bytes = prf_seed(command, &params.material, &params)?;
-    let seed = crypto::derive::SecretSeed::new(seed_bytes.as_slice()).map_err(derive_error)?;
+    let seed = SecretSeed::new(seed_bytes.as_slice()).map_err(derive_error)?;
     dispatch_output(&params, &seed, &mode)
 }
 
@@ -242,14 +245,14 @@ fn hmac_prf_seed(
     Ok(seed)
 }
 
-fn derive_mode(params: &DeriveParams) -> Result<crypto::derive::DeriveMode> {
+fn derive_mode(params: &DeriveParams) -> Result<DeriveMode> {
     if let Some(label) = &params.label {
-        Ok(crypto::derive::DeriveMode::deterministic(label.clone()))
+        Ok(DeriveMode::deterministic(label.clone()))
     } else {
         let entropy = params.entropy.as_ref().ok_or_else(|| {
             Error::invalid("entropy", "entropy is required when label is omitted")
         })?;
-        Ok(crypto::derive::DeriveMode::ephemeral(
+        Ok(DeriveMode::ephemeral(
             Vec::new(),
             entropy.as_slice().to_vec(),
         ))
@@ -258,8 +261,8 @@ fn derive_mode(params: &DeriveParams) -> Result<crypto::derive::DeriveMode> {
 
 fn dispatch_output(
     params: &DeriveParams,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
+    seed: &SecretSeed,
+    mode: &DeriveMode,
 ) -> Result<Zeroizing<Vec<u8>>> {
     match params.usage {
         DeriveUse::Secret => secret(params, seed, mode),
@@ -270,19 +273,19 @@ fn dispatch_output(
 
 fn secret(
     params: &DeriveParams,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
+    seed: &SecretSeed,
+    mode: &DeriveMode,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let mut raw = match params.algorithm {
-        DeriveAlgorithm::P256 => crypto::p256::derive_secret_key(seed, mode)
+        DeriveAlgorithm::P256 => p256::derive_secret_key(seed, mode)
             .map_err(derive_error)?
             .to_bytes()
             .to_vec(),
-        DeriveAlgorithm::Ed25519 => crypto::ed25519::derive_signing_key(seed, mode)
+        DeriveAlgorithm::Ed25519 => ed25519::derive_signing_key(seed, mode)
             .map_err(derive_error)?
             .to_bytes()
             .to_vec(),
-        DeriveAlgorithm::Secp256k1 => crypto::secp256k1::derive_secret_key(seed, mode)
+        DeriveAlgorithm::Secp256k1 => secp256k1::derive_secret_key(seed, mode)
             .map_err(derive_error)?
             .to_bytes()
             .to_vec(),
@@ -294,25 +297,25 @@ fn secret(
 
 fn pubkey(
     params: &DeriveParams,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
+    seed: &SecretSeed,
+    mode: &DeriveMode,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let bytes = match params.algorithm {
         DeriveAlgorithm::P256 => encode_raw_or_hex(
-            &crypto::p256::derive_public_key_sec1(seed, mode, false).map_err(derive_error)?,
+            &p256::derive_public_key_sec1(seed, mode, false).map_err(derive_error)?,
             params.output_format,
         )?,
         DeriveAlgorithm::Ed25519 => encode_raw_or_hex(
-            &crypto::ed25519::derive_public_key_bytes(seed, mode).map_err(derive_error)?,
+            &ed25519::derive_public_key_bytes(seed, mode).map_err(derive_error)?,
             params.output_format,
         )?,
         DeriveAlgorithm::Secp256k1 if params.output_format == DeriveFormat::Address => {
-            crypto::secp256k1::derive_ethereum_address(seed, mode)
+            secp256k1::derive_ethereum_address(seed, mode)
                 .map_err(derive_error)?
                 .into_bytes()
         }
         DeriveAlgorithm::Secp256k1 => encode_raw_or_hex(
-            &crypto::secp256k1::derive_public_key_sec1(seed, mode, params.compressed)
+            &secp256k1::derive_public_key_sec1(seed, mode, params.compressed)
                 .map_err(derive_error)?,
             params.output_format,
         )?,
@@ -322,21 +325,21 @@ fn pubkey(
 
 fn signature(
     params: &DeriveParams,
-    seed: &crypto::derive::SecretSeed,
-    mode: &crypto::derive::DeriveMode,
+    seed: &SecretSeed,
+    mode: &DeriveMode,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let message = sign_message_bytes(params)?;
     let bytes = match params.algorithm {
         DeriveAlgorithm::P256 => output::encode_p256_signature(
-            &crypto::p256::sign_prehash(seed, mode, &message).map_err(derive_error)?,
+            &p256::sign_prehash(seed, mode, &message).map_err(derive_error)?,
             signature_format(params.output_format)?,
         )?,
         DeriveAlgorithm::Ed25519 => encode_raw_or_hex(
-            &crypto::ed25519::sign_message(seed, mode, &message).map_err(derive_error)?,
+            &ed25519::sign_message(seed, mode, &message).map_err(derive_error)?,
             params.output_format,
         )?,
         DeriveAlgorithm::Secp256k1 => output::encode_secp256k1_signature(
-            &crypto::secp256k1::sign_prehash(seed, mode, &message).map_err(derive_error)?,
+            &secp256k1::sign_prehash(seed, mode, &message).map_err(derive_error)?,
             signature_format(params.output_format)?,
         )?,
     };
@@ -466,11 +469,11 @@ fn derive_hash(
     }
 }
 
-fn hash_selection(hash: HashAlgorithm) -> crypto::derive::HashSelection {
+fn hash_selection(hash: HashAlgorithm) -> HashSelection {
     match hash {
-        HashAlgorithm::Sha256 => crypto::derive::HashSelection::Sha256,
-        HashAlgorithm::Sha384 => crypto::derive::HashSelection::Sha384,
-        HashAlgorithm::Sha512 => crypto::derive::HashSelection::Sha512,
+        HashAlgorithm::Sha256 => HashSelection::Sha256,
+        HashAlgorithm::Sha384 => HashSelection::Sha384,
+        HashAlgorithm::Sha512 => HashSelection::Sha512,
     }
 }
 
@@ -479,5 +482,5 @@ fn derive_error(error: impl std::fmt::Display) -> Error {
 }
 
 #[cfg(test)]
-#[path = "derive.test.rs"]
+#[path = "mod.test.rs"]
 mod tests;

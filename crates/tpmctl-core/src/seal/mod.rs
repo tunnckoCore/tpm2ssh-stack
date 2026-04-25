@@ -236,5 +236,5 @@ fn clear_persistent_if_needed(
 }
 
 #[cfg(test)]
-#[path = "seal.test.rs"]
+#[path = "mod.test.rs"]
 mod seal_tests;

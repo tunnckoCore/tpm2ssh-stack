@@ -223,5 +223,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "hmac.test.rs"]
+#[path = "mod.test.rs"]
 mod hmac_tests;

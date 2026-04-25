@@ -3,8 +3,8 @@ use signature::{Signer, hazmat::PrehashSigner};
 use zeroize::Zeroize;
 
 use super::{
-    derive::{DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_valid_secret_key},
     ethereum::{EthereumError, checksum_address_from_public_key},
+    primitives::{DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_valid_secret_key},
 };
 
 /// Derives a valid non-zero secp256k1 scalar, retrying HKDF output until accepted

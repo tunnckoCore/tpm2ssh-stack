@@ -7,12 +7,11 @@ output encoders, and secret-handling types.
 ## Main modules
 
 - `api` — high-level typed operations using an `api::Context`.
-- `derive` — TPM-seeded software-key derivation for P-256, secp256k1, and Ed25519.
+- `derive` — TPM-seeded software-key derivation for P-256, secp256k1, and Ed25519, including pure derivation primitives.
 - `keygen`, `pubkey`, `sign`, `hmac`, `seal`, `ecdh` — domain request/result APIs.
 - `store` — registry IDs, object records, and atomic persistence.
 - `tpm` — ESAPI context creation, object loading, handles, signatures, and ECDH.
 - `output` — public key, signature, and byte encoders.
-- `crypto` — pure software derivation/signing primitives used by `derive`.
 
 ## Basic usage
 

@@ -107,5 +107,5 @@ pub fn encode_tpm_p256_signature(p1363: &[u8], output_format: SignatureFormat) -
 }
 
 #[cfg(test)]
-#[path = "sign.test.rs"]
+#[path = "mod.test.rs"]
 mod sign_tests;

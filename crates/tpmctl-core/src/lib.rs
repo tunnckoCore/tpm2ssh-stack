@@ -2,7 +2,6 @@
 //! encoders, ECDH/HMAC/signing helpers, and derived software-key operations.
 
 pub mod api;
-pub mod crypto;
 pub mod derive;
 pub mod ecdh;
 pub mod error;
@@ -30,9 +29,9 @@ pub type PublicKeyFormat = output::PublicKeyFormat;
 /// Binary/text encodings supported by byte-output operations.
 pub type BinaryTextFormat = output::BinaryFormat;
 /// Algorithms supported by derived software-key operations.
-pub type DeriveAlgorithm = crypto::derive::DerivedAlgorithm;
+pub type DeriveAlgorithm = derive::DerivedAlgorithm;
 /// Output uses supported by derived software-key operations.
-pub type DeriveUse = crypto::derive::DeriveUse;
+pub type DeriveUse = derive::DeriveUse;
 
 /// Caller-provided input encoding.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

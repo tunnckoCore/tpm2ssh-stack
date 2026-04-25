@@ -62,5 +62,5 @@ pub fn encode_shared_secret(secret: &[u8], output_format: BinaryFormat) -> Zeroi
 }
 
 #[cfg(test)]
-#[path = "ecdh.test.rs"]
+#[path = "mod.test.rs"]
 mod ecdh_tests;

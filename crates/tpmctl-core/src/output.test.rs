@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn base_point_sec1() -> Vec<u8> {

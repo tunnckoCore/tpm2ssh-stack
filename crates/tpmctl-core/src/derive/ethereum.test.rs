@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn parse_address(value: &str) -> [u8; 20] {

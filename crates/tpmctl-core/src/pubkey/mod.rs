@@ -112,5 +112,5 @@ impl PublicKeyInput {
 }
 
 #[cfg(test)]
-#[path = "pubkey.test.rs"]
+#[path = "mod.test.rs"]
 mod pubkey_tests;

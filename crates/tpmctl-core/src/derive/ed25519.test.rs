@@ -1,6 +1,5 @@
-
 use super::*;
-use crate::crypto::derive::{DeriveRequest, DeriveUse, HashSelection};
+use crate::derive::primitives::{DeriveRequest, DeriveUse, HashSelection};
 
 #[test]
 fn public_key_is_32_bytes() {

@@ -11,5 +11,5 @@ pub use object::*;
 pub use registry::*;
 
 #[cfg(test)]
-#[path = "tpm.test.rs"]
+#[path = "mod.test.rs"]
 mod tests;

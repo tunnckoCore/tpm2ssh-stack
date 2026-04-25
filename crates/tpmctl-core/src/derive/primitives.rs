@@ -211,5 +211,5 @@ where
 }
 
 #[cfg(test)]
-#[path = "derive.test.rs"]
+#[path = "primitives.test.rs"]
 mod tests;

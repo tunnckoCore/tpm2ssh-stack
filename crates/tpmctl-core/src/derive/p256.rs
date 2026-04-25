@@ -2,7 +2,7 @@ use p256::{SecretKey, ecdsa::SigningKey, elliptic_curve::sec1::ToEncodedPoint};
 use signature::{Signer, hazmat::PrehashSigner};
 use zeroize::Zeroize;
 
-use super::derive::{
+use super::primitives::{
     DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_valid_secret_key,
 };
 

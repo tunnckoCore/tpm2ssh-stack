@@ -355,5 +355,5 @@ fn push_fixed_32(out: &mut Vec<u8>, value: &[u8], coordinate: &'static str) -> R
 }
 
 #[cfg(test)]
-#[path = "keygen.test.rs"]
+#[path = "mod.test.rs"]
 mod keygen_tests;

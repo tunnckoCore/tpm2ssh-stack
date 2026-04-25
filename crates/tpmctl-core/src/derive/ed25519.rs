@@ -1,7 +1,7 @@
 use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use zeroize::Zeroizing;
 
-use super::derive::{DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_bytes};
+use super::primitives::{DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_bytes};
 
 pub fn derive_signing_key(seed: &SecretSeed, mode: &DeriveMode) -> Result<SigningKey, DeriveError> {
     let seed = derive_bytes(seed, mode, DerivedAlgorithm::Ed25519, b"seed", 0)?;
