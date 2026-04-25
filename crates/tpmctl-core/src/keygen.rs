@@ -551,7 +551,7 @@ mod keygen_tests {
             selector: ObjectSelector::Id(id),
             input: SignInput::Message(b"parent and hash flexibility".to_vec()),
             hash: HashAlgorithm::Sha512,
-            format: SignatureFormat::Raw,
+            output_format: SignatureFormat::Raw,
         }
         .execute(&store)
         .unwrap();

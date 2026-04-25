@@ -14,7 +14,7 @@ pub struct HmacRequest {
     pub selector: ObjectSelector,
     pub input: Vec<u8>,
     pub hash: Option<HashAlgorithm>,
-    pub format: BinaryFormat,
+    pub output_format: BinaryFormat,
     pub seal_target: Option<SealTarget>,
     pub emit_prf_when_sealing: bool,
     pub force: bool,
@@ -49,7 +49,7 @@ impl HmacRequest {
         match &self.seal_target {
             None => Ok(HmacResult::Output(Zeroizing::new(encode_hmac_output(
                 output.as_slice(),
-                self.format,
+                self.output_format,
             )))),
             Some(target) => {
                 let selector = match target {
@@ -61,7 +61,10 @@ impl HmacRequest {
                     Ok(HmacResult::SealedWithOutput {
                         target: target.clone(),
                         hash,
-                        output: Zeroizing::new(encode_hmac_output(output.as_slice(), self.format)),
+                        output: Zeroizing::new(encode_hmac_output(
+                            output.as_slice(),
+                            self.output_format,
+                        )),
                     })
                 } else {
                     Ok(HmacResult::Sealed {
@@ -88,8 +91,8 @@ pub enum HmacResult {
     },
 }
 
-pub fn encode_hmac_output(bytes: &[u8], format: BinaryFormat) -> Vec<u8> {
-    encode_binary(bytes, format)
+pub fn encode_hmac_output(bytes: &[u8], output_format: BinaryFormat) -> Vec<u8> {
+    encode_binary(bytes, output_format)
 }
 
 pub fn compute_tpm_hmac(
@@ -122,6 +125,19 @@ pub fn compute_tpm_hmac(
         })
         .map_err(|source| crate::CoreError::tpm("HMAC", source))?;
     Ok(Zeroizing::new(digest.value().to_vec()))
+}
+
+pub fn prf_seed_from_hmac_identity(
+    command: &CommandContext,
+    selector: &ObjectSelector,
+    input: &[u8],
+    hash: Option<HashAlgorithm>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut context = tpm::create_context_for(command)?;
+    let (object_handle, descriptor) = load_hmac_key(&mut context, command, selector)?;
+    descriptor.require_usage(KeyUsage::Hmac)?;
+    let hash = hash.or(descriptor.hash).unwrap_or(HashAlgorithm::Sha256);
+    compute_tpm_hmac(&mut context, object_handle, input, hash)
 }
 
 fn load_hmac_key(
@@ -179,7 +195,7 @@ mod hmac_tests {
             selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
             input: b"ctx".to_vec(),
             hash: None,
-            format: BinaryFormat::Raw,
+            output_format: BinaryFormat::Raw,
             seal_target: None,
             emit_prf_when_sealing: false,
             force: false,

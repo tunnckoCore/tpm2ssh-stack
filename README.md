@@ -118,6 +118,8 @@ A fresh `swtpm` may need TPM2_Startup before normal commands. The simulator inte
 
 The CLI parser and validation layer support the planned command surface. TPM runtime command bodies may still return unsupported until the remaining TPM checklist items are completed.
 
+session id: 019dbe6d-7cfe-713a-97e2-e3c9154ac9d
+
 ```bash
 # key creation
 tpmctl keygen --use sign --id org/acme/alice/main
@@ -126,26 +128,29 @@ tpmctl keygen --use hmac --id org/acme/alice/kdf
 tpmctl keygen --use sign --id org/acme/alice/main --handle 0x81010010
 
 # public key export
-tpmctl pubkey --id org/acme/alice/main --format pem > alice-main.pem
-tpmctl pubkey --id org/acme/alice/main --format ssh
-tpmctl pubkey --handle 0x81010010 --format der --output alice-main.der
+tpmctl pubkey --id org/acme/alice/main --output-format pem > alice-main.pem
+tpmctl pubkey --id org/acme/alice/main --output-format ssh
+tpmctl pubkey --handle 0x81010010 --output-format der --output alice-main.der
 
 # signing
-tpmctl sign --id org/acme/alice/main --input message.txt --format der --output sig.der
-tpmctl sign --id org/acme/alice/main --digest message.sha256 --format hex
+tpmctl sign --id org/acme/alice/main --input message.txt --output-format der --output sig.der
+tpmctl sign --id org/acme/alice/main --digest-file message.sha256 --output-format hex
+tpmctl sign --id org/acme/alice/main --digest 9ea88765e9e69962dc2a4efa11fd3a87a600811fa27ec6cfcf9feea6c579ac4c --output-format hex
+printf 68656c6c6f | tpmctl sign --id org/acme/alice/main --input - --input-format hex --output-format hex
 
 # ECDH/HMAC
-tpmctl ecdh --id org/acme/alice/comms --peer-pub bob-comms.pem --format hex
-tpmctl hmac --id org/acme/alice/kdf --input ctx.bin --hash sha512 --format hex
+tpmctl ecdh --id org/acme/alice/comms --peer-pub bob-comms.pem --output-format hex
+tpmctl hmac --id org/acme/alice/kdf --input ctx.bin --hash sha512 --output-format hex
+printf 637478 | tpmctl hmac --id org/acme/alice/kdf --input - --input-format hex --output-format hex
 
 # seal/unseal
 tpmctl seal --input secret.bin --id org/acme/alice/sealed/foo
 tpmctl unseal --id org/acme/alice/sealed/foo --output secret.bin
 
 # derived software keys from TPM-protected PRF seed material
-tpmctl derive --id org/acme/alice/derived/foo --label user1 --algorithm ed25519 --format hex
-tpmctl derive --id org/acme/bob/derived/eth-prf --use pubkey --algorithm secp256k1 --format address
-tpmctl derive --handle 0x81010020 --algorithm p256 --use sign --input message.txt --format hex
+tpmctl derive --id org/acme/alice/derived/foo --label user1 --algorithm ed25519 --output-format hex
+tpmctl derive --id org/acme/bob/derived/eth-prf --use pubkey --algorithm secp256k1 --output-format address
+tpmctl derive --handle 0x81010020 --algorithm p256 --use sign --input message.txt --output-format hex
 ```
 
 Global behavior:
@@ -171,7 +176,7 @@ Derived-key operations are intentionally not TPM-native p256/Ed25519/secp256k1 o
 1. TPM-protected PRF seed material is unsealed or loaded by higher-level command code.
 2. `tpmctl-core::crypto` derives software keys from that seed with HKDF-SHA256 domain separation over algorithm/use/label or ephemeral randomness.
 3. p256 and secp256k1 scalar derivation retry with a counter until the curve library accepts a valid non-zero scalar.
-4. Ed25519 derives a 32-byte signing seed and uses pure Ed25519 signing. Ed25519 signing rejects hash/prehash selection for v1; `--digest` bytes are treated as the message bytes to sign, not as Ed25519ph.
+4. Ed25519 derives a 32-byte signing seed and uses pure Ed25519 signing. Ed25519 signing rejects hash/prehash selection for v1, and `derive --algorithm ed25519 --use sign` accepts only `--input`, not `--digest-file` or `--digest`.
 5. Temporary seed, scalar, and intermediate buffers are zeroized where practical.
 6. Software key material exists in process memory briefly. Avoid logging, debug dumps, core dumps, swap exposure, and long-lived storage of derived secrets.
 

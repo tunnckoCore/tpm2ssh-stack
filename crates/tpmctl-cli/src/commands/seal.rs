@@ -6,7 +6,7 @@ use tpmctl_core::{CommandContext, SealTarget, StoreOptions, seal as core_seal};
 use zeroize::Zeroizing;
 
 pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &SealArgs) -> Result<(), CliError> {
-    let destination = args.destination();
+    let destination = args.destination()?;
     let target = seal_target_from_destination(&destination)?;
     let selector = match target {
         SealTarget::Id(id) => tpmctl_core::ObjectSelector::Id(id),

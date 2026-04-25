@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 pub struct EcdhRequest {
     pub selector: ObjectSelector,
     pub peer_public_key: PublicKeyInput,
-    pub format: BinaryFormat,
+    pub output_format: BinaryFormat,
 }
 
 impl EcdhRequest {
@@ -30,12 +30,12 @@ impl EcdhRequest {
         };
         self.validate_descriptor(&loaded.descriptor)?;
         let secret = crate::tpm::ecdh_z_gen(&mut context, loaded.handle, &peer_public_key)?;
-        Ok(encode_shared_secret(secret.as_slice(), self.format))
+        Ok(encode_shared_secret(secret.as_slice(), self.output_format))
     }
 }
 
-pub fn encode_shared_secret(secret: &[u8], format: BinaryFormat) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(encode_binary(secret, format))
+pub fn encode_shared_secret(secret: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(encode_binary(secret, output_format))
 }
 
 #[cfg(test)]
@@ -56,7 +56,7 @@ mod ecdh_tests {
         EcdhRequest {
             selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
             peer_public_key: PublicKeyInput::Sec1(sec1()),
-            format: BinaryFormat::Raw,
+            output_format: BinaryFormat::Raw,
         }
     }
 

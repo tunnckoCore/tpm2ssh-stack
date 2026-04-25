@@ -6,7 +6,7 @@ use tpmctl_core::{CommandContext, StoreOptions, seal as core_seal};
 
 pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &UnsealArgs) -> Result<(), CliError> {
     let request = core_seal::UnsealRequest {
-        selector: selector_from_material(&args.material.material())?,
+        selector: selector_from_material(&args.material.material()?)?,
         force_binary_stdout: args.force,
     };
     let command = CommandContext {

@@ -8,7 +8,7 @@ pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &KeygenArgs) -> Result<()
     let request = core_keygen::KeygenRequest {
         usage: keygen_usage(args.usage),
         id: RegistryId::new(args.id.clone())?,
-        persist_at: args.handle,
+        persist_at: args.persist_at,
         force: args.force,
     };
     let store = tpmctl_core::Store::new(runtime.store.root.clone());

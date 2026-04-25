@@ -330,10 +330,7 @@ impl FromStr for PersistentHandle {
             ));
         }
 
-        let Some(hex) = trimmed
-            .strip_prefix("0x")
-            .or_else(|| trimmed.strip_prefix("0X"))
-        else {
+        let Some(hex) = trimmed.strip_prefix("0x") else {
             return Err(invalid_handle(
                 input,
                 "persistent handles must be hexadecimal and start with 0x",
@@ -942,9 +939,6 @@ mod tests {
         let handle = PersistentHandle::parse("0x81010010").unwrap();
         assert_eq!(handle.raw(), 0x8101_0010);
         assert_eq!(handle.to_string(), "0x81010010");
-
-        let upper = PersistentHandle::parse("0X81010010").unwrap();
-        assert_eq!(upper, handle);
     }
 
     #[test]
@@ -955,6 +949,7 @@ mod tests {
             "2164326416",
             "0x",
             "0xzzzzzzzz",
+            "0X81010010",
             "0x80000000",
             " 0x81010010",
             "0x81010010 ",

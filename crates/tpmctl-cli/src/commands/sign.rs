@@ -2,28 +2,45 @@ use crate::{
     args::{CliError, SignArgs},
     commands::io::{read_input, selector_from_material, write_output_with_force},
 };
-use tpmctl_core::sign as core_sign;
+use tpmctl_core::{InputFormat, sign as core_sign};
 
 pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &SignArgs) -> Result<(), CliError> {
     let input = match args.sign_input() {
-        tpmctl_core::SignInput::Message(source) => {
-            core_sign::SignInput::Message(read_input(&source)?)
-        }
-        tpmctl_core::SignInput::Digest(source) => {
+        tpmctl_core::SignInput::Message(source) => core_sign::SignInput::Message(
+            decode_input_bytes(read_input(&source)?, args.input_format.into())?,
+        ),
+        tpmctl_core::SignInput::DigestFile(source) => {
             core_sign::SignInput::Digest(read_input(&source)?)
         }
+        tpmctl_core::SignInput::DigestHex(hex) => core_sign::SignInput::Digest(
+            hex::decode(hex.trim().strip_prefix("0x").unwrap_or(hex.trim()))
+                .map_err(|error| CliError::Usage(format!("invalid --digest hex: {error}")))?,
+        ),
     };
     let request = core_sign::SignRequest {
-        selector: selector_from_material(&args.material.material())?,
+        selector: selector_from_material(&args.material.material()?)?,
         input,
         hash: args.hash.into(),
-        format: args.format.into(),
+        output_format: args.output_format.into(),
     };
     let store = tpmctl_core::Store::new(runtime.store.root);
     let bytes = request.execute(&store)?;
     let output: tpmctl_core::OutputTarget = (&args.output).into();
     write_output_with_force(&output, &bytes, args.force)?;
     Ok(())
+}
+
+fn decode_input_bytes(input: Vec<u8>, input_format: InputFormat) -> Result<Vec<u8>, CliError> {
+    match input_format {
+        InputFormat::Raw => Ok(input),
+        InputFormat::Hex => {
+            let text = std::str::from_utf8(&input)
+                .map_err(|error| CliError::Usage(format!("hex input is not UTF-8: {error}")))?;
+            hex::decode(text.trim().strip_prefix("0x").unwrap_or(text.trim())).map_err(|error| {
+                CliError::Usage(format!("invalid --input-format hex input: {error}"))
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -41,9 +58,9 @@ mod tests {
             "sign",
             "--id",
             "alice",
-            "--digest",
+            "--digest-file",
             path.to_str().unwrap(),
-            "--format",
+            "--output-format",
             "hex",
         ])
         .unwrap();

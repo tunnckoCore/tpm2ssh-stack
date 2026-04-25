@@ -83,6 +83,27 @@ impl HashAlgorithm {
     }
 }
 
+fn decode_hex_bytes(field: &'static str, value: &str) -> Result<Vec<u8>> {
+    let normalized = value.trim().strip_prefix("0x").unwrap_or(value.trim());
+    hex::decode(normalized).map_err(|error| Error::invalid(field, format!("invalid hex: {error}")))
+}
+
+fn decode_hex_digest(value: &str) -> Result<Vec<u8>> {
+    decode_hex_bytes("digest", value)
+}
+
+fn decode_input_bytes(input: Vec<u8>, input_format: InputFormat) -> Result<Vec<u8>> {
+    match input_format {
+        InputFormat::Raw => Ok(input),
+        InputFormat::Hex => {
+            let text = std::str::from_utf8(&input).map_err(|error| {
+                Error::invalid("input", format!("hex input is not UTF-8: {error}"))
+            })?;
+            decode_hex_bytes("input", text)
+        }
+    }
+}
+
 impl fmt::Display for HashAlgorithm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -193,6 +214,12 @@ pub type SignatureFormat = output::SignatureFormat;
 pub type PublicKeyFormat = output::PublicKeyFormat;
 pub type BinaryTextFormat = output::BinaryFormat;
 pub type DeriveAlgorithm = crypto::derive::DerivedAlgorithm;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InputFormat {
+    Raw,
+    Hex,
+}
 pub type DeriveUse = crypto::derive::DeriveUse;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -228,6 +255,17 @@ pub enum MaterialRef {
     Handle(PersistentHandle),
 }
 
+impl MaterialRef {
+    pub fn from_id_or_handle(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.starts_with("0x") {
+            Ok(Self::Handle(value.parse::<PersistentHandle>()?))
+        } else {
+            Ok(Self::Id(value))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct OutputTarget {
     pub path: Option<PathBuf>,
@@ -250,7 +288,7 @@ pub struct KeygenRequest {
     pub runtime: RuntimeOptions,
     pub usage: KeyUsage,
     pub id: String,
-    pub handle: Option<PersistentHandle>,
+    pub persist_at: Option<PersistentHandle>,
     pub force: bool,
 }
 
@@ -259,8 +297,9 @@ pub struct SignRequest {
     pub runtime: RuntimeOptions,
     pub material: MaterialRef,
     pub input: SignInput,
+    pub input_format: InputFormat,
     pub hash: HashAlgorithm,
-    pub format: SignatureFormat,
+    pub output_format: SignatureFormat,
     pub output: OutputTarget,
     pub force: bool,
 }
@@ -268,14 +307,15 @@ pub struct SignRequest {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SignInput {
     Message(InputSource),
-    Digest(InputSource),
+    DigestFile(InputSource),
+    DigestHex(String),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PubkeyRequest {
     pub runtime: RuntimeOptions,
     pub material: MaterialRef,
-    pub format: PublicKeyFormat,
+    pub output_format: PublicKeyFormat,
     pub output: OutputTarget,
     pub force: bool,
 }
@@ -285,7 +325,7 @@ pub struct EcdhRequest {
     pub runtime: RuntimeOptions,
     pub material: MaterialRef,
     pub peer_pub: InputSource,
-    pub format: BinaryTextFormat,
+    pub output_format: BinaryTextFormat,
     pub output: OutputTarget,
     pub force: bool,
 }
@@ -295,8 +335,9 @@ pub struct HmacRequest {
     pub runtime: RuntimeOptions,
     pub material: MaterialRef,
     pub input: InputSource,
+    pub input_format: InputFormat,
     pub hash: Option<HashAlgorithm>,
-    pub format: BinaryTextFormat,
+    pub output_format: BinaryTextFormat,
     pub output: OutputTarget,
     pub seal: Option<SealDestination>,
     pub force: bool,
@@ -326,14 +367,16 @@ pub struct DeriveRequest {
     pub algorithm: DeriveAlgorithm,
     pub usage: DeriveUse,
     pub input: Option<SignInput>,
+    pub input_format: InputFormat,
     pub hash: Option<HashAlgorithm>,
-    pub format: DeriveFormat,
+    pub output_format: DeriveFormat,
     pub compressed: bool,
     pub output: OutputTarget,
     pub force: bool,
 }
 
 pub fn keygen(request: KeygenRequest) -> Result<()> {
+    validate_keygen_request(&request)?;
     let usage = match request.usage {
         KeyUsage::Sign => keygen::KeygenUsage::Sign,
         KeyUsage::Ecdh => keygen::KeygenUsage::Ecdh,
@@ -350,24 +393,38 @@ pub fn keygen(request: KeygenRequest) -> Result<()> {
     keygen::KeygenRequest {
         usage,
         id,
-        persist_at: request.handle,
+        persist_at: request.persist_at,
         force: request.force,
     }
     .execute_with_store(&store)?;
     Ok(())
 }
 
+fn validate_keygen_request(request: &KeygenRequest) -> Result<()> {
+    if request.id.starts_with("0x") {
+        return Err(Error::invalid(
+            "id",
+            "keygen id cannot start with 0x; use persist_at for persistent TPM handles",
+        ));
+    }
+    Ok(())
+}
+
 pub fn sign(request: SignRequest) -> Result<()> {
     let store = Store::new(request.runtime.store.root);
     let input = match request.input {
-        SignInput::Message(source) => sign::SignInput::Message(read_input(&source)?),
-        SignInput::Digest(source) => sign::SignInput::Digest(read_input(&source)?),
+        SignInput::Message(source) => sign::SignInput::Message(decode_input_bytes(
+            read_input(&source)?,
+            request.input_format,
+        )?),
+        SignInput::DigestFile(source) => sign::SignInput::Digest(read_input(&source)?),
+        SignInput::DigestHex(hex) => sign::SignInput::Digest(decode_hex_digest(&hex)?),
     };
     let domain_request = sign::SignRequest {
         selector: material_selector(request.material)?,
         input,
         hash: request.hash,
-        format: request.format,
+        output_format: request.output_format,
     };
     let output = domain_request.execute(&store)?;
     write_output(&request.output, output.as_slice(), request.force)
@@ -377,7 +434,7 @@ pub fn pubkey(request: PubkeyRequest) -> Result<()> {
     let store = Store::new(request.runtime.store.root);
     let domain_request = pubkey::PubkeyRequest {
         selector: material_selector(request.material)?,
-        format: request.format,
+        output_format: request.output_format,
     };
     let output = domain_request.execute(&store)?;
     write_output(&request.output, output.as_slice(), request.force)
@@ -389,7 +446,7 @@ pub fn ecdh(request: EcdhRequest) -> Result<()> {
     let domain_request = ecdh::EcdhRequest {
         selector: material_selector(request.material)?,
         peer_public_key,
-        format: request.format,
+        output_format: request.output_format,
     };
     let output = domain_request.execute(&store)?;
     write_output(&request.output, output.as_slice(), request.force)
@@ -398,13 +455,13 @@ pub fn ecdh(request: EcdhRequest) -> Result<()> {
 pub fn hmac(request: HmacRequest) -> Result<()> {
     let command = command_context(&request.runtime);
     let selector = material_selector(request.material)?;
-    let input = read_input(&request.input)?;
+    let input = decode_input_bytes(read_input(&request.input)?, request.input_format)?;
     let seal_target = request.seal.map(seal_target).transpose()?;
     let domain = hmac::HmacRequest {
         selector,
         input,
         hash: request.hash,
-        format: request.format,
+        output_format: request.output_format,
         seal_target,
         emit_prf_when_sealing: false,
         force: request.force,
@@ -414,7 +471,7 @@ pub fn hmac(request: HmacRequest) -> Result<()> {
         hmac::HmacResult::Output(output) => {
             let encoded = zeroize::Zeroizing::new(hmac::encode_hmac_output(
                 output.as_slice(),
-                request.format,
+                request.output_format,
             ));
             write_output(&request.output, encoded.as_slice(), request.force)?;
         }
@@ -428,7 +485,7 @@ pub fn hmac(request: HmacRequest) -> Result<()> {
         } => {
             let encoded = zeroize::Zeroizing::new(hmac::encode_hmac_output(
                 output.as_slice(),
-                request.format,
+                request.output_format,
             ));
             write_output(&request.output, encoded.as_slice(), request.force)?;
             write_hmac_sealed_result(&request.runtime, &target, hash)?;
@@ -470,13 +527,10 @@ pub fn derive(request: DeriveRequest) -> Result<()> {
     }
 
     let command = command_context(&request.runtime);
-    let seed_bytes = seal::UnsealRequest {
-        selector: material_selector(request.material.clone())?,
-        force_binary_stdout: false,
-    }
-    .execute_with_context(&command)?;
-    let seed = crypto::derive::SecretSeed::new(seed_bytes.as_slice()).map_err(derive_error)?;
+    let selector = material_selector(request.material.clone())?;
     let mode = derive_mode(&request)?;
+    let seed_bytes = derive_prf_seed(&command, &selector, &request)?;
+    let seed = crypto::derive::SecretSeed::new(seed_bytes.as_slice()).map_err(derive_error)?;
     let output = derive_output(&request, &seed, &mode)?;
     write_output(&request.output, output.as_slice(), request.force)
 }
@@ -485,50 +539,58 @@ fn validate_derive_request(request: &DeriveRequest) -> Result<()> {
     if request.usage == DeriveUse::Sign && request.input.is_none() {
         return Err(Error::invalid(
             "derive",
-            "derive --use sign requires exactly one of --input or --digest",
+            "derive --use sign requires exactly one of --input, --digest-file, or --digest",
         ));
     }
     if request.usage != DeriveUse::Sign && request.input.is_some() {
         return Err(Error::invalid(
             "derive",
-            "derive --input/--digest are only valid with --use sign",
+            "derive --input/--digest-file/--digest are only valid with --use sign",
         ));
     }
-    if request.algorithm == DeriveAlgorithm::Ed25519
-        && request.usage == DeriveUse::Sign
-        && request.hash.is_some()
-    {
-        return Err(Error::invalid(
-            "derive",
-            "derive --algorithm ed25519 --use sign does not support --hash in v1",
-        ));
+    if request.algorithm == DeriveAlgorithm::Ed25519 && request.usage == DeriveUse::Sign {
+        if request.hash.is_some() {
+            return Err(Error::invalid(
+                "derive",
+                "derive --algorithm ed25519 --use sign does not support --hash in v1",
+            ));
+        }
+        if matches!(
+            request.input,
+            Some(SignInput::DigestFile(_) | SignInput::DigestHex(_))
+        ) {
+            return Err(Error::invalid(
+                "derive",
+                "derive --algorithm ed25519 --use sign supports only --input, not --digest-file or --digest",
+            ));
+        }
     }
     if request.usage == DeriveUse::Secret
-        && !matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex)
+        && !matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex)
     {
         return Err(Error::invalid(
             "derive",
-            "derive --use secret supports only --format raw or --format hex",
+            "derive --use secret supports only --output-format raw or --output-format hex",
         ));
     }
     if request.usage == DeriveUse::Pubkey {
         match request.algorithm {
             DeriveAlgorithm::P256 | DeriveAlgorithm::Ed25519 => {
-                if !matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex) {
+                if !matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex) {
                     return Err(Error::invalid(
                         "derive",
-                        "derive --use pubkey with p256 or ed25519 supports only --format raw or --format hex",
+                        "derive --use pubkey with p256 or ed25519 supports only --output-format raw or --output-format hex",
                     ));
                 }
             }
             DeriveAlgorithm::Secp256k1 => {
                 if !matches!(
-                    request.format,
+                    request.output_format,
                     DeriveFormat::Raw | DeriveFormat::Hex | DeriveFormat::Address
                 ) {
                     return Err(Error::invalid(
                         "derive",
-                        "derive --use pubkey --algorithm secp256k1 supports --format raw, hex, or address",
+                        "derive --use pubkey --algorithm secp256k1 supports --output-format raw, hex, or address",
                     ));
                 }
             }
@@ -537,21 +599,21 @@ fn validate_derive_request(request: &DeriveRequest) -> Result<()> {
     if request.usage == DeriveUse::Sign {
         match request.algorithm {
             DeriveAlgorithm::Ed25519 => {
-                if !matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex) {
+                if !matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex) {
                     return Err(Error::invalid(
                         "derive",
-                        "derive --algorithm ed25519 --use sign supports only --format raw or --format hex",
+                        "derive --algorithm ed25519 --use sign supports only --output-format raw or --output-format hex",
                     ));
                 }
             }
             DeriveAlgorithm::P256 | DeriveAlgorithm::Secp256k1 => {
                 if !matches!(
-                    request.format,
+                    request.output_format,
                     DeriveFormat::Der | DeriveFormat::Raw | DeriveFormat::Hex
                 ) {
                     return Err(Error::invalid(
                         "derive",
-                        "derive --use sign with p256 or secp256k1 supports --format der, raw, or hex",
+                        "derive --use sign with p256 or secp256k1 supports --output-format der, raw, or hex",
                     ));
                 }
             }
@@ -560,19 +622,19 @@ fn validate_derive_request(request: &DeriveRequest) -> Result<()> {
     if request.compressed
         && !(request.algorithm == DeriveAlgorithm::Secp256k1
             && request.usage == DeriveUse::Pubkey
-            && matches!(request.format, DeriveFormat::Raw | DeriveFormat::Hex))
+            && matches!(request.output_format, DeriveFormat::Raw | DeriveFormat::Hex))
     {
         return Err(Error::invalid(
             "compressed",
-            "--compressed is valid only for derive --algorithm secp256k1 --use pubkey with --format raw or hex",
+            "--compressed is valid only for derive --algorithm secp256k1 --use pubkey with --output-format raw or hex",
         ));
     }
-    if request.format == DeriveFormat::Address
+    if request.output_format == DeriveFormat::Address
         && !(request.algorithm == DeriveAlgorithm::Secp256k1 && request.usage == DeriveUse::Pubkey)
     {
         return Err(Error::invalid(
-            "format",
-            "--format address is valid only for derive --algorithm secp256k1 --use pubkey",
+            "output_format",
+            "--output-format address is valid only for derive --algorithm secp256k1 --use pubkey",
         ));
     }
 
@@ -583,6 +645,51 @@ fn validate_derive_request(request: &DeriveRequest) -> Result<()> {
     )
     .map_err(derive_error)?;
     Ok(())
+}
+
+fn derive_prf_seed(
+    command: &CommandContext,
+    selector: &ObjectSelector,
+    request: &DeriveRequest,
+) -> Result<Zeroizing<Vec<u8>>> {
+    match (seal::UnsealRequest {
+        selector: selector.clone(),
+        force_binary_stdout: false,
+    })
+    .execute_with_context(command)
+    {
+        Ok(seed) => Ok(seed),
+        Err(Error::NotFound(_)) if matches!(selector, ObjectSelector::Id(_)) => {
+            derive_hmac_prf_seed(command, selector, request)
+        }
+        Err(Error::InvalidInput { .. }) | Err(Error::Tpm { .. })
+            if matches!(selector, ObjectSelector::Handle(_)) =>
+        {
+            derive_hmac_prf_seed(command, selector, request)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn derive_hmac_prf_seed(
+    command: &CommandContext,
+    selector: &ObjectSelector,
+    request: &DeriveRequest,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut input = Vec::new();
+    input.extend_from_slice(b"tpmctl derive prf v1\0");
+    input.extend_from_slice(match request.algorithm {
+        DeriveAlgorithm::P256 => b"p256".as_slice(),
+        DeriveAlgorithm::Ed25519 => b"ed25519".as_slice(),
+        DeriveAlgorithm::Secp256k1 => b"secp256k1".as_slice(),
+    });
+    input.push(0);
+    if let Some(label) = &request.label {
+        input.extend_from_slice(label.as_bytes());
+    }
+    let seed = hmac::prf_seed_from_hmac_identity(command, selector, &input, None)?;
+    input.zeroize();
+    Ok(seed)
 }
 
 fn derive_mode(request: &DeriveRequest) -> Result<crypto::derive::DeriveMode> {
@@ -632,7 +739,7 @@ fn derive_secret(
             .to_bytes()
             .to_vec(),
     };
-    let encoded = encode_raw_or_hex(&raw, request.format)?;
+    let encoded = encode_raw_or_hex(&raw, request.output_format)?;
     raw.zeroize();
     Ok(Zeroizing::new(encoded))
 }
@@ -646,13 +753,13 @@ fn derive_public_key(
         DeriveAlgorithm::P256 => {
             let raw =
                 crypto::p256::derive_public_key_sec1(seed, mode, false).map_err(derive_error)?;
-            encode_raw_or_hex(&raw, request.format)?
+            encode_raw_or_hex(&raw, request.output_format)?
         }
         DeriveAlgorithm::Ed25519 => {
             let raw = crypto::ed25519::derive_public_key_bytes(seed, mode).map_err(derive_error)?;
-            encode_raw_or_hex(&raw, request.format)?
+            encode_raw_or_hex(&raw, request.output_format)?
         }
-        DeriveAlgorithm::Secp256k1 if request.format == DeriveFormat::Address => {
+        DeriveAlgorithm::Secp256k1 if request.output_format == DeriveFormat::Address => {
             crypto::secp256k1::derive_ethereum_address(seed, mode)
                 .map_err(derive_error)?
                 .into_bytes()
@@ -660,7 +767,7 @@ fn derive_public_key(
         DeriveAlgorithm::Secp256k1 => {
             let raw = crypto::secp256k1::derive_public_key_sec1(seed, mode, request.compressed)
                 .map_err(derive_error)?;
-            encode_raw_or_hex(&raw, request.format)?
+            encode_raw_or_hex(&raw, request.output_format)?
         }
     };
     Ok(Zeroizing::new(bytes))
@@ -676,22 +783,27 @@ fn derive_signature(
         DeriveAlgorithm::P256 => {
             let mut p1363 =
                 crypto::p256::sign_prehash(seed, mode, &message).map_err(derive_error)?;
-            let encoded = output::encode_p256_signature(&p1363, signature_format(request.format)?)?;
+            let encoded = output::encode_p256_signature(
+                &p1363,
+                signature_output_format(request.output_format)?,
+            )?;
             p1363.zeroize();
             encoded
         }
         DeriveAlgorithm::Ed25519 => {
             let mut raw =
                 crypto::ed25519::sign_message(seed, mode, &message).map_err(derive_error)?;
-            let encoded = encode_raw_or_hex(&raw, request.format)?;
+            let encoded = encode_raw_or_hex(&raw, request.output_format)?;
             raw.zeroize();
             encoded
         }
         DeriveAlgorithm::Secp256k1 => {
             let mut p1363 =
                 crypto::secp256k1::sign_prehash(seed, mode, &message).map_err(derive_error)?;
-            let encoded =
-                output::encode_secp256k1_signature(&p1363, signature_format(request.format)?)?;
+            let encoded = output::encode_secp256k1_signature(
+                &p1363,
+                signature_output_format(request.output_format)?,
+            )?;
             p1363.zeroize();
             encoded
         }
@@ -706,42 +818,45 @@ fn derive_sign_message_bytes(request: &DeriveRequest) -> Result<Zeroizing<Vec<u8
         .expect("derive --use sign input was validated")
     {
         SignInput::Message(source) => {
-            let bytes = read_input(source)?;
+            let bytes = decode_input_bytes(read_input(source)?, request.input_format)?;
             if request.algorithm == DeriveAlgorithm::Ed25519 {
                 Ok(Zeroizing::new(bytes))
             } else {
                 Ok(Zeroizing::new(derive_hash(request).unwrap().digest(&bytes)))
             }
         }
-        SignInput::Digest(source) => {
+        SignInput::DigestFile(source) => {
             let bytes = read_input(source)?;
-            if request.algorithm != DeriveAlgorithm::Ed25519 {
-                derive_hash(request).unwrap().validate_digest(&bytes)?;
-            }
+            derive_hash(request).unwrap().validate_digest(&bytes)?;
+            Ok(Zeroizing::new(bytes))
+        }
+        SignInput::DigestHex(hex) => {
+            let bytes = decode_hex_digest(hex)?;
+            derive_hash(request).unwrap().validate_digest(&bytes)?;
             Ok(Zeroizing::new(bytes))
         }
     }
 }
 
-fn encode_raw_or_hex(raw: &[u8], format: DeriveFormat) -> Result<Vec<u8>> {
-    match format {
+fn encode_raw_or_hex(raw: &[u8], output_format: DeriveFormat) -> Result<Vec<u8>> {
+    match output_format {
         DeriveFormat::Raw => Ok(output::encode_binary(raw, BinaryTextFormat::Raw)),
         DeriveFormat::Hex => Ok(output::encode_binary(raw, BinaryTextFormat::Hex)),
         DeriveFormat::Der | DeriveFormat::Address => Err(Error::invalid(
-            "format",
+            "output_format",
             "derive output format is not valid for this operation",
         )),
     }
 }
 
-fn signature_format(format: DeriveFormat) -> Result<SignatureFormat> {
-    match format {
+fn signature_output_format(output_format: DeriveFormat) -> Result<SignatureFormat> {
+    match output_format {
         DeriveFormat::Der => Ok(SignatureFormat::Der),
         DeriveFormat::Raw => Ok(SignatureFormat::Raw),
         DeriveFormat::Hex => Ok(SignatureFormat::Hex),
         DeriveFormat::Address => Err(Error::invalid(
-            "format",
-            "derive --use sign does not support --format address",
+            "output_format",
+            "derive --use sign does not support --output-format address",
         )),
     }
 }

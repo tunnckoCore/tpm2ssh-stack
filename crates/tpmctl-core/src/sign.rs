@@ -9,7 +9,7 @@ pub struct SignRequest {
     pub selector: ObjectSelector,
     pub input: SignInput,
     pub hash: HashAlgorithm,
-    pub format: SignatureFormat,
+    pub output_format: SignatureFormat,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -44,12 +44,12 @@ impl SignRequest {
         };
         self.validate_descriptor(&loaded.descriptor)?;
         let p1363 = crate::tpm::sign_digest(&mut context, loaded.handle, &digest, self.hash)?;
-        encode_tpm_p256_signature(&p1363, self.format)
+        encode_tpm_p256_signature(&p1363, self.output_format)
     }
 }
 
-pub fn encode_tpm_p256_signature(p1363: &[u8], format: SignatureFormat) -> Result<Vec<u8>> {
-    encode_p256_signature(p1363, format)
+pub fn encode_tpm_p256_signature(p1363: &[u8], output_format: SignatureFormat) -> Result<Vec<u8>> {
+    encode_p256_signature(p1363, output_format)
 }
 
 #[cfg(test)]
@@ -67,7 +67,7 @@ mod sign_tests {
             selector: selector(),
             input: SignInput::Message(b"hello".to_vec()),
             hash: HashAlgorithm::Sha256,
-            format: SignatureFormat::Der,
+            output_format: SignatureFormat::Der,
         };
         assert_eq!(request.digest().unwrap().len(), 32);
     }
@@ -78,7 +78,7 @@ mod sign_tests {
             selector: selector(),
             input: SignInput::Digest(vec![0; 31]),
             hash: HashAlgorithm::Sha256,
-            format: SignatureFormat::Der,
+            output_format: SignatureFormat::Der,
         };
         assert!(request.digest().is_err());
     }
@@ -109,7 +109,7 @@ mod sign_tests {
             selector: selector(),
             input: SignInput::Digest(vec![0; 32]),
             hash: HashAlgorithm::Sha256,
-            format: SignatureFormat::Der,
+            output_format: SignatureFormat::Der,
         };
         let descriptor = ObjectDescriptor {
             selector: selector(),

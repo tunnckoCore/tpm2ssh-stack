@@ -7,9 +7,9 @@ use tpmctl_core::{ecdh as core_ecdh, pubkey::PublicKeyInput};
 pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &EcdhArgs) -> Result<(), CliError> {
     let peer_public_key = parse_peer_public_key(read_input(&args.peer_pub)?);
     let request = core_ecdh::EcdhRequest {
-        selector: selector_from_material(&args.material.material())?,
+        selector: selector_from_material(&args.material.material()?)?,
         peer_public_key,
-        format: args.format.into(),
+        output_format: args.output_format.into(),
     };
     let store = tpmctl_core::Store::new(runtime.store.root);
     let bytes = request.execute(&store)?;

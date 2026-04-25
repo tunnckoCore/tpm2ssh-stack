@@ -6,7 +6,7 @@ use crate::{EccPublicKey, Error, KeyUsage, ObjectDescriptor, ObjectSelector, Res
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PubkeyRequest {
     pub selector: ObjectSelector,
-    pub format: PublicKeyFormat,
+    pub output_format: PublicKeyFormat,
 }
 
 impl PubkeyRequest {
@@ -31,7 +31,7 @@ impl PubkeyRequest {
             .ok_or_else(|| Error::invalid("public_key", "descriptor has no cached public key"))?;
         encode_public_key(
             public_key,
-            self.format,
+            self.output_format,
             Some(&descriptor.selector.ssh_comment()),
         )
     }
@@ -124,7 +124,7 @@ mod pubkey_tests {
     fn pubkey_rejects_hmac_and_sealed_objects() {
         let request = PubkeyRequest {
             selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
-            format: PublicKeyFormat::Pem,
+            output_format: PublicKeyFormat::Pem,
         };
         assert!(
             request
@@ -140,7 +140,7 @@ mod pubkey_tests {
 
     #[test]
     fn pubkey_supports_raw_hex_pem_der_and_ssh_output() {
-        for format in [
+        for output_format in [
             PublicKeyFormat::Raw,
             PublicKeyFormat::Hex,
             PublicKeyFormat::Pem,
@@ -149,7 +149,7 @@ mod pubkey_tests {
         ] {
             let request = PubkeyRequest {
                 selector: ObjectSelector::Id(RegistryId::new("org/acme/alice/main").unwrap()),
-                format,
+                output_format,
             };
             assert!(
                 !request
@@ -164,7 +164,7 @@ mod pubkey_tests {
     fn pubkey_ssh_comment_uses_sanitized_id() {
         let request = PubkeyRequest {
             selector: ObjectSelector::Id(RegistryId::new("org/acme/alice/main").unwrap()),
-            format: PublicKeyFormat::Ssh,
+            output_format: PublicKeyFormat::Ssh,
         };
         let output = String::from_utf8(
             request

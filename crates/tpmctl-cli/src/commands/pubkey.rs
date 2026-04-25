@@ -8,10 +8,10 @@ use tpmctl_core::{
 };
 
 pub fn run(runtime: tpmctl_core::RuntimeOptions, args: &PubkeyArgs) -> Result<(), CliError> {
-    let material = args.material.material();
+    let material = args.material.material()?;
     let request = core_pubkey::PubkeyRequest {
         selector: selector_from_material(&material)?,
-        format: args.format.into(),
+        output_format: args.output_format.into(),
     };
     let bytes = match &material {
         MaterialRef::Id(id) => cached_public_key(&runtime, id, &request)?,

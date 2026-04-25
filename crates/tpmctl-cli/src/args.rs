@@ -2,9 +2,9 @@ use std::{io::IsTerminal as _, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tpmctl_core::{
-    BinaryTextFormat, DeriveAlgorithm, DeriveFormat, DeriveUse, HashAlgorithm, InputSource,
-    KeyUsage, MaterialRef, OutputTarget, PersistentHandle, PublicKeyFormat, SealDestination,
-    SignatureFormat, StoreConfig,
+    BinaryTextFormat, DeriveAlgorithm, DeriveFormat, DeriveUse, HashAlgorithm, InputFormat,
+    InputSource, KeyUsage, MaterialRef, OutputTarget, PersistentHandle, PublicKeyFormat,
+    SealDestination, SignatureFormat, StoreConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -91,12 +91,15 @@ impl Command {
     fn validate(&self) -> Result<(), CliError> {
         match self {
             Self::Keygen(_) => Ok(()),
-            Self::Sign(_) => Ok(()),
-            Self::Pubkey(_) => Ok(()),
-            Self::Ecdh(_) => Ok(()),
-            Self::Hmac(args) => args.validate(),
-            Self::Seal(_) => Ok(()),
-            Self::Unseal(_) => Ok(()),
+            Self::Sign(args) => args.material.validate(),
+            Self::Pubkey(args) => args.material.validate(),
+            Self::Ecdh(args) => args.material.validate(),
+            Self::Hmac(args) => {
+                args.material.validate()?;
+                args.validate()
+            }
+            Self::Seal(args) => args.validate(),
+            Self::Unseal(args) => args.material.validate(),
             Self::Derive(args) => args.validate(),
         }
     }
@@ -104,16 +107,16 @@ impl Command {
     fn writes_binary_stdout(&self) -> bool {
         match self {
             Self::Keygen(_) | Self::Seal(_) => false,
-            Self::Sign(args) => args.output.is_stdout() && args.format.is_binary(),
-            Self::Pubkey(args) => args.output.is_stdout() && args.format.is_binary(),
-            Self::Ecdh(args) => args.output.is_stdout() && args.format.is_binary(),
+            Self::Sign(args) => args.output.is_stdout() && args.output_format.is_binary(),
+            Self::Pubkey(args) => args.output.is_stdout() && args.output_format.is_binary(),
+            Self::Ecdh(args) => args.output.is_stdout() && args.output_format.is_binary(),
             Self::Hmac(args) => {
                 args.output.is_stdout()
                     && args.seal_destination().is_none()
-                    && args.format.is_binary()
+                    && args.output_format.is_binary()
             }
             Self::Unseal(args) => args.output.is_stdout(),
-            Self::Derive(args) => args.output.is_stdout() && args.format.is_binary(),
+            Self::Derive(args) => args.output.is_stdout() && args.output_format.is_binary(),
         }
     }
 
@@ -139,35 +142,31 @@ pub struct KeygenArgs {
     #[arg(long, value_name = "ID")]
     pub id: String,
 
-    #[arg(long, value_name = "0xHANDLE", value_parser = parse_persistent_handle)]
-    pub handle: Option<PersistentHandle>,
+    #[arg(long = "persist-at", value_name = "0xHANDLE", value_parser = parse_persistent_handle)]
+    pub persist_at: Option<PersistentHandle>,
 
     #[arg(long)]
     pub force: bool,
 }
 
 #[derive(Debug, Args)]
-#[group(required = true, multiple = false, args = ["id", "handle"])]
 pub struct MaterialArgs {
-    #[arg(long, value_name = "ID")]
-    pub id: Option<String>,
-
-    #[arg(long, value_name = "0xHANDLE", value_parser = parse_persistent_handle)]
-    pub handle: Option<PersistentHandle>,
+    #[arg(long, value_name = "ID_OR_0xHANDLE")]
+    pub id: String,
 }
 
 impl MaterialArgs {
-    pub fn material(&self) -> MaterialRef {
-        match (&self.id, self.handle) {
-            (Some(id), None) => MaterialRef::Id(id.clone()),
-            (None, Some(handle)) => MaterialRef::Handle(handle),
-            _ => unreachable!("clap enforces exactly one material reference"),
-        }
+    fn validate(&self) -> Result<(), CliError> {
+        self.material().map(|_| ())
+    }
+
+    pub fn material(&self) -> Result<MaterialRef, CliError> {
+        material_ref_from_id_arg(&self.id)
     }
 }
 
 #[derive(Debug, Args)]
-#[group(required = true, multiple = false, args = ["input", "digest"])]
+#[group(required = true, multiple = false, args = ["input", "digest_file", "digest"])]
 pub struct SignArgs {
     #[command(flatten)]
     pub material: MaterialArgs,
@@ -175,14 +174,20 @@ pub struct SignArgs {
     #[arg(long, value_name = "PATH", value_parser = parse_input_source)]
     pub input: Option<InputSource>,
 
-    #[arg(long, value_name = "PATH", value_parser = parse_input_source)]
-    pub digest: Option<InputSource>,
+    #[arg(long = "digest-file", value_name = "PATH", value_parser = parse_input_source)]
+    pub digest_file: Option<InputSource>,
+
+    #[arg(long, value_name = "HEX")]
+    pub digest: Option<String>,
 
     #[arg(long, value_enum, default_value_t = HashArg::Sha256)]
     pub hash: HashArg,
 
-    #[arg(long, value_enum, default_value_t = SignatureFormatArg::Der)]
-    pub format: SignatureFormatArg,
+    #[arg(long = "input-format", value_enum, default_value_t = InputFormatArg::Raw)]
+    pub input_format: InputFormatArg,
+
+    #[arg(long = "output-format", value_enum, default_value_t = SignatureFormatArg::Der)]
+    pub output_format: SignatureFormatArg,
 
     #[command(flatten)]
     pub output: OutputArgs,
@@ -193,9 +198,10 @@ pub struct SignArgs {
 
 impl SignArgs {
     pub fn sign_input(&self) -> tpmctl_core::SignInput {
-        match (&self.input, &self.digest) {
-            (Some(input), None) => tpmctl_core::SignInput::Message(input.clone()),
-            (None, Some(digest)) => tpmctl_core::SignInput::Digest(digest.clone()),
+        match (&self.input, &self.digest_file, &self.digest) {
+            (Some(input), None, None) => tpmctl_core::SignInput::Message(input.clone()),
+            (None, Some(digest), None) => tpmctl_core::SignInput::DigestFile(digest.clone()),
+            (None, None, Some(digest)) => tpmctl_core::SignInput::DigestHex(digest.clone()),
             _ => unreachable!("clap enforces exactly one sign input"),
         }
     }
@@ -206,8 +212,8 @@ pub struct PubkeyArgs {
     #[command(flatten)]
     pub material: MaterialArgs,
 
-    #[arg(long, value_enum, default_value_t = PublicKeyFormatArg::Pem)]
-    pub format: PublicKeyFormatArg,
+    #[arg(long = "output-format", value_enum, default_value_t = PublicKeyFormatArg::Pem)]
+    pub output_format: PublicKeyFormatArg,
 
     #[command(flatten)]
     pub output: OutputArgs,
@@ -224,8 +230,8 @@ pub struct EcdhArgs {
     #[arg(long = "peer-pub", value_name = "PATH", value_parser = parse_input_source)]
     pub peer_pub: InputSource,
 
-    #[arg(long, value_enum, default_value_t = BinaryTextFormatArg::Raw)]
-    pub format: BinaryTextFormatArg,
+    #[arg(long = "output-format", value_enum, default_value_t = BinaryTextFormatArg::Raw)]
+    pub output_format: BinaryTextFormatArg,
 
     #[command(flatten)]
     pub output: OutputArgs,
@@ -243,11 +249,14 @@ pub struct HmacArgs {
     #[arg(long, value_name = "PATH", value_parser = parse_input_source)]
     pub input: InputSource,
 
+    #[arg(long = "input-format", value_enum, default_value_t = InputFormatArg::Raw)]
+    pub input_format: InputFormatArg,
+
     #[arg(long, value_enum)]
     pub hash: Option<HashArg>,
 
-    #[arg(long, value_enum, default_value_t = BinaryTextFormatArg::Raw)]
-    pub format: BinaryTextFormatArg,
+    #[arg(long = "output-format", value_enum, default_value_t = BinaryTextFormatArg::Raw)]
+    pub output_format: BinaryTextFormatArg,
 
     #[command(flatten)]
     pub output: OutputArgs,
@@ -284,27 +293,26 @@ impl HmacArgs {
 }
 
 #[derive(Debug, Args)]
-#[group(required = true, multiple = false, args = ["id", "handle"])]
 pub struct SealArgs {
     #[arg(long, value_name = "PATH", value_parser = parse_input_source)]
     pub input: InputSource,
 
-    #[arg(long, value_name = "ID")]
-    pub id: Option<String>,
-
-    #[arg(long, value_name = "0xHANDLE", value_parser = parse_persistent_handle)]
-    pub handle: Option<PersistentHandle>,
+    #[arg(long, value_name = "ID_OR_0xHANDLE")]
+    pub id: String,
 
     #[arg(long)]
     pub force: bool,
 }
 
 impl SealArgs {
-    pub fn destination(&self) -> SealDestination {
-        match (&self.id, self.handle) {
-            (Some(id), None) => SealDestination::Id(id.clone()),
-            (None, Some(handle)) => SealDestination::Handle(handle),
-            _ => unreachable!("clap enforces exactly one seal destination"),
+    fn validate(&self) -> Result<(), CliError> {
+        self.destination().map(|_| ())
+    }
+
+    pub fn destination(&self) -> Result<SealDestination, CliError> {
+        match material_ref_from_id_arg(&self.id)? {
+            MaterialRef::Id(id) => Ok(SealDestination::Id(id)),
+            MaterialRef::Handle(handle) => Ok(SealDestination::Handle(handle)),
         }
     }
 }
@@ -338,14 +346,20 @@ pub struct DeriveArgs {
     #[arg(long, value_name = "PATH", value_parser = parse_input_source)]
     pub input: Option<InputSource>,
 
-    #[arg(long, value_name = "PATH", value_parser = parse_input_source)]
-    pub digest: Option<InputSource>,
+    #[arg(long = "digest-file", value_name = "PATH", value_parser = parse_input_source)]
+    pub digest_file: Option<InputSource>,
+
+    #[arg(long, value_name = "HEX")]
+    pub digest: Option<String>,
 
     #[arg(long, value_enum)]
     pub hash: Option<HashArg>,
 
-    #[arg(long, value_enum, default_value_t = DeriveFormatArg::Raw)]
-    pub format: DeriveFormatArg,
+    #[arg(long = "input-format", value_enum, default_value_t = InputFormatArg::Raw)]
+    pub input_format: InputFormatArg,
+
+    #[arg(long = "output-format", value_enum, default_value_t = DeriveFormatArg::Raw)]
+    pub output_format: DeriveFormatArg,
 
     #[arg(long)]
     pub compressed: bool,
@@ -359,50 +373,65 @@ pub struct DeriveArgs {
 
 impl DeriveArgs {
     pub fn validate(&self) -> Result<(), CliError> {
-        let sign_input_count =
-            usize::from(self.input.is_some()) + usize::from(self.digest.is_some());
+        let sign_input_count = usize::from(self.input.is_some())
+            + usize::from(self.digest_file.is_some())
+            + usize::from(self.digest.is_some());
         if self.usage == DeriveUseArg::Sign && sign_input_count != 1 {
             return Err(CliError::Usage(
-                "derive --use sign requires exactly one of --input or --digest".to_string(),
+                "derive --use sign requires exactly one of --input, --digest-file, or --digest"
+                    .to_string(),
             ));
         }
         if self.usage != DeriveUseArg::Sign && sign_input_count > 0 {
             return Err(CliError::Usage(
-                "derive --input/--digest are only valid with --use sign".to_string(),
+                "derive --input/--digest-file/--digest are only valid with --use sign".to_string(),
             ));
         }
-        if self.algorithm == DeriveAlgorithmArg::Ed25519
-            && self.usage == DeriveUseArg::Sign
-            && self.hash.is_some()
-        {
-            return Err(CliError::Usage(
-                "derive --algorithm ed25519 --use sign does not support --hash in v1".to_string(),
-            ));
+        if self.algorithm == DeriveAlgorithmArg::Ed25519 && self.usage == DeriveUseArg::Sign {
+            if self.hash.is_some() {
+                return Err(CliError::Usage(
+                    "derive --algorithm ed25519 --use sign does not support --hash in v1"
+                        .to_string(),
+                ));
+            }
+            if self.digest_file.is_some() || self.digest.is_some() {
+                return Err(CliError::Usage(
+                    "derive --algorithm ed25519 --use sign supports only --input, not --digest-file or --digest"
+                        .to_string(),
+                ));
+            }
         }
         if self.usage == DeriveUseArg::Secret
-            && !matches!(self.format, DeriveFormatArg::Raw | DeriveFormatArg::Hex)
+            && !matches!(
+                self.output_format,
+                DeriveFormatArg::Raw | DeriveFormatArg::Hex
+            )
         {
             return Err(CliError::Usage(
-                "derive --use secret supports only --format raw or --format hex".to_string(),
+                "derive --use secret supports only --output-format raw or --output-format hex"
+                    .to_string(),
             ));
         }
         if self.usage == DeriveUseArg::Pubkey {
             match self.algorithm {
                 DeriveAlgorithmArg::P256 | DeriveAlgorithmArg::Ed25519 => {
-                    if !matches!(self.format, DeriveFormatArg::Raw | DeriveFormatArg::Hex) {
+                    if !matches!(
+                        self.output_format,
+                        DeriveFormatArg::Raw | DeriveFormatArg::Hex
+                    ) {
                         return Err(CliError::Usage(
-                            "derive --use pubkey with p256 or ed25519 supports only --format raw or --format hex"
+                            "derive --use pubkey with p256 or ed25519 supports only --output-format raw or --output-format hex"
                                 .to_string(),
                         ));
                     }
                 }
                 DeriveAlgorithmArg::Secp256k1 => {
                     if !matches!(
-                        self.format,
+                        self.output_format,
                         DeriveFormatArg::Raw | DeriveFormatArg::Hex | DeriveFormatArg::Address
                     ) {
                         return Err(CliError::Usage(
-                            "derive --use pubkey --algorithm secp256k1 supports --format raw, hex, or address"
+                            "derive --use pubkey --algorithm secp256k1 supports --output-format raw, hex, or address"
                                 .to_string(),
                         ));
                     }
@@ -412,20 +441,23 @@ impl DeriveArgs {
         if self.usage == DeriveUseArg::Sign {
             match self.algorithm {
                 DeriveAlgorithmArg::Ed25519 => {
-                    if !matches!(self.format, DeriveFormatArg::Raw | DeriveFormatArg::Hex) {
+                    if !matches!(
+                        self.output_format,
+                        DeriveFormatArg::Raw | DeriveFormatArg::Hex
+                    ) {
                         return Err(CliError::Usage(
-                            "derive --algorithm ed25519 --use sign supports only --format raw or --format hex"
+                            "derive --algorithm ed25519 --use sign supports only --output-format raw or --output-format hex"
                                 .to_string(),
                         ));
                     }
                 }
                 DeriveAlgorithmArg::P256 | DeriveAlgorithmArg::Secp256k1 => {
                     if !matches!(
-                        self.format,
+                        self.output_format,
                         DeriveFormatArg::Der | DeriveFormatArg::Raw | DeriveFormatArg::Hex
                     ) {
                         return Err(CliError::Usage(
-                            "derive --use sign with p256 or secp256k1 supports --format der, raw, or hex"
+                            "derive --use sign with p256 or secp256k1 supports --output-format der, raw, or hex"
                                 .to_string(),
                         ));
                     }
@@ -435,19 +467,22 @@ impl DeriveArgs {
         if self.compressed
             && !(self.algorithm == DeriveAlgorithmArg::Secp256k1
                 && self.usage == DeriveUseArg::Pubkey
-                && matches!(self.format, DeriveFormatArg::Raw | DeriveFormatArg::Hex))
+                && matches!(
+                    self.output_format,
+                    DeriveFormatArg::Raw | DeriveFormatArg::Hex
+                ))
         {
             return Err(CliError::Usage(
-                "--compressed is valid only for derive --algorithm secp256k1 --use pubkey with --format raw or hex"
+                "--compressed is valid only for derive --algorithm secp256k1 --use pubkey with --output-format raw or hex"
                     .to_string(),
             ));
         }
-        if self.format == DeriveFormatArg::Address
+        if self.output_format == DeriveFormatArg::Address
             && !(self.algorithm == DeriveAlgorithmArg::Secp256k1
                 && self.usage == DeriveUseArg::Pubkey)
         {
             return Err(CliError::Usage(
-                "--format address is valid only for derive --algorithm secp256k1 --use pubkey"
+                "--output-format address is valid only for derive --algorithm secp256k1 --use pubkey"
                     .to_string(),
             ));
         }
@@ -455,10 +490,11 @@ impl DeriveArgs {
     }
 
     pub fn sign_input(&self) -> Option<tpmctl_core::SignInput> {
-        match (&self.input, &self.digest) {
-            (Some(input), None) => Some(tpmctl_core::SignInput::Message(input.clone())),
-            (None, Some(digest)) => Some(tpmctl_core::SignInput::Digest(digest.clone())),
-            (None, None) => None,
+        match (&self.input, &self.digest_file, &self.digest) {
+            (Some(input), None, None) => Some(tpmctl_core::SignInput::Message(input.clone())),
+            (None, Some(digest), None) => Some(tpmctl_core::SignInput::DigestFile(digest.clone())),
+            (None, None, Some(digest)) => Some(tpmctl_core::SignInput::DigestHex(digest.clone())),
+            (None, None, None) => None,
             _ => unreachable!("derive validation enforces at most one sign input"),
         }
     }
@@ -526,6 +562,22 @@ impl From<HashArg> for HashAlgorithm {
             HashArg::Sha256 => Self::Sha256,
             HashArg::Sha384 => Self::Sha384,
             HashArg::Sha512 => Self::Sha512,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum InputFormatArg {
+    Raw,
+    Hex,
+}
+
+impl From<InputFormatArg> for InputFormat {
+    fn from(value: InputFormatArg) -> Self {
+        match value {
+            InputFormatArg::Raw => Self::Raw,
+            InputFormatArg::Hex => Self::Hex,
         }
     }
 }
@@ -688,6 +740,10 @@ pub fn parse_persistent_handle(value: &str) -> Result<PersistentHandle, String> 
         .map_err(|error| error.to_string())
 }
 
+fn material_ref_from_id_arg(value: &str) -> Result<MaterialRef, CliError> {
+    Ok(MaterialRef::from_id_or_handle(value.to_owned())?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -703,20 +759,24 @@ mod tests {
     }
 
     #[test]
-    fn sign_rejects_id_and_handle_together() {
-        assert!(
-            Cli::try_parse_args([
-                "tpmctl",
-                "sign",
-                "--id",
-                "alice",
-                "--handle",
-                "0x81010010",
-                "--input",
-                "msg",
-            ])
-            .is_err()
+    fn id_accepts_registry_ids_and_handle_literals() {
+        let cli = parse(&["tpmctl", "sign", "--id", "alice", "--input", "msg"]);
+        let Command::Sign(args) = cli.command else {
+            panic!("expected sign command");
+        };
+        assert_eq!(
+            args.material.material().unwrap(),
+            MaterialRef::Id("alice".into())
         );
+
+        let cli = parse(&["tpmctl", "sign", "--id", "0x81010010", "--input", "msg"]);
+        let Command::Sign(args) = cli.command else {
+            panic!("expected sign command");
+        };
+        assert!(matches!(
+            args.material.material().unwrap(),
+            MaterialRef::Handle(_)
+        ));
     }
 
     #[test]
@@ -727,7 +787,16 @@ mod tests {
     #[test]
     fn sign_accepts_stdin_and_stdout_dash() {
         let cli = parse(&[
-            "tpmctl", "sign", "--id", "alice", "--input", "-", "--format", "hex", "--output", "-",
+            "tpmctl",
+            "sign",
+            "--id",
+            "alice",
+            "--input",
+            "-",
+            "--output-format",
+            "hex",
+            "--output",
+            "-",
         ]);
         assert!(matches!(cli.command, Command::Sign(_)));
     }
@@ -776,7 +845,7 @@ mod tests {
             "sign",
             "--input",
             "msg",
-            "--digest",
+            "--digest-file",
             "digest",
         ]);
         assert!(cli.validate().is_err());
@@ -802,6 +871,37 @@ mod tests {
     }
 
     #[test]
+    fn derive_rejects_ed25519_sign_digest_inputs() {
+        let cli = parse(&[
+            "tpmctl",
+            "derive",
+            "--id",
+            "seed",
+            "--algorithm",
+            "ed25519",
+            "--use",
+            "sign",
+            "--digest-file",
+            "digest.bin",
+        ]);
+        assert!(cli.validate().is_err());
+
+        let cli = parse(&[
+            "tpmctl",
+            "derive",
+            "--id",
+            "seed",
+            "--algorithm",
+            "ed25519",
+            "--use",
+            "sign",
+            "--digest",
+            "00",
+        ]);
+        assert!(cli.validate().is_err());
+    }
+
+    #[test]
     fn derive_compressed_scope_is_validated() {
         let cli = parse(&[
             "tpmctl",
@@ -819,18 +919,61 @@ mod tests {
 
     #[test]
     fn binary_stdout_to_tty_requires_force() {
-        let cli = parse(&["tpmctl", "pubkey", "--id", "alice", "--format", "der"]);
+        let cli = parse(&[
+            "tpmctl",
+            "pubkey",
+            "--id",
+            "alice",
+            "--output-format",
+            "der",
+        ]);
         assert!(cli.guard_binary_stdout(true).is_err());
 
         let cli = parse(&[
-            "tpmctl", "pubkey", "--id", "alice", "--format", "der", "--force",
+            "tpmctl",
+            "pubkey",
+            "--id",
+            "alice",
+            "--output-format",
+            "der",
+            "--force",
         ]);
         assert!(cli.guard_binary_stdout(true).is_ok());
     }
 
     #[test]
-    fn parse_handle_requires_hex_prefix() {
-        assert!(Cli::try_parse_args(["tpmctl", "pubkey", "--handle", "81010010",]).is_err());
-        assert!(Cli::try_parse_args(["tpmctl", "pubkey", "--handle", "0x81010010",]).is_ok());
+    fn handle_literal_is_supplied_through_id_and_validated() {
+        assert!(Cli::try_parse_args(["tpmctl", "pubkey", "--handle", "0x81010010",]).is_err());
+
+        let cli = parse(&["tpmctl", "pubkey", "--id", "0x81010010"]);
+        assert!(cli.validate().is_ok());
+
+        let cli = parse(&["tpmctl", "pubkey", "--id", "0x80000000"]);
+        assert!(cli.validate().is_err());
+
+        let cli = parse(&["tpmctl", "pubkey", "--id", "0xzzzzzzzz"]);
+        assert!(cli.validate().is_err());
+
+        let cli = parse(&["tpmctl", "pubkey", "--id", "0X81010010"]);
+        assert!(cli.validate().is_ok());
+        let Command::Pubkey(args) = cli.command else {
+            panic!("expected pubkey command");
+        };
+        assert_eq!(
+            args.material.material().unwrap(),
+            MaterialRef::Id("0X81010010".into())
+        );
+
+        let cli = parse(&[
+            "tpmctl",
+            "keygen",
+            "--use",
+            "sign",
+            "--id",
+            "alice",
+            "--persist-at",
+            "0x81010010",
+        ]);
+        assert!(cli.validate().is_ok());
     }
 }
