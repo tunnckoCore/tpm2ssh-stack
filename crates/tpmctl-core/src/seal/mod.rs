@@ -16,10 +16,14 @@ use crate::{
     tpm,
 };
 
+/// Domain request for sealing bytes into a TPM sealed-data object.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SealRequest {
+    /// Registry ID or persistent handle where the sealed object is written.
     pub selector: ObjectSelector,
+    /// Secret bytes to seal.
     pub input: Zeroizing<Vec<u8>>,
+    /// Whether an existing target may be replaced.
     pub force: bool,
 }
 
@@ -35,14 +39,17 @@ impl std::fmt::Debug for SealRequest {
 }
 
 impl SealRequest {
+    /// Validate sealed input size and non-emptiness.
     pub fn validate(&self) -> Result<()> {
         validate_seal_input(&self.input)
     }
 
+    /// Execute the seal request using the default command context.
     pub fn execute(&self) -> Result<SealResult> {
         self.execute_with_context(&CommandContext::default())
     }
 
+    /// Execute the seal request using an explicit command context.
     pub fn execute_with_context(&self, command: &CommandContext) -> Result<SealResult> {
         seal_bytes(
             command,
@@ -54,33 +61,42 @@ impl SealRequest {
     }
 }
 
+/// Result metadata for a successfully sealed object.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SealResult {
+    /// Destination where the sealed object was written.
     pub selector: ObjectSelector,
+    /// Optional hash metadata associated with PRF/HMAC-derived sealed data.
     pub hash: Option<HashAlgorithm>,
 }
 
+/// Domain request for unsealing bytes from a TPM sealed-data object.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UnsealRequest {
+    /// Registry ID or persistent handle of the sealed object.
     pub selector: ObjectSelector,
+    /// Compatibility flag for callers that require binary stdout behavior.
     pub force_binary_stdout: bool,
 }
 
 impl UnsealRequest {
+    /// Ensure the loaded object descriptor represents sealed data.
     pub fn validate_descriptor(&self, descriptor: &ObjectDescriptor) -> Result<()> {
         descriptor.require_usage(KeyUsage::Sealed)
     }
 
+    /// Execute the unseal request using the default command context.
     pub fn execute(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.execute_with_context(&CommandContext::default())
     }
 
+    /// Execute the unseal request using an explicit command context.
     pub fn execute_with_context(&self, command: &CommandContext) -> Result<Zeroizing<Vec<u8>>> {
         unseal_bytes(command, &self.selector)
     }
 }
 
-pub fn seal_bytes(
+pub(crate) fn seal_bytes(
     command: &CommandContext,
     selector: ObjectSelector,
     input: &[u8],
@@ -133,7 +149,7 @@ pub fn seal_bytes(
     Ok(SealResult { selector, hash })
 }
 
-pub fn unseal_bytes(
+pub(crate) fn unseal_bytes(
     command: &CommandContext,
     selector: &ObjectSelector,
 ) -> Result<Zeroizing<Vec<u8>>> {

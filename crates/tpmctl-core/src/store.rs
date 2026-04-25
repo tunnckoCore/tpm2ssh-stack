@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 
 use crate::{CoreError, Result};
 
+/// Environment variable that overrides the default registry store root.
 pub const STORE_ENV: &str = "TPMCTL_STORE";
 const STORE_DIR_NAME: &str = "tpmctl";
 const REGISTRY_RECORD_FILE: &str = "meta.json";
@@ -24,6 +25,7 @@ pub struct StoreOptions {
 }
 
 impl StoreOptions {
+    /// Resolve the effective store root from the explicit option, environment, or defaults.
     pub fn resolve_root(&self) -> Result<PathBuf> {
         resolve_store_root(self.root.as_deref())
     }
@@ -32,42 +34,51 @@ impl StoreOptions {
 /// Stable identifier for existing TPM material.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum IdentityRef {
+    /// Registry object identifier.
     Id(String),
+    /// Persistent TPM handle reference.
     Handle(crate::PersistentHandle),
 }
 
+/// Filesystem-backed registry for TPM object metadata and blobs.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Store {
     root: PathBuf,
 }
 
 impl Store {
+    /// Create a store by resolving the effective root path.
     pub fn resolve<P: AsRef<Path>>(explicit_root: Option<P>) -> Result<Self> {
         Ok(Self {
             root: resolve_store_root(explicit_root)?,
         })
     }
 
+    /// Create a store rooted at an already chosen path.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
 
+    /// Return the root directory for this store.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Compute the directory path for an object in a registry collection.
     pub fn path_for(&self, collection: RegistryCollection, id: &RegistryId) -> PathBuf {
         collection
             .apply_to_root(&self.root)
             .join(id.as_relative_path())
     }
 
+    /// Check whether an object entry exists in the requested collection.
     pub fn exists(&self, collection: RegistryCollection, id: &RegistryId) -> bool {
         self.path_for(collection, id)
             .join(REGISTRY_RECORD_FILE)
             .is_file()
     }
 
+    /// Persist an object entry atomically into the requested collection.
     pub fn save_entry(
         &self,
         collection: RegistryCollection,
@@ -96,6 +107,7 @@ impl Store {
         Ok(dir)
     }
 
+    /// Load an object entry and its TPM blobs from the requested collection.
     pub fn load_entry(
         &self,
         collection: RegistryCollection,
@@ -131,26 +143,33 @@ impl Store {
         })
     }
 
+    /// Save a key entry into the keys collection.
     pub fn save_key(&self, entry: &StoredObjectEntry, overwrite: bool) -> Result<PathBuf> {
         self.save_entry(RegistryCollection::Keys, entry, overwrite)
     }
 
+    /// Load a key entry from the keys collection.
     pub fn load_key(&self, id: &RegistryId) -> Result<StoredObjectEntry> {
         self.load_entry(RegistryCollection::Keys, id)
     }
 
+    /// Save a sealed-object entry into the sealed collection.
     pub fn save_sealed(&self, entry: &StoredObjectEntry, overwrite: bool) -> Result<PathBuf> {
         self.save_entry(RegistryCollection::Sealed, entry, overwrite)
     }
 
+    /// Load a sealed-object entry from the sealed collection.
     pub fn load_sealed(&self, id: &RegistryId) -> Result<StoredObjectEntry> {
         self.load_entry(RegistryCollection::Sealed, id)
     }
 }
 
+/// Top-level registry collection for stored TPM objects.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RegistryCollection {
+    /// TPM key objects.
     Keys,
+    /// TPM sealed-data objects.
     Sealed,
 }
 
@@ -163,28 +182,34 @@ impl RegistryCollection {
     }
 }
 
+/// Validated registry identifier made of safe relative path components.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RegistryId(String);
 
 impl RegistryId {
+    /// Validate and create a registry ID from owned string-like input.
     pub fn new(input: impl Into<String>) -> Result<Self> {
         Self::parse(input.into())
     }
 
+    /// Validate and create a registry ID from borrowed string-like input.
     pub fn parse(input: impl AsRef<str>) -> Result<Self> {
         let input = input.as_ref();
         validate_registry_id(input)?;
         Ok(Self(input.to_owned()))
     }
 
+    /// Return the canonical string form of this registry ID.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Convert the slash-delimited ID into a relative filesystem path.
     pub fn as_relative_path(&self) -> PathBuf {
         self.0.split('/').collect()
     }
 
+    /// Return a filesystem-safe SSH comment derived from this ID.
     pub fn ssh_comment(&self) -> String {
         self.0.replace('/', "_")
     }
@@ -207,45 +232,68 @@ impl std::str::FromStr for RegistryId {
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StoredObjectKind {
+    /// Asymmetric or keyed-hash key object.
     Key,
+    /// Sealed-data object.
     Sealed,
 }
 
+/// Backwards-compatible alias for the stored object kind enum.
 pub type ObjectKind = StoredObjectKind;
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+/// Intended operation for a registry object.
 pub enum ObjectUsage {
+    /// Signing key usage.
     Sign,
+    /// ECDH key-agreement usage.
     Ecdh,
+    /// HMAC keyed-hash usage.
     Hmac,
+    /// Sealed-data usage.
     Sealed,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ParentRecord {
+    /// TPM hierarchy used for the parent object.
     pub hierarchy: String,
+    /// Human-readable parent template name.
     pub template: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Serializable metadata stored next to TPM public/private blobs.
 pub struct RegistryRecord {
+    /// Registry ID for the object.
     pub id: String,
+    /// Stored object category.
     pub kind: StoredObjectKind,
+    /// Intended object operation.
     pub usage: ObjectUsage,
+    /// Optional persistent TPM handle string.
     pub handle: Option<String>,
+    /// Whether the object is expected to exist at a persistent handle.
     pub persistent: bool,
+    /// Optional ECC curve name for asymmetric keys.
     pub curve: Option<String>,
+    /// Optional hash algorithm associated with the object.
     pub hash: Option<String>,
+    /// Creation timestamp in seconds since the Unix epoch.
     pub created_at: String,
+    /// Parent object metadata used to recreate transient loads.
     pub parent: Option<ParentRecord>,
+    /// Object template name used when creating the object.
     pub template: Option<String>,
+    /// Cached public key material for asymmetric objects.
     pub public_key: Option<String>,
 }
 
 impl RegistryRecord {
+    /// Build a new registry record with default metadata for the object.
     pub fn new(id: &RegistryId, kind: StoredObjectKind, usage: ObjectUsage) -> Self {
         Self {
             id: id.to_string(),
@@ -264,10 +312,15 @@ impl RegistryRecord {
 }
 
 #[derive(Clone, Eq, PartialEq)]
+/// Complete on-disk object entry including metadata and TPM blobs.
 pub struct StoredObjectEntry {
+    /// Serializable metadata record.
     pub record: RegistryRecord,
+    /// Marshaled TPM public area.
     pub public_blob: Vec<u8>,
+    /// Marshaled TPM private area; zeroized when dropped.
     pub private_blob: Zeroizing<Vec<u8>>,
+    /// Optional PEM-encoded public key cache.
     pub public_pem: Option<Vec<u8>>,
 }
 
@@ -286,13 +339,19 @@ impl fmt::Debug for StoredObjectEntry {
 /// Shared details for registry-backed objects in higher-level command contracts.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ObjectRecord {
+    /// Registry identifier.
     pub id: String,
+    /// Stored object kind.
     pub kind: ObjectKind,
+    /// Operational usage.
     pub usage: crate::KeyUsage,
+    /// Optional persistent TPM handle.
     pub handle: Option<crate::PersistentHandle>,
+    /// Whether the object is persistent in the TPM.
     pub persistent: bool,
 }
 
+/// Resolve the store root from an explicit path, environment, or XDG defaults.
 pub fn resolve_store_root<P: AsRef<Path>>(explicit_root: Option<P>) -> Result<PathBuf> {
     if let Some(path) = explicit_root {
         return normalize_store_root(path.as_ref());
@@ -305,10 +364,12 @@ pub fn resolve_store_root<P: AsRef<Path>>(explicit_root: Option<P>) -> Result<Pa
     default_store_root()
 }
 
+/// Validate an ID and convert it to a relative path.
 pub fn id_to_relative_path(id: &str) -> Result<PathBuf> {
     Ok(RegistryId::parse(id)?.as_relative_path())
 }
 
+/// Return the default store root under XDG_DATA_HOME or HOME.
 pub fn default_store_root() -> Result<PathBuf> {
     if let Some(xdg_data_home) = non_empty_env("XDG_DATA_HOME") {
         return normalize_store_root(Path::new(&xdg_data_home).join(STORE_DIR_NAME).as_path());

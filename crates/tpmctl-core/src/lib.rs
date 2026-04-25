@@ -107,6 +107,7 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
+    /// Return the digest length in bytes for this hash algorithm.
     pub fn digest_len(self) -> usize {
         match self {
             Self::Sha256 => 32,
@@ -115,6 +116,7 @@ impl HashAlgorithm {
         }
     }
 
+    /// Hash the provided bytes with this algorithm and return the digest.
     pub fn digest(self, input: &[u8]) -> Vec<u8> {
         match self {
             Self::Sha256 => Sha256::digest(input).to_vec(),
@@ -123,6 +125,7 @@ impl HashAlgorithm {
         }
     }
 
+    /// Ensure a caller-provided digest has this algorithm's expected length.
     pub fn validate_digest(self, digest: &[u8]) -> Result<()> {
         let expected = self.digest_len();
         if digest.len() == expected {
@@ -166,13 +169,17 @@ impl FromStr for HashAlgorithm {
     }
 }
 
+/// Selects a TPM object by registry ID or persistent handle.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum ObjectSelector {
+    /// Load object material from the registry store.
     Id(RegistryId),
+    /// Refer to an object that already resides at a persistent TPM handle.
     Handle(PersistentHandle),
 }
 
 impl ObjectSelector {
+    /// Return a stable SSH comment for this object selector.
     pub fn ssh_comment(&self) -> String {
         match self {
             Self::Id(id) => id.ssh_comment(),
@@ -181,16 +188,23 @@ impl ObjectSelector {
     }
 }
 
+/// Metadata describing a loaded or registry-backed TPM object.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ObjectDescriptor {
+    /// Selector used to locate the object.
     pub selector: ObjectSelector,
+    /// Allowed operation for the object.
     pub usage: KeyUsage,
+    /// ECC curve for asymmetric keys, when applicable.
     pub curve: Option<EccCurve>,
+    /// Hash algorithm associated with keyed-hash or signing objects.
     pub hash: Option<HashAlgorithm>,
+    /// Cached public key for asymmetric objects.
     pub public_key: Option<EccPublicKey>,
 }
 
 impl ObjectDescriptor {
+    /// Validate that this descriptor supports the expected key usage.
     pub fn require_usage(&self, expected: KeyUsage) -> Result<()> {
         if self.usage == expected {
             Ok(())
@@ -203,11 +217,14 @@ impl ObjectDescriptor {
     }
 }
 
+/// ECC curves supported by public key descriptors.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EccCurve {
+    /// NIST P-256 / secp256r1.
     P256,
 }
 
+/// Normalized ECC public key in uncompressed SEC1 form.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EccPublicKey {
     curve: EccCurve,
@@ -215,6 +232,7 @@ pub struct EccPublicKey {
 }
 
 impl EccPublicKey {
+    /// Parse and normalize a P-256 SEC1 encoded public key.
     pub fn p256_sec1(sec1: impl Into<Vec<u8>>) -> Result<Self> {
         let sec1 = sec1.into();
         let key = p256::PublicKey::from_sec1_bytes(&sec1)
@@ -226,18 +244,23 @@ impl EccPublicKey {
         })
     }
 
+    /// Return the curve for this public key.
     pub fn curve(&self) -> EccCurve {
         self.curve
     }
 
+    /// Return the normalized uncompressed SEC1 public key bytes.
     pub fn sec1(&self) -> &[u8] {
         &self.sec1
     }
 }
 
+/// Destination for bytes sealed by HMAC or seal operations.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SealTarget {
+    /// Store the sealed object in the registry.
     Id(RegistryId),
+    /// Persist the sealed object at a TPM handle.
     Handle(PersistentHandle),
 }
 

@@ -15,9 +15,13 @@ use crate::output::{SignatureFormat, encode_p256_signature};
 /// their payload; its length is validated against `hash` before signing.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SignRequest {
+    /// Signing key selected by registry ID or persistent handle.
     pub selector: ObjectSelector,
+    /// Message or digest to sign.
     pub input: SignInput,
+    /// Hash algorithm used for message hashing or digest validation.
     pub hash: HashAlgorithm,
+    /// Signature encoding to return.
     pub output_format: SignatureFormat,
 }
 
@@ -28,7 +32,9 @@ pub struct SignRequest {
 /// matches `SignRequest::hash`.
 #[derive(Clone, Eq, PartialEq)]
 pub enum SignInput {
+    /// Arbitrary message bytes that will be hashed before signing.
     Message(Zeroizing<Vec<u8>>),
+    /// Precomputed digest bytes whose length must match `SignRequest::hash`.
     Digest(Zeroizing<Vec<u8>>),
 }
 
@@ -60,6 +66,7 @@ impl fmt::Debug for SignInput {
 }
 
 impl SignRequest {
+    /// Return the digest that will be submitted to the TPM for signing.
     pub fn digest(&self) -> Result<Zeroizing<Vec<u8>>> {
         match &self.input {
             SignInput::Message(message) => Ok(Zeroizing::new(self.hash.digest(message))),
@@ -70,19 +77,23 @@ impl SignRequest {
         }
     }
 
+    /// Ensure the loaded object descriptor is usable for signing.
     pub fn validate_descriptor(&self, descriptor: &ObjectDescriptor) -> Result<()> {
         descriptor.require_usage(KeyUsage::Sign)
     }
 
+    /// Execute the request using an explicit store and default command context.
     pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
         self.execute_with_store_and_context(store, &CommandContext::default())
     }
 
+    /// Execute the request using a command context and its resolved store.
     pub fn execute_with_context(&self, command: &CommandContext) -> Result<Vec<u8>> {
         let store = Store::resolve(command.store.root.as_deref())?;
         self.execute_with_store_and_context(&store, command)
     }
 
+    /// Execute the request using both an explicit store and command context.
     pub fn execute_with_store_and_context(
         &self,
         store: &Store,
@@ -102,7 +113,10 @@ impl SignRequest {
     }
 }
 
-pub fn encode_tpm_p256_signature(p1363: &[u8], output_format: SignatureFormat) -> Result<Vec<u8>> {
+pub(crate) fn encode_tpm_p256_signature(
+    p1363: &[u8],
+    output_format: SignatureFormat,
+) -> Result<Vec<u8>> {
     encode_p256_signature(p1363, output_format)
 }
 

@@ -4,6 +4,7 @@ use tss_esapi::handles::{PersistentTpmHandle, TpmHandle};
 
 use crate::{CoreError, Result};
 
+/// Validated TPM persistent handle wrapper.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PersistentHandle {
     raw: u32,
@@ -11,6 +12,7 @@ pub struct PersistentHandle {
 }
 
 impl PersistentHandle {
+    /// Construct a persistent handle from its raw numeric value.
     pub fn new(raw: u32) -> Result<Self> {
         let handle = PersistentTpmHandle::new(raw).map_err(|error| {
             invalid_handle(
@@ -21,18 +23,22 @@ impl PersistentHandle {
         Ok(Self { raw, handle })
     }
 
+    /// Parse a persistent handle from a `0x`-prefixed hexadecimal string.
     pub fn parse(input: impl AsRef<str>) -> Result<Self> {
         input.as_ref().parse()
     }
 
+    /// Return the raw TPM handle value.
     pub fn raw(self) -> u32 {
         self.raw
     }
 
+    /// Convert to a generic tss-esapi TPM handle.
     pub fn tpm_handle(self) -> TpmHandle {
         TpmHandle::Persistent(self.handle)
     }
 
+    /// Convert to a tss-esapi persistent TPM handle.
     pub fn persistent_tpm_handle(self) -> PersistentTpmHandle {
         self.handle
     }

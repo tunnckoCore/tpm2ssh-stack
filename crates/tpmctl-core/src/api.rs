@@ -39,15 +39,21 @@ impl Context {
     }
 }
 
+/// Parameters for creating a TPM-backed key and registering it in the store.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct KeygenParams {
+    /// Intended key capability: signing, ECDH, or HMAC.
     pub usage: KeygenUsage,
+    /// Registry identifier where the new key metadata and blobs are stored.
     pub id: RegistryId,
+    /// Optional persistent TPM handle to evict-control the created key into.
     pub persist_at: Option<tpm::PersistentHandle>,
+    /// Whether an existing registry entry or persistent handle may be replaced.
     pub overwrite: bool,
 }
 
 impl KeygenParams {
+    /// Validate parameters before attempting TPM or store mutations.
     pub fn validate(&self) -> Result<()> {
         if self.id.as_str().starts_with("0x") {
             return Err(crate::Error::invalid(
@@ -59,6 +65,7 @@ impl KeygenParams {
     }
 }
 
+/// Create a TPM-backed key according to [`KeygenParams`].
 pub fn keygen(context: &Context, params: KeygenParams) -> Result<KeygenResult> {
     params.validate()?;
     keygen::KeygenRequest {
@@ -70,12 +77,16 @@ pub fn keygen(context: &Context, params: KeygenParams) -> Result<KeygenResult> {
     .execute_with_context(&context.command())
 }
 
+/// Parameters for exporting a public key from a registry ID or TPM handle.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PubkeyParams {
+    /// Object whose public key should be exported.
     pub material: ObjectSelector,
+    /// Encoding to use for the exported public key.
     pub output_format: PublicKeyFormat,
 }
 
+/// Export the public portion of a TPM-backed asymmetric key.
 pub fn pubkey(context: &Context, params: PubkeyParams) -> Result<Vec<u8>> {
     pubkey_api::PubkeyRequest {
         selector: params.material,
@@ -84,10 +95,14 @@ pub fn pubkey(context: &Context, params: PubkeyParams) -> Result<Vec<u8>> {
     .execute_with_context(&context.command())
 }
 
+/// Parameters for deriving an ECDH shared secret with a TPM key.
 #[derive(Clone, Eq, PartialEq)]
 pub struct EcdhParams {
+    /// Local ECDH private key selected by registry ID or persistent handle.
     pub material: ObjectSelector,
+    /// Peer public key encoded as SEC1, DER, or PEM.
     pub peer_public_key: PublicKeyInput,
+    /// Encoding to apply to the shared secret bytes.
     pub output_format: BinaryFormat,
 }
 
@@ -102,6 +117,7 @@ impl fmt::Debug for EcdhParams {
     }
 }
 
+/// Derive and encode an ECDH shared secret using a TPM-backed key.
 pub fn ecdh(context: &Context, params: EcdhParams) -> Result<Zeroizing<Vec<u8>>> {
     EcdhRequest {
         selector: params.material,
@@ -118,16 +134,22 @@ pub fn ecdh(context: &Context, params: EcdhParams) -> Result<Zeroizing<Vec<u8>>>
 /// `SignParams::hash`.
 #[derive(Clone, Eq, PartialEq)]
 pub enum SignPayload {
+    /// Arbitrary message bytes that will be hashed before signing.
     Message(Zeroizing<Vec<u8>>),
+    /// Precomputed digest bytes whose length must match the selected hash.
     Digest(Zeroizing<Vec<u8>>),
 }
 
 /// Parameters for [`sign`], the ergonomic public API around TPM P-256 signing.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SignParams {
+    /// Signing key selected by registry ID or persistent handle.
     pub material: ObjectSelector,
+    /// Message or digest to sign.
     pub payload: SignPayload,
+    /// Hash algorithm associated with the signature operation.
     pub hash: HashAlgorithm,
+    /// Encoding for the returned signature.
     pub output_format: SignatureFormat,
 }
 
@@ -158,6 +180,7 @@ impl fmt::Debug for SignParams {
     }
 }
 
+/// Sign a message or digest with a TPM-backed P-256 signing key.
 pub fn sign(context: &Context, params: SignParams) -> Result<Vec<u8>> {
     let input = match params.payload {
         SignPayload::Message(message) => SignInput::Message(message),
@@ -172,14 +195,22 @@ pub fn sign(context: &Context, params: SignParams) -> Result<Vec<u8>> {
     .execute_with_context(&context.command())
 }
 
+/// Parameters for computing a TPM HMAC and optionally sealing the result.
 #[derive(Clone, Eq, PartialEq)]
 pub struct HmacParams {
+    /// HMAC key selected by registry ID or persistent handle.
     pub material: ObjectSelector,
+    /// Input bytes for the HMAC operation.
     pub input: Zeroizing<Vec<u8>>,
+    /// Optional hash override; defaults from object metadata or SHA-256.
     pub hash: Option<HashAlgorithm>,
+    /// Encoding for emitted HMAC bytes.
     pub output_format: BinaryFormat,
+    /// Optional sealed-object destination for the HMAC output.
     pub seal_target: Option<SealTarget>,
+    /// Whether to return HMAC bytes even when also sealing them.
     pub emit_prf_when_sealing: bool,
+    /// Whether existing sealed registry entries or persistent handles may be replaced.
     pub overwrite: bool,
 }
 
@@ -198,6 +229,7 @@ impl fmt::Debug for HmacParams {
     }
 }
 
+/// Compute an HMAC with a TPM-backed key and return or seal the result.
 pub fn hmac(context: &Context, params: HmacParams) -> Result<HmacResult> {
     HmacRequest {
         selector: params.material,
@@ -211,10 +243,14 @@ pub fn hmac(context: &Context, params: HmacParams) -> Result<HmacResult> {
     .execute_with_context(&context.command())
 }
 
+/// Parameters for sealing bytes into a TPM sealed-data object.
 #[derive(Clone, Eq, PartialEq)]
 pub struct SealParams {
+    /// Registry ID or persistent handle where the sealed object is written.
     pub target: ObjectSelector,
+    /// Secret bytes to seal.
     pub input: Zeroizing<Vec<u8>>,
+    /// Whether an existing target may be replaced.
     pub overwrite: bool,
 }
 
@@ -229,6 +265,7 @@ impl fmt::Debug for SealParams {
     }
 }
 
+/// Seal bytes into a TPM object and store or persist it at the requested target.
 pub fn seal(context: &Context, params: SealParams) -> Result<SealResult> {
     SealRequest {
         selector: params.target,
@@ -238,11 +275,14 @@ pub fn seal(context: &Context, params: SealParams) -> Result<SealResult> {
     .execute_with_context(&context.command())
 }
 
+/// Parameters for unsealing bytes from a TPM sealed-data object.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UnsealParams {
+    /// Sealed object selected by registry ID or persistent handle.
     pub material: ObjectSelector,
 }
 
+/// Unseal and return secret bytes from a TPM sealed-data object.
 pub fn unseal(context: &Context, params: UnsealParams) -> Result<Zeroizing<Vec<u8>>> {
     UnsealRequest {
         selector: params.material,

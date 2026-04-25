@@ -45,12 +45,14 @@ impl Drop for DeriveMode {
 }
 
 impl DeriveMode {
+    /// Build deterministic derivation mode using the supplied label.
     pub fn deterministic(label: impl Into<Vec<u8>>) -> Self {
         Self::Deterministic {
             label: label.into(),
         }
     }
 
+    /// Build ephemeral derivation mode using caller-supplied entropy.
     pub fn ephemeral(label: impl Into<Vec<u8>>, entropy: impl Into<Vec<u8>>) -> Self {
         Self::Ephemeral {
             label: label.into(),
@@ -79,8 +81,11 @@ impl DeriveMode {
 /// Derived-key algorithm family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DerivedAlgorithm {
+    /// NIST P-256 ECDSA key derivation.
     P256,
+    /// Ed25519 signing key derivation.
     Ed25519,
+    /// secp256k1 ECDSA key derivation.
     Secp256k1,
 }
 
@@ -97,28 +102,38 @@ impl DerivedAlgorithm {
 /// Requested operation over a derived software key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeriveUse {
+    /// Export the derived private/secret key bytes.
     Secret,
+    /// Export the derived public key bytes.
     Pubkey,
+    /// Sign a message or digest with the derived key.
     Sign,
 }
 
 /// Hash selector accepted by algorithms that support pre-hash semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HashSelection {
+    /// SHA-256 prehash selection.
     Sha256,
+    /// SHA-384 prehash selection.
     Sha384,
+    /// SHA-512 prehash selection.
     Sha512,
 }
 
 /// Validated operation request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeriveRequest {
+    /// Algorithm family for the derived key.
     pub algorithm: DerivedAlgorithm,
+    /// Operation requested for the derived key.
     pub use_: DeriveUse,
+    /// Optional hash selection for ECDSA signing.
     pub hash: Option<HashSelection>,
 }
 
 impl DeriveRequest {
+    /// Validate and construct a derived-key request.
     pub fn new(
         algorithm: DerivedAlgorithm,
         use_: DeriveUse,
@@ -135,16 +150,22 @@ impl DeriveRequest {
     }
 }
 
+/// Errors produced by derived software-key primitives.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum DeriveError {
+    /// Seed material was empty.
     #[error("PRF seed must not be empty")]
     EmptySeed,
+    /// HKDF output expansion failed.
     #[error("HKDF expansion failed")]
     HkdfExpand,
+    /// No valid scalar was found before the retry limit.
     #[error("candidate scalar remained invalid after {0} attempts")]
     ScalarExhausted(u32),
+    /// Ed25519 signing was requested with an external hash selection.
     #[error("Ed25519 signing does not accept --hash in v1")]
     HashNotAllowedForEd25519Sign,
+    /// Caller-supplied digest was invalid for ECDSA signing.
     #[error("invalid ECDSA prehash")]
     InvalidPrehash,
 }

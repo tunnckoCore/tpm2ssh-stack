@@ -75,3 +75,21 @@ fn hmac_result_can_carry_zeroizing_output() {
     let result = HmacResult::Output(Zeroizing::new(vec![1, 2, 3]));
     assert!(matches!(result, HmacResult::Output(_)));
 }
+
+#[test]
+fn hmac_debug_redacts_secret_input_and_output() {
+    let mut request = request();
+    request.input = Zeroizing::new(b"hmac-input-secret".to_vec());
+    let request_debug = format!("{request:?}");
+    assert!(request_debug.contains("<redacted>"));
+    assert!(!request_debug.contains("hmac-input-secret"));
+
+    let output = HmacResult::SealedWithOutput {
+        target: SealTarget::Handle(PersistentHandle::new(0x8101_0020).unwrap()),
+        hash: HashAlgorithm::Sha256,
+        output: Zeroizing::new(b"hmac-output-secret".to_vec()),
+    };
+    let output_debug = format!("{output:?}");
+    assert!(output_debug.contains("<redacted>"));
+    assert!(!output_debug.contains("hmac-output-secret"));
+}

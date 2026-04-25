@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
     CommandContext, DeriveAlgorithm, Error, HashAlgorithm, ObjectSelector, Result,
@@ -15,11 +15,11 @@ use crate::{
 
 use crate::api::Context;
 
-pub mod ed25519;
-pub mod ethereum;
-pub mod p256;
+pub(crate) mod ed25519;
+pub(crate) mod ethereum;
+pub(crate) mod p256;
 pub mod primitives;
-pub mod secp256k1;
+pub(crate) mod secp256k1;
 mod seed;
 mod validation;
 
@@ -139,7 +139,7 @@ fn secret(
     seed: &SecretSeed,
     mode: &DeriveMode,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let mut raw = match params.algorithm {
+    let raw = Zeroizing::new(match params.algorithm {
         DeriveAlgorithm::P256 => p256::derive_secret_key(seed, mode)
             .map_err(derive_error)?
             .to_bytes()
@@ -152,10 +152,11 @@ fn secret(
             .map_err(derive_error)?
             .to_bytes()
             .to_vec(),
-    };
-    let encoded = encode_raw_or_hex(&raw, params.output_format)?;
-    raw.zeroize();
-    Ok(Zeroizing::new(encoded))
+    });
+    Ok(Zeroizing::new(encode_raw_or_hex(
+        raw.as_slice(),
+        params.output_format,
+    )?))
 }
 
 fn pubkey(

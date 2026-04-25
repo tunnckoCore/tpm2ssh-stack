@@ -55,3 +55,16 @@ fn seal_result_carries_optional_hmac_hash_record() {
     };
     assert_eq!(result.hash, Some(HashAlgorithm::Sha512));
 }
+
+#[test]
+fn seal_request_debug_redacts_input() {
+    let request = SealRequest {
+        selector: selector(),
+        input: Zeroizing::new(b"sealed-input-secret".to_vec()),
+        force: false,
+    };
+
+    let debug = format!("{request:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("sealed-input-secret"));
+}

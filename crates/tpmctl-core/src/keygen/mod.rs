@@ -25,22 +25,32 @@ use crate::{
     tpm,
 };
 
+/// Domain request for creating and registering a TPM-backed key.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct KeygenRequest {
+    /// Intended usage for the new key.
     pub usage: KeygenUsage,
+    /// Registry ID under which the key is stored.
     pub id: RegistryId,
+    /// Optional persistent handle for the created key.
     pub persist_at: Option<PersistentHandle>,
+    /// Whether existing registry entries or handles may be replaced.
     pub force: bool,
 }
 
+/// Key capabilities supported by key generation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum KeygenUsage {
+    /// P-256 signing key.
     Sign,
+    /// P-256 ECDH key-agreement key.
     Ecdh,
+    /// Keyed-hash HMAC key.
     Hmac,
 }
 
 impl KeygenUsage {
+    /// Convert this generation usage into runtime object usage.
     pub fn object_usage(self) -> KeyUsage {
         match self {
             Self::Sign => KeyUsage::Sign,
@@ -58,19 +68,29 @@ impl KeygenUsage {
     }
 }
 
+/// Planned key generation operation after request normalization.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct KeygenPlan {
+    /// Intended usage for the generated key.
     pub usage: KeygenUsage,
+    /// Selector where the key will be addressable.
     pub selector: ObjectSelector,
+    /// Optional persistent handle destination.
     pub persistent_handle: Option<PersistentHandle>,
+    /// Whether replacement is allowed.
     pub force: bool,
+    /// TPM public template selected for the key.
     pub template: KeyTemplate,
 }
 
+/// TPM public templates used by key generation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum KeyTemplate {
+    /// Unrestricted P-256 signing key template.
     EccP256Sign,
+    /// Unrestricted P-256 ECDH key template.
     EccP256Ecdh,
+    /// Keyed-hash HMAC-SHA256 key template.
     KeyedHashHmac,
 }
 
@@ -85,6 +105,7 @@ impl KeyTemplate {
 }
 
 impl KeygenRequest {
+    /// Build a normalized generation plan without touching the TPM.
     pub fn plan(&self) -> Result<KeygenPlan> {
         Ok(KeygenPlan {
             usage: self.usage,
@@ -95,20 +116,24 @@ impl KeygenRequest {
         })
     }
 
+    /// Execute key generation using the default store and command context.
     pub fn execute(&self) -> Result<KeygenResult> {
         let store = Store::resolve::<&std::path::Path>(None)?;
         self.execute_with_store(&store)
     }
 
+    /// Execute key generation using an explicit store.
     pub fn execute_with_store(&self, store: &Store) -> Result<KeygenResult> {
         self.execute_with_store_and_context(store, &CommandContext::default())
     }
 
+    /// Execute key generation using a command context and its resolved store.
     pub fn execute_with_context(&self, command: &CommandContext) -> Result<KeygenResult> {
         let store = Store::resolve(command.store.root.as_deref())?;
         self.execute_with_store_and_context(&store, command)
     }
 
+    /// Execute key generation with explicit store and command context.
     pub fn execute_with_store_and_context(
         &self,
         store: &Store,
@@ -143,14 +168,18 @@ impl KeygenRequest {
     }
 }
 
+/// Result metadata for a successfully generated key.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct KeygenResult {
+    /// Registry ID where the key was stored.
     pub id: RegistryId,
+    /// Usage selected for the generated key.
     pub usage: KeygenUsage,
+    /// Persistent handle used for the key, if requested.
     pub persistent_handle: Option<PersistentHandle>,
 }
 
-pub fn template_for_usage(usage: KeygenUsage) -> KeyTemplate {
+pub(crate) fn template_for_usage(usage: KeygenUsage) -> KeyTemplate {
     match usage {
         KeygenUsage::Sign => KeyTemplate::EccP256Sign,
         KeygenUsage::Ecdh => KeyTemplate::EccP256Ecdh,
@@ -158,7 +187,7 @@ pub fn template_for_usage(usage: KeygenUsage) -> KeyTemplate {
     }
 }
 
-pub fn public_template_for_usage(usage: KeygenUsage) -> Result<Public> {
+pub(crate) fn public_template_for_usage(usage: KeygenUsage) -> Result<Public> {
     match usage {
         KeygenUsage::Sign => ecc_p256_sign_template(),
         KeygenUsage::Ecdh => ecc_p256_ecdh_template(),
@@ -166,7 +195,7 @@ pub fn public_template_for_usage(usage: KeygenUsage) -> Result<Public> {
     }
 }
 
-pub fn ecc_p256_sign_template() -> Result<Public> {
+pub(crate) fn ecc_p256_sign_template() -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -195,7 +224,7 @@ pub fn ecc_p256_sign_template() -> Result<Public> {
         .map_err(|source| CoreError::tpm("build ECC signing public template", source))
 }
 
-pub fn ecc_p256_ecdh_template() -> Result<Public> {
+pub(crate) fn ecc_p256_ecdh_template() -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -227,7 +256,7 @@ pub fn ecc_p256_ecdh_template() -> Result<Public> {
         .map_err(|source| CoreError::tpm("build ECC ECDH public template", source))
 }
 
-pub fn keyed_hash_hmac_template() -> Result<Public> {
+pub(crate) fn keyed_hash_hmac_template() -> Result<Public> {
     let attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -324,7 +353,7 @@ fn stored_key_entry(
     })
 }
 
-pub fn ecc_public_key_from_tpm_public(public: &Public) -> Result<Option<EccPublicKey>> {
+pub(crate) fn ecc_public_key_from_tpm_public(public: &Public) -> Result<Option<EccPublicKey>> {
     let Public::Ecc { unique, .. } = public else {
         return Ok(None);
     };

@@ -12,6 +12,7 @@ use tss_esapi::{
 
 use super::{ecc_point_from_public_key, left_pad_copy};
 
+/// Ask the TPM to produce a P-256 ECDSA signature over a digest.
 pub fn sign_digest(
     context: &mut Context,
     key_handle: KeyHandle,
@@ -32,6 +33,7 @@ pub fn sign_digest(
     p1363_from_tpm_signature(signature)
 }
 
+/// Ask the TPM to derive an ECDH shared secret with a peer public key.
 pub fn ecdh_z_gen(
     context: &mut Context,
     key_handle: KeyHandle,

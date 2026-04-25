@@ -187,6 +187,17 @@ fn test_key_entry(id: &RegistryId) -> StoredObjectEntry {
 }
 
 #[test]
+fn stored_object_entry_debug_redacts_private_blob() {
+    let id = RegistryId::parse("org/acme/key").unwrap();
+    let mut entry = test_key_entry(&id);
+    entry.private_blob = Zeroizing::new(b"private-blob-secret".to_vec());
+
+    let debug = format!("{entry:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("private-blob-secret"));
+}
+
+#[test]
 fn write_atomic_writes_exact_bytes_and_leaves_no_temp_file() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("target");

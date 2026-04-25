@@ -11,7 +11,7 @@ use tss_esapi::{
 
 use super::{KeyUsage, PersistentHandle, unmarshal_public};
 
-pub fn ecc_public_key_from_public(public: &Public) -> Result<EccPublicKey> {
+pub(crate) fn ecc_public_key_from_public(public: &Public) -> Result<EccPublicKey> {
     match public {
         Public::Ecc {
             parameters, unique, ..
@@ -31,6 +31,7 @@ pub fn ecc_public_key_from_public(public: &Public) -> Result<EccPublicKey> {
     }
 }
 
+/// Build an object descriptor from TPM public-area metadata.
 pub fn descriptor_from_tpm_public(
     selector: ObjectSelector,
     public: Public,
@@ -155,7 +156,7 @@ fn ecc_public_key_from_point(point: &EccPoint) -> Result<EccPublicKey> {
     EccPublicKey::p256_sec1(sec1)
 }
 
-pub fn ecc_point_from_public_key(public_key: &EccPublicKey) -> Result<EccPoint> {
+pub(crate) fn ecc_point_from_public_key(public_key: &EccPublicKey) -> Result<EccPoint> {
     let key = p256::PublicKey::from_sec1_bytes(public_key.sec1())
         .map_err(|source| CoreError::invalid("public_key", source.to_string()))?;
     let point = p256::elliptic_curve::sec1::ToEncodedPoint::to_encoded_point(&key, false);
@@ -211,7 +212,7 @@ impl ObjectDescriptor {
     }
 }
 
-pub fn descriptor_from_registry_entry(
+pub(crate) fn descriptor_from_registry_entry(
     collection: RegistryCollection,
     id: &RegistryId,
     entry: &StoredObjectEntry,
@@ -245,6 +246,7 @@ pub fn descriptor_from_registry_entry(
     })
 }
 
+/// Build an object descriptor directly from a TPM public area.
 pub fn descriptor_from_public(
     selector: ObjectSelector,
     public: &Public,

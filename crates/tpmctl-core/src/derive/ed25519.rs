@@ -3,19 +3,22 @@ use zeroize::Zeroizing;
 
 use super::primitives::{DeriveError, DeriveMode, DerivedAlgorithm, SecretSeed, derive_bytes};
 
-pub fn derive_signing_key(seed: &SecretSeed, mode: &DeriveMode) -> Result<SigningKey, DeriveError> {
+pub(crate) fn derive_signing_key(
+    seed: &SecretSeed,
+    mode: &DeriveMode,
+) -> Result<SigningKey, DeriveError> {
     let seed = derive_bytes(seed, mode, DerivedAlgorithm::Ed25519, b"seed", 0)?;
     Ok(SigningKey::from_bytes(&seed))
 }
 
-pub fn derive_verifying_key(
+pub(crate) fn derive_verifying_key(
     seed: &SecretSeed,
     mode: &DeriveMode,
 ) -> Result<VerifyingKey, DeriveError> {
     Ok(derive_signing_key(seed, mode)?.verifying_key())
 }
 
-pub fn derive_public_key_bytes(
+pub(crate) fn derive_public_key_bytes(
     seed: &SecretSeed,
     mode: &DeriveMode,
 ) -> Result<[u8; 32], DeriveError> {
@@ -24,7 +27,7 @@ pub fn derive_public_key_bytes(
 
 /// Signs message bytes with pure Ed25519. Ed25519ph/hash selection is
 /// intentionally not implemented for v1; request validation rejects it.
-pub fn sign_message(
+pub(crate) fn sign_message(
     seed: &SecretSeed,
     mode: &DeriveMode,
     message: &[u8],

@@ -5,13 +5,17 @@ use crate::{
     CommandContext, EccPublicKey, Error, KeyUsage, ObjectDescriptor, ObjectSelector, Result, Store,
 };
 
+/// Domain request for exporting public-key material from a TPM object.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PubkeyRequest {
+    /// Object selected by registry ID or persistent handle.
     pub selector: ObjectSelector,
+    /// Encoding for the exported public key.
     pub output_format: PublicKeyFormat,
 }
 
 impl PubkeyRequest {
+    /// Ensure the descriptor represents an asymmetric key with public material.
     pub fn validate_descriptor(&self, descriptor: &ObjectDescriptor) -> Result<()> {
         match descriptor.usage {
             KeyUsage::Sign | KeyUsage::Ecdh => Ok(()),
@@ -25,6 +29,7 @@ impl PubkeyRequest {
         }
     }
 
+    /// Encode public key material cached in an object descriptor.
     pub fn encode_descriptor_public_key(&self, descriptor: &ObjectDescriptor) -> Result<Vec<u8>> {
         self.validate_descriptor(descriptor)?;
         let public_key = descriptor
@@ -38,15 +43,18 @@ impl PubkeyRequest {
         )
     }
 
+    /// Execute the request using an explicit store and default command context.
     pub fn execute(&self, store: &Store) -> Result<Vec<u8>> {
         self.execute_with_store_and_context(store, &CommandContext::default())
     }
 
+    /// Execute the request using a command context and its resolved store.
     pub fn execute_with_context(&self, command: &CommandContext) -> Result<Vec<u8>> {
         let store = Store::resolve(command.store.root.as_deref())?;
         self.execute_with_store_and_context(&store, command)
     }
 
+    /// Execute the request using both an explicit store and command context.
     pub fn execute_with_store_and_context(
         &self,
         store: &Store,
@@ -68,14 +76,19 @@ impl PubkeyRequest {
     }
 }
 
+/// Supported external encodings for peer public keys.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PublicKeyInput {
+    /// SEC1 encoded elliptic-curve point.
     Sec1(Vec<u8>),
+    /// DER encoded SubjectPublicKeyInfo.
     Der(Vec<u8>),
+    /// PEM encoded SubjectPublicKeyInfo.
     Pem(String),
 }
 
 impl PublicKeyInput {
+    /// Classify raw input bytes as SEC1, DER, or PEM public-key input.
     pub fn parse_bytes(bytes: Vec<u8>) -> Result<Self> {
         if bytes.starts_with(b"-----BEGIN") {
             let pem = String::from_utf8(bytes)
@@ -90,6 +103,7 @@ impl PublicKeyInput {
         Ok(Self::Der(bytes))
     }
 
+    /// Decode this input as a normalized P-256 public key.
     pub fn into_p256(self) -> Result<EccPublicKey> {
         match self {
             Self::Sec1(bytes) => EccPublicKey::p256_sec1(bytes),

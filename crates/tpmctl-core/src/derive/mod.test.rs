@@ -68,3 +68,19 @@ fn validate_rejects_sign_formats_matching_root_rules() {
     p256.payload = Some(SignPayload::Message(Zeroizing::new(b"message".to_vec())));
     assert!(p256.validate().is_err());
 }
+
+#[test]
+fn debug_redacts_secret_bearing_derive_fields() {
+    let mut params = params(DerivedAlgorithm::P256, DeriveUse::Sign, DeriveFormat::Raw);
+    params.label = Some(b"label-secret".to_vec());
+    params.payload = Some(SignPayload::Message(Zeroizing::new(
+        b"message-secret".to_vec(),
+    )));
+    params.entropy = Some(Zeroizing::new(b"entropy-secret".to_vec()));
+
+    let debug = format!("{params:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("label-secret"));
+    assert!(!debug.contains("message-secret"));
+    assert!(!debug.contains("entropy-secret"));
+}

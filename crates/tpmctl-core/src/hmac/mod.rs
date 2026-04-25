@@ -1,6 +1,8 @@
 use std::fmt;
 
+#[cfg(test)]
 use hmac_crate::{Hmac, Mac};
+#[cfg(test)]
 use sha2::{Sha256, Sha384, Sha512};
 use tss_esapi::{handles::ObjectHandle, structures::MaxBuffer};
 use zeroize::Zeroizing;
@@ -11,36 +13,49 @@ use crate::{
     SealTarget, seal::seal_bytes, store::Store, tpm,
 };
 
+/// Domain request for computing a TPM HMAC and optionally sealing the result.
 #[derive(Clone, Eq, PartialEq)]
 pub struct HmacRequest {
+    /// HMAC key selected by registry ID or persistent handle.
     pub selector: ObjectSelector,
+    /// Input bytes for the HMAC operation.
     pub input: Zeroizing<Vec<u8>>,
+    /// Optional hash override; otherwise descriptor metadata or SHA-256 is used.
     pub hash: Option<HashAlgorithm>,
+    /// Encoding for emitted HMAC bytes.
     pub output_format: BinaryFormat,
+    /// Optional sealed-object destination for the HMAC output.
     pub seal_target: Option<SealTarget>,
+    /// Whether to emit HMAC bytes when a seal target is also provided.
     pub emit_prf_when_sealing: bool,
+    /// Whether an existing seal target can be overwritten.
     pub force: bool,
 }
 
 impl HmacRequest {
+    /// Resolve the hash algorithm from request override, descriptor, or default.
     pub fn effective_hash(&self, descriptor: Option<&ObjectDescriptor>) -> HashAlgorithm {
         self.hash
             .or_else(|| descriptor.and_then(|descriptor| descriptor.hash))
             .unwrap_or(HashAlgorithm::Sha256)
     }
 
+    /// Ensure the loaded object descriptor is usable for HMAC.
     pub fn validate_descriptor(&self, descriptor: &ObjectDescriptor) -> Result<()> {
         descriptor.require_usage(KeyUsage::Hmac)
     }
 
+    /// Return whether the computed HMAC bytes should be included in the result.
     pub fn should_emit_prf_bytes(&self) -> bool {
         self.seal_target.is_none() || self.emit_prf_when_sealing
     }
 
+    /// Execute the request using the default command context.
     pub fn execute(&self) -> Result<HmacResult> {
         self.execute_with_context(&CommandContext::default())
     }
 
+    /// Execute the request using an explicit command context.
     pub fn execute_with_context(&self, command: &CommandContext) -> Result<HmacResult> {
         let mut context = tpm::create_context_for(command)?;
         let (object_handle, descriptor) = load_hmac_key(&mut context, command, &self.selector)?;
@@ -77,16 +92,25 @@ impl HmacRequest {
     }
 }
 
+/// Result of an HMAC request.
 #[derive(Clone, Eq, PartialEq)]
 pub enum HmacResult {
+    /// Encoded HMAC bytes were returned directly.
     Output(Zeroizing<Vec<u8>>),
+    /// HMAC bytes were sealed without being emitted.
     Sealed {
+        /// Destination of the sealed HMAC bytes.
         target: SealTarget,
+        /// Hash algorithm used to compute the HMAC.
         hash: HashAlgorithm,
     },
+    /// HMAC bytes were sealed and also returned.
     SealedWithOutput {
+        /// Destination of the sealed HMAC bytes.
         target: SealTarget,
+        /// Hash algorithm used to compute the HMAC.
         hash: HashAlgorithm,
+        /// Encoded HMAC bytes.
         output: Zeroizing<Vec<u8>>,
     },
 }
@@ -128,11 +152,11 @@ impl fmt::Debug for HmacResult {
     }
 }
 
-pub fn encode_hmac_output(bytes: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
+pub(crate) fn encode_hmac_output(bytes: &[u8], output_format: BinaryFormat) -> Zeroizing<Vec<u8>> {
     encode_secret_binary(bytes, output_format)
 }
 
-pub fn compute_tpm_hmac(
+pub(crate) fn compute_tpm_hmac(
     context: &mut tss_esapi::Context,
     object_handle: ObjectHandle,
     input: &[u8],
@@ -164,7 +188,7 @@ pub fn compute_tpm_hmac(
     Ok(Zeroizing::new(digest.value().to_vec()))
 }
 
-pub fn prf_seed_from_hmac_identity(
+pub(crate) fn prf_seed_from_hmac_identity(
     command: &CommandContext,
     selector: &ObjectSelector,
     input: &[u8],
@@ -199,27 +223,28 @@ fn load_hmac_key(
     }
 }
 
-pub fn compute_software_hmac_for_tests(
+#[cfg(test)]
+pub(crate) fn compute_software_hmac_for_tests(
     key: &[u8],
     input: &[u8],
     hash: HashAlgorithm,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let output = match hash {
-        HashAlgorithm::Sha256 => compute::<Hmac<Sha256>>(key, input)?,
-        HashAlgorithm::Sha384 => compute::<Hmac<Sha384>>(key, input)?,
-        HashAlgorithm::Sha512 => compute::<Hmac<Sha512>>(key, input)?,
-    };
-    Ok(Zeroizing::new(output))
+    match hash {
+        HashAlgorithm::Sha256 => compute::<Hmac<Sha256>>(key, input),
+        HashAlgorithm::Sha384 => compute::<Hmac<Sha384>>(key, input),
+        HashAlgorithm::Sha512 => compute::<Hmac<Sha512>>(key, input),
+    }
 }
 
-fn compute<M>(key: &[u8], input: &[u8]) -> Result<Vec<u8>>
+#[cfg(test)]
+fn compute<M>(key: &[u8], input: &[u8]) -> Result<Zeroizing<Vec<u8>>>
 where
     M: Mac + hmac_crate::digest::KeyInit,
 {
     let mut mac = <M as hmac_crate::digest::KeyInit>::new_from_slice(key)
         .map_err(|error| Error::invalid("key", error.to_string()))?;
     mac.update(input);
-    Ok(mac.finalize().into_bytes().to_vec())
+    Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }
 
 #[cfg(test)]

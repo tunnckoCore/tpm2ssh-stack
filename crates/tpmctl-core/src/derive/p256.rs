@@ -1,5 +1,7 @@
 use p256::{SecretKey, ecdsa::SigningKey, elliptic_curve::sec1::ToEncodedPoint};
-use signature::{Signer, hazmat::PrehashSigner};
+#[cfg(test)]
+use signature::Signer;
+use signature::hazmat::PrehashSigner;
 use zeroize::Zeroize;
 
 use super::primitives::{
@@ -8,13 +10,16 @@ use super::primitives::{
 
 /// Derives a valid non-zero P-256 scalar, retrying HKDF output until accepted by
 /// the curve implementation.
-pub fn derive_secret_key(seed: &SecretSeed, mode: &DeriveMode) -> Result<SecretKey, DeriveError> {
+pub(crate) fn derive_secret_key(
+    seed: &SecretSeed,
+    mode: &DeriveMode,
+) -> Result<SecretKey, DeriveError> {
     derive_valid_secret_key(seed, mode, DerivedAlgorithm::P256, b"scalar", |candidate| {
         SecretKey::from_slice(candidate).ok()
     })
 }
 
-pub fn derive_public_key_sec1(
+pub(crate) fn derive_public_key_sec1(
     seed: &SecretSeed,
     mode: &DeriveMode,
     compressed: bool,
@@ -24,17 +29,10 @@ pub fn derive_public_key_sec1(
     Ok(public.to_encoded_point(compressed).as_bytes().to_vec())
 }
 
-pub fn public_key_sec1(secret: &SecretKey, compressed: bool) -> Vec<u8> {
-    secret
-        .public_key()
-        .to_encoded_point(compressed)
-        .as_bytes()
-        .to_vec()
-}
-
+#[cfg(test)]
 /// Signs message bytes using ECDSA/P-256. The `p256` ECDSA implementation hashes
 /// the message internally according to its signature crate semantics.
-pub fn sign_message(
+pub(crate) fn sign_message(
     seed: &SecretSeed,
     mode: &DeriveMode,
     message: &[u8],
@@ -46,7 +44,7 @@ pub fn sign_message(
 }
 
 /// Signs a caller-supplied digest using ECDSA/P-256 prehash semantics.
-pub fn sign_prehash(
+pub(crate) fn sign_prehash(
     seed: &SecretSeed,
     mode: &DeriveMode,
     digest: &[u8],
