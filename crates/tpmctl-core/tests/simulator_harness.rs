@@ -27,8 +27,8 @@ use tpmctl_core::{
     api::{
         self, Context as ApiContext, EcdhParams, HmacParams, KeygenParams, PubkeyParams,
         SealParams, SignParams, SignPayload, UnsealParams,
-        derive::{DeriveParams, SignPayload as DeriveSignPayload},
     },
+    derive::{self, DeriveParams, SignPayload as DeriveSignPayload},
     hmac::HmacResult,
     keygen::{KeygenRequest, KeygenUsage},
     output::{BinaryFormat, PublicKeyFormat, SignatureFormat},
@@ -395,13 +395,13 @@ fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
     )
     .unwrap();
 
-    let public_sec1 = api::derive::derive(
+    let public_sec1 = derive::derive(
         &context,
-        api::derive::DeriveParams {
+        derive::DeriveParams {
             material: ObjectSelector::Id(seed_id.clone()),
             label: Some(label.clone()),
             algorithm: DeriveAlgorithm::P256,
-            usage: api::derive::DeriveUse::Pubkey,
+            usage: derive::DeriveUse::Pubkey,
             payload: None,
             hash: None,
             output_format: DeriveFormat::Raw,
@@ -415,14 +415,14 @@ fn simulator_api_derive_from_sealed_seed_emits_p256_pubkey_and_signature() {
     let verifying_key = VerifyingKey::from_sec1_bytes(&public_sec1).unwrap();
 
     let message = Zeroizing::new(b"api derive simulator signature payload".to_vec());
-    let signature = api::derive::derive(
+    let signature = derive::derive(
         &context,
-        api::derive::DeriveParams {
+        derive::DeriveParams {
             material: ObjectSelector::Id(seed_id),
             label: Some(label),
             algorithm: DeriveAlgorithm::P256,
-            usage: api::derive::DeriveUse::Sign,
-            payload: Some(api::derive::SignPayload::Message(message.clone())),
+            usage: derive::DeriveUse::Sign,
+            payload: Some(derive::SignPayload::Message(message.clone())),
             hash: Some(HashAlgorithm::Sha256),
             output_format: DeriveFormat::Raw,
             compressed: false,
@@ -480,8 +480,8 @@ fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {
         compressed: false,
         entropy: None,
     };
-    let first_address = api::derive::derive(&context, address_params.clone()).unwrap();
-    let second_address = api::derive::derive(&context, address_params).unwrap();
+    let first_address = derive::derive(&context, address_params.clone()).unwrap();
+    let second_address = derive::derive(&context, address_params).unwrap();
     assert_eq!(first_address, second_address);
     assert_eq!(first_address.len(), 42);
     assert!(first_address.starts_with(b"0x"));
@@ -497,8 +497,8 @@ fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {
         compressed: false,
         entropy: None,
     };
-    let first_pubkey = api::derive::derive(&context, pubkey_params.clone()).unwrap();
-    let second_pubkey = api::derive::derive(&context, pubkey_params).unwrap();
+    let first_pubkey = derive::derive(&context, pubkey_params.clone()).unwrap();
+    let second_pubkey = derive::derive(&context, pubkey_params).unwrap();
     assert_eq!(first_pubkey, second_pubkey);
     assert_eq!(first_pubkey.len(), 65);
     assert_eq!(first_pubkey[0], 0x04);
@@ -516,8 +516,8 @@ fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {
         compressed: false,
         entropy: None,
     };
-    let first_signature = api::derive::derive(&context, signature_params.clone()).unwrap();
-    let second_signature = api::derive::derive(&context, signature_params).unwrap();
+    let first_signature = derive::derive(&context, signature_params.clone()).unwrap();
+    let second_signature = derive::derive(&context, signature_params).unwrap();
     assert_eq!(first_signature, second_signature);
     assert_eq!(first_signature.len(), 64);
 }

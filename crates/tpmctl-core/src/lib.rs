@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod crypto;
+pub mod derive;
 pub mod ecdh;
 pub mod error;
 pub mod hmac;
@@ -22,33 +23,50 @@ use sha2::{Digest as _, Sha256, Sha384, Sha512};
 pub use store::{IdentityRef, ObjectKind, RegistryId, Store, StoreOptions};
 pub use tpm::{CommandContext, KeyUsage, PersistentHandle};
 
+/// Signature encodings supported by signing operations.
 pub type SignatureFormat = output::SignatureFormat;
+/// Public-key encodings supported by public-key export operations.
 pub type PublicKeyFormat = output::PublicKeyFormat;
+/// Binary/text encodings supported by byte-output operations.
 pub type BinaryTextFormat = output::BinaryFormat;
+/// Algorithms supported by derived software-key operations.
 pub type DeriveAlgorithm = crypto::derive::DerivedAlgorithm;
+/// Output uses supported by derived software-key operations.
 pub type DeriveUse = crypto::derive::DeriveUse;
 
+/// Caller-provided input encoding.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InputFormat {
+    /// Input bytes are used as-is.
     Raw,
+    /// Input bytes contain UTF-8 hexadecimal text.
     Hex,
 }
 
+/// Encodings supported by derived-key outputs.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DeriveFormat {
+    /// Raw bytes.
     Raw,
+    /// Lowercase hexadecimal bytes.
     Hex,
+    /// ASN.1 DER signature bytes.
     Der,
+    /// EIP-55 Ethereum address for secp256k1 public keys.
     Address,
 }
 
+/// Reference to registry material by ID or persistent TPM handle.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum MaterialRef {
+    /// Registry ID.
     Id(String),
+    /// Persistent TPM handle.
     Handle(PersistentHandle),
 }
 
 impl MaterialRef {
+    /// Parse an ID or lowercase `0x` persistent-handle literal.
     pub fn from_id_or_handle(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if value.starts_with("0x") {
@@ -58,6 +76,7 @@ impl MaterialRef {
         }
     }
 
+    /// Convert into an object selector, validating registry IDs.
     pub fn selector(self) -> Result<ObjectSelector> {
         match self {
             Self::Id(id) => Ok(ObjectSelector::Id(RegistryId::new(id)?)),
@@ -77,10 +96,14 @@ impl fmt::Display for KeyUsage {
     }
 }
 
+/// Hash algorithms used for TPM and derived ECDSA signing.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HashAlgorithm {
+    /// SHA-256.
     Sha256,
+    /// SHA-384.
     Sha384,
+    /// SHA-512.
     Sha512,
 }
 
