@@ -11,6 +11,134 @@ fn simulator_or_test_tcti_opens_esapi_context_and_gets_random() {
 }
 
 #[test]
+fn simulator_native_sign_by_id_signs_message_and_digest_with_exported_pubkey() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let store = Store::new(temp_store.path());
+    let id = RegistryId::new("sim/native/sign/by-id").unwrap();
+    let message = Zeroizing::new(b"native sign by id message".to_vec());
+    let digest = Zeroizing::new(Sha256::digest(message.as_slice()).to_vec());
+
+    KeygenRequest {
+        usage: KeygenUsage::Sign,
+        id: id.clone(),
+        persist_at: None,
+        force: false,
+    }
+    .execute_with_store(&store)
+    .unwrap();
+
+    let public_by_id = PubkeyRequest {
+        selector: ObjectSelector::Id(id.clone()),
+        output_format: PublicKeyFormat::Raw,
+    }
+    .execute(&store)
+    .unwrap();
+    let verifying_key = VerifyingKey::from_sec1_bytes(&public_by_id).unwrap();
+
+    let message_signature = SignRequest {
+        selector: ObjectSelector::Id(id.clone()),
+        input: SignInput::Message(message.clone()),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Raw,
+    }
+    .execute(&store)
+    .unwrap();
+    let message_signature = decode_p256_signature(&message_signature, SignatureFormat::Raw);
+    verifying_key
+        .verify(message.as_slice(), &message_signature)
+        .unwrap();
+
+    let digest_signature = SignRequest {
+        selector: ObjectSelector::Id(id),
+        input: SignInput::Digest(digest.clone()),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Raw,
+    }
+    .execute(&store)
+    .unwrap();
+    let digest_signature = decode_p256_signature(&digest_signature, SignatureFormat::Raw);
+    verifying_key
+        .verify_prehash(digest.as_slice(), &digest_signature)
+        .unwrap();
+}
+
+#[test]
+fn simulator_native_sign_by_id_supports_reload_hashes_and_formats() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let store = Store::new(temp_store.path());
+    let id = RegistryId::new("sim/native/sign/by-id-reload-formats").unwrap();
+    let message = Zeroizing::new(b"native sign by id reload and formats".to_vec());
+
+    KeygenRequest {
+        usage: KeygenUsage::Sign,
+        id: id.clone(),
+        persist_at: None,
+        force: false,
+    }
+    .execute_with_store(&store)
+    .unwrap();
+
+    let public_by_id = PubkeyRequest {
+        selector: ObjectSelector::Id(id.clone()),
+        output_format: PublicKeyFormat::Raw,
+    }
+    .execute(&store)
+    .unwrap();
+    let verifying_key = VerifyingKey::from_sec1_bytes(&public_by_id).unwrap();
+
+    let reloaded_store = Store::new(temp_store.path());
+
+    let raw_sha256 = SignRequest {
+        selector: ObjectSelector::Id(id.clone()),
+        input: SignInput::Message(message.clone()),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Raw,
+    }
+    .execute(&reloaded_store)
+    .unwrap();
+    let raw_sha256 = decode_p256_signature(&raw_sha256, SignatureFormat::Raw);
+    verifying_key
+        .verify(message.as_slice(), &raw_sha256)
+        .unwrap();
+
+    let digest_sha384 = Zeroizing::new(Sha384::digest(message.as_slice()).to_vec());
+    let hex_sha384 = SignRequest {
+        selector: ObjectSelector::Id(id.clone()),
+        input: SignInput::Digest(digest_sha384.clone()),
+        hash: HashAlgorithm::Sha384,
+        output_format: SignatureFormat::Hex,
+    }
+    .execute(&reloaded_store)
+    .unwrap();
+    let hex_sha384 = decode_p256_signature(&hex_sha384, SignatureFormat::Hex);
+    verifying_key
+        .verify_prehash(digest_sha384.as_slice(), &hex_sha384)
+        .unwrap();
+
+    let digest_sha512 = Zeroizing::new(Sha512::digest(message.as_slice()).to_vec());
+    let der_sha512 = SignRequest {
+        selector: ObjectSelector::Id(id),
+        input: SignInput::Digest(digest_sha512.clone()),
+        hash: HashAlgorithm::Sha512,
+        output_format: SignatureFormat::Der,
+    }
+    .execute(&reloaded_store)
+    .unwrap();
+    let der_sha512 = decode_p256_signature(&der_sha512, SignatureFormat::Der);
+    verifying_key
+        .verify_prehash(digest_sha512.as_slice(), &der_sha512)
+        .unwrap();
+}
+
+#[test]
 fn simulator_non_persistent_keygen_sign_reload_supports_sha512() {
     let _guard = simulator_test_lock().lock().unwrap();
     let _tcti = require_simulator_tcti();
@@ -204,6 +332,29 @@ fn simulator_sign_and_hmac_reject_wrong_object_usages() {
     .to_string();
     assert!(sign_with_hmac.contains("expected sign object, got hmac"));
 
+    let handle = PersistentHandle::new(0x8101_004c).unwrap();
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Hmac,
+            id: RegistryId::new("sim/negative/hmac-handle-key").unwrap(),
+            persist_at: Some(handle),
+            overwrite: allow_external_tcti(),
+        },
+    )
+    .unwrap();
+
+    let native_sign_with_hmac_handle = SignRequest {
+        selector: ObjectSelector::Handle(handle),
+        input: SignInput::Message(Zeroizing::new(b"wrong handle usage sign".to_vec())),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Raw,
+    }
+    .execute_with_store_and_context(&store, &simulator_command_context(temp_store.path()))
+    .unwrap_err()
+    .to_string();
+    assert!(native_sign_with_hmac_handle.contains("expected sign object, got hmac"));
+
     let hmac_with_sign = api::hmac(
         &context,
         HmacParams {
@@ -391,6 +542,97 @@ fn simulator_force_replacement_allows_manual_evict_of_replacement_only() {
         tpmctl_core::tpm::load_persistent_object(&mut tpm_context, handle).is_err(),
         "evicting replacement should clean up the persistent handle"
     );
+}
+
+#[test]
+fn simulator_native_sign_rejects_invalid_digest_before_handle_lookup() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let store = Store::new(temp_store.path());
+    let handle = PersistentHandle::new(0x8101_004d).unwrap();
+
+    let error = SignRequest {
+        selector: ObjectSelector::Handle(handle),
+        input: SignInput::Digest(Zeroizing::new(vec![0x11; 31])),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Raw,
+    }
+    .execute_with_store_and_context(&store, &simulator_command_context(temp_store.path()))
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            tpmctl_core::Error::InvalidInput {
+                field: "digest",
+                ..
+            }
+        ),
+        "expected digest validation error before handle lookup, got {error:?}"
+    );
+}
+
+#[test]
+fn simulator_native_sign_by_handle_rejects_ecdh_key_usage() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let store = Store::new(temp_store.path());
+    let handle = PersistentHandle::new(0x8101_004e).unwrap();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Ecdh,
+            id: RegistryId::new("sim/negative/ecdh-handle-key").unwrap(),
+            persist_at: Some(handle),
+            overwrite: allow_external_tcti(),
+        },
+    )
+    .unwrap();
+
+    let error = SignRequest {
+        selector: ObjectSelector::Handle(handle),
+        input: SignInput::Message(Zeroizing::new(b"ecdh handle should not sign".to_vec())),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Raw,
+    }
+    .execute_with_store_and_context(&store, &simulator_command_context(temp_store.path()))
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("expected sign object, got ecdh"));
+}
+
+#[test]
+fn simulator_native_sign_by_handle_rejects_vacant_persistent_handle() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let store = Store::new(temp_store.path());
+    let handle = PersistentHandle::new(0x8101_004f).unwrap();
+
+    let error = SignRequest {
+        selector: ObjectSelector::Handle(handle),
+        input: SignInput::Message(Zeroizing::new(b"vacant handle should fail".to_vec())),
+        hash: HashAlgorithm::Sha256,
+        output_format: SignatureFormat::Raw,
+    }
+    .execute_with_store_and_context(&store, &simulator_command_context(temp_store.path()))
+    .unwrap_err();
+    assert!(matches!(error, tpmctl_core::Error::Tpm { .. }));
 }
 
 #[test]

@@ -32,7 +32,7 @@ pub(crate) use p256::{
     elliptic_curve::sec1::ToEncodedPoint,
     pkcs8::{DecodePublicKey, EncodePublicKey, LineEnding},
 };
-pub(crate) use sha2::{Digest, Sha256, Sha384};
+pub(crate) use sha2::{Digest, Sha256, Sha384, Sha512};
 pub(crate) use sha3::Keccak256;
 pub(crate) use tss_esapi::constants::StartupType;
 pub(crate) use zeroize::Zeroizing;
