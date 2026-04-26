@@ -121,7 +121,10 @@ pub(crate) fn seal_bytes(
         ObjectSelector::Handle(handle) => {
             clear_persistent_if_needed(&mut context, *handle, force)?;
             let loaded = context
-                .load(parent, create_result.out_private, create_result.out_public)
+                .execute_with_session(
+                    Some(tss_esapi::interface_types::session_handles::AuthSession::Password),
+                    |ctx| ctx.load(parent, create_result.out_private, create_result.out_public),
+                )
                 .map_err(|source| crate::CoreError::tpm("Load sealed object", source))?;
             tpm::persist_object(&mut context, ObjectHandle::from(loaded), *handle)?;
         }
