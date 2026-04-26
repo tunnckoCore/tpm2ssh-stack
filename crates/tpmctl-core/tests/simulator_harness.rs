@@ -3716,6 +3716,300 @@ fn simulator_native_sign_request_survives_cross_context_reload_and_handle_replac
 }
 
 #[test]
+fn simulator_native_sign_request_hash_and_format_matrix_verifies_with_exported_public_key() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let command = simulator_command_context(temp_store.path());
+    let reloaded_command = simulator_command_context(temp_store.path());
+    let handle = PersistentHandle::new(0x8101_0053).unwrap();
+    let sign_id = RegistryId::new("sim/native/sign/hash-format-matrix").unwrap();
+    let message = Zeroizing::new(b"native sign hash and format matrix".to_vec());
+
+    KeygenRequest {
+        usage: KeygenUsage::Sign,
+        id: sign_id.clone(),
+        persist_at: Some(handle),
+        force: true,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+
+    let public_by_id = PubkeyRequest {
+        selector: ObjectSelector::Id(sign_id.clone()),
+        output_format: PublicKeyFormat::Raw,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+    let public_by_handle = PubkeyRequest {
+        selector: ObjectSelector::Handle(handle),
+        output_format: PublicKeyFormat::Raw,
+    }
+    .execute_with_context(&reloaded_command)
+    .unwrap();
+    assert_eq!(public_by_id, public_by_handle);
+
+    let verifying_key = VerifyingKey::from_sec1_bytes(&public_by_id).unwrap();
+    let hashes = [
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Sha384,
+        HashAlgorithm::Sha512,
+    ];
+    let formats = [
+        SignatureFormat::Raw,
+        SignatureFormat::Hex,
+        SignatureFormat::Der,
+    ];
+
+    for (hash_index, hash) in hashes.into_iter().enumerate() {
+        let digest = Zeroizing::new(hash.digest(message.as_slice()));
+
+        for (format_index, format) in formats.into_iter().enumerate() {
+            let use_id_for_message = (hash_index + format_index) % 2 == 0;
+            let (message_selector, message_command, digest_selector, digest_command) =
+                if use_id_for_message {
+                    (
+                        ObjectSelector::Id(sign_id.clone()),
+                        &command,
+                        ObjectSelector::Handle(handle),
+                        &reloaded_command,
+                    )
+                } else {
+                    (
+                        ObjectSelector::Handle(handle),
+                        &reloaded_command,
+                        ObjectSelector::Id(sign_id.clone()),
+                        &command,
+                    )
+                };
+
+            let message_signature = SignRequest {
+                selector: message_selector,
+                input: SignInput::Message(message.clone()),
+                hash,
+                output_format: format,
+            }
+            .execute_with_context(message_command)
+            .unwrap();
+            match format {
+                SignatureFormat::Raw => assert_eq!(message_signature.len(), 64),
+                SignatureFormat::Hex => assert_eq!(message_signature.len(), 128),
+                SignatureFormat::Der => assert_eq!(message_signature.first(), Some(&0x30)),
+            }
+            let message_signature = decode_p256_signature(&message_signature, format);
+            verifying_key
+                .verify_prehash(digest.as_slice(), &message_signature)
+                .unwrap();
+
+            let digest_signature = SignRequest {
+                selector: digest_selector,
+                input: SignInput::Digest(digest.clone()),
+                hash,
+                output_format: format,
+            }
+            .execute_with_context(digest_command)
+            .unwrap();
+            match format {
+                SignatureFormat::Raw => assert_eq!(digest_signature.len(), 64),
+                SignatureFormat::Hex => assert_eq!(digest_signature.len(), 128),
+                SignatureFormat::Der => assert_eq!(digest_signature.first(), Some(&0x30)),
+            }
+            let digest_signature = decode_p256_signature(&digest_signature, format);
+            verifying_key
+                .verify_prehash(digest.as_slice(), &digest_signature)
+                .unwrap();
+        }
+    }
+
+    cleanup_persistent_handle(handle);
+}
+
+#[test]
+fn simulator_native_hmac_request_hash_matrix_covers_descriptor_and_global_defaults() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let command = simulator_command_context(temp_store.path());
+    let reloaded_command = simulator_command_context(temp_store.path());
+    let handle = PersistentHandle::new(0x8101_0054).unwrap();
+    let hmac_id = RegistryId::new("sim/native/hmac/hash-matrix").unwrap();
+    let sealed_default_id = RegistryId::new("sim/native/hmac/hash-matrix/default-sealed").unwrap();
+    let input = b"native hmac hash matrix".to_vec();
+
+    KeygenRequest {
+        usage: KeygenUsage::Hmac,
+        id: hmac_id.clone(),
+        persist_at: Some(handle),
+        force: true,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+
+    let default_by_id = expect_hmac_output(
+        HmacRequest {
+            selector: ObjectSelector::Id(hmac_id.clone()),
+            input: Zeroizing::new(input.clone()),
+            hash: None,
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            force: false,
+        }
+        .execute_with_context(&command)
+        .unwrap(),
+    );
+    assert_eq!(default_by_id.len(), HashAlgorithm::Sha256.digest_len());
+
+    let default_by_handle_hex = expect_hmac_output(
+        HmacRequest {
+            selector: ObjectSelector::Handle(handle),
+            input: Zeroizing::new(input.clone()),
+            hash: None,
+            output_format: BinaryFormat::Hex,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            force: false,
+        }
+        .execute_with_context(&reloaded_command)
+        .unwrap(),
+    );
+    assert_eq!(
+        hex::decode(&default_by_handle_hex).unwrap(),
+        default_by_id.as_slice()
+    );
+
+    let sealed_default = HmacRequest {
+        selector: ObjectSelector::Handle(handle),
+        input: Zeroizing::new(input.clone()),
+        hash: None,
+        output_format: BinaryFormat::Hex,
+        seal_target: Some(SealTarget::Id(sealed_default_id.clone())),
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(&reloaded_command)
+    .unwrap();
+    let HmacResult::Sealed { target, hash } = sealed_default else {
+        panic!("expected sealed HMAC result without emitted PRF bytes")
+    };
+    assert_eq!(target, SealTarget::Id(sealed_default_id.clone()));
+    assert_eq!(hash, HashAlgorithm::Sha256);
+
+    let unsealed_default = UnsealRequest {
+        selector: ObjectSelector::Id(sealed_default_id),
+        force_binary_stdout: true,
+    }
+    .execute_with_context(&simulator_command_context(temp_store.path()))
+    .unwrap();
+    assert_eq!(unsealed_default.as_slice(), default_by_id.as_slice());
+
+    for (index, hash) in [
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Sha384,
+        HashAlgorithm::Sha512,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (raw_selector, raw_command, hex_selector, hex_command) = if index % 2 == 0 {
+            (
+                ObjectSelector::Id(hmac_id.clone()),
+                &command,
+                ObjectSelector::Handle(handle),
+                &reloaded_command,
+            )
+        } else {
+            (
+                ObjectSelector::Handle(handle),
+                &reloaded_command,
+                ObjectSelector::Id(hmac_id.clone()),
+                &command,
+            )
+        };
+
+        match hash {
+            HashAlgorithm::Sha256 => {
+                let raw_output = expect_hmac_output(
+                    HmacRequest {
+                        selector: raw_selector,
+                        input: Zeroizing::new(input.clone()),
+                        hash: Some(hash),
+                        output_format: BinaryFormat::Raw,
+                        seal_target: None,
+                        emit_prf_when_sealing: false,
+                        force: false,
+                    }
+                    .execute_with_context(raw_command)
+                    .unwrap(),
+                );
+                assert_eq!(raw_output.len(), hash.digest_len());
+
+                let hex_output = expect_hmac_output(
+                    HmacRequest {
+                        selector: hex_selector,
+                        input: Zeroizing::new(input.clone()),
+                        hash: Some(hash),
+                        output_format: BinaryFormat::Hex,
+                        seal_target: None,
+                        emit_prf_when_sealing: false,
+                        force: false,
+                    }
+                    .execute_with_context(hex_command)
+                    .unwrap(),
+                );
+                assert_eq!(hex::decode(&hex_output).unwrap(), raw_output.as_slice());
+                assert_eq!(raw_output.as_slice(), default_by_id.as_slice());
+            }
+            HashAlgorithm::Sha384 | HashAlgorithm::Sha512 => {
+                let raw_error = HmacRequest {
+                    selector: raw_selector,
+                    input: Zeroizing::new(input.clone()),
+                    hash: Some(hash),
+                    output_format: BinaryFormat::Raw,
+                    seal_target: None,
+                    emit_prf_when_sealing: false,
+                    force: false,
+                }
+                .execute_with_context(raw_command)
+                .unwrap_err();
+                assert!(matches!(
+                    raw_error,
+                    tpmctl_core::Error::Tpm {
+                        operation: "HMAC",
+                        ..
+                    }
+                ));
+
+                let hex_error = HmacRequest {
+                    selector: hex_selector,
+                    input: Zeroizing::new(input.clone()),
+                    hash: Some(hash),
+                    output_format: BinaryFormat::Hex,
+                    seal_target: None,
+                    emit_prf_when_sealing: false,
+                    force: false,
+                }
+                .execute_with_context(hex_command)
+                .unwrap_err();
+                assert!(matches!(
+                    hex_error,
+                    tpmctl_core::Error::Tpm {
+                        operation: "HMAC",
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    cleanup_persistent_handle(handle);
+}
+
+#[test]
 fn simulator_native_hmac_request_survives_cross_context_reload_and_force_replacement() {
     let _guard = simulator_test_lock().lock().unwrap();
     let _tcti = require_simulator_tcti();
@@ -4160,6 +4454,786 @@ fn simulator_api_facade_keygen_pubkey_sign_hmac_seal_and_ecdh_roundtrip() {
     )
     .unwrap();
     assert_eq!(shared_secret.len(), 32);
+}
+
+#[test]
+fn simulator_api_derive_supports_output_format_matrix_for_sealed_seed_material() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let seed_id = RegistryId::new("sim/api/derive/formats/sealed-seed").unwrap();
+    let material = ObjectSelector::Id(seed_id.clone());
+
+    api::seal(
+        &context,
+        SealParams {
+            target: material.clone(),
+            input: Zeroizing::new(b"sealed derive output format matrix seed material".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let p256_label = b"simulator derive format matrix p256".to_vec();
+    let p256_secret_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(p256_label.clone()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let p256_secret_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(p256_label.clone()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(p256_secret_hex.as_slice()).unwrap(),
+        p256_secret_raw.as_slice()
+    );
+    let p256_software_secret = SecretKey::from_slice(p256_secret_raw.as_slice()).unwrap();
+
+    let p256_public_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(p256_label.clone()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let p256_public_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(p256_label.clone()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(p256_public_hex.as_slice()).unwrap(),
+        p256_public_raw.as_slice()
+    );
+    assert_eq!(
+        p256_public_raw.as_slice(),
+        p256_software_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+    );
+
+    let p256_message = b"derive output format matrix p256 message";
+    let p256_signature_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(p256_label.clone()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(
+            p256_message.to_vec(),
+        ))),
+        Some(HashAlgorithm::Sha256),
+        DeriveFormat::Raw,
+        false,
+    );
+    let p256_signature_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(p256_label.clone()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(
+            p256_message.to_vec(),
+        ))),
+        Some(HashAlgorithm::Sha256),
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(p256_signature_hex.as_slice()).unwrap(),
+        p256_signature_raw.as_slice()
+    );
+    VerifyingKey::from_sec1_bytes(p256_public_raw.as_slice())
+        .unwrap()
+        .verify_prehash(
+            HashAlgorithm::Sha256.digest(p256_message).as_slice(),
+            &P256Signature::from_slice(p256_signature_raw.as_slice()).unwrap(),
+        )
+        .unwrap();
+
+    let secp256k1_label = b"simulator derive format matrix secp256k1".to_vec();
+    let secp256k1_secret_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let secp256k1_secret_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(secp256k1_secret_hex.as_slice()).unwrap(),
+        secp256k1_secret_raw.as_slice()
+    );
+    let secp256k1_software_secret =
+        k256::SecretKey::from_slice(secp256k1_secret_raw.as_slice()).unwrap();
+
+    let secp256k1_public_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let secp256k1_public_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(secp256k1_public_hex.as_slice()).unwrap(),
+        secp256k1_public_raw.as_slice()
+    );
+    assert_eq!(
+        secp256k1_public_raw.as_slice(),
+        secp256k1_software_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+    );
+
+    let secp256k1_compressed_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Raw,
+        true,
+    );
+    let secp256k1_compressed_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Hex,
+        true,
+    );
+    assert_eq!(
+        hex::decode(secp256k1_compressed_hex.as_slice()).unwrap(),
+        secp256k1_compressed_raw.as_slice()
+    );
+    assert_eq!(
+        k256::PublicKey::from_sec1_bytes(secp256k1_compressed_raw.as_slice())
+            .unwrap()
+            .to_encoded_point(false)
+            .as_bytes(),
+        secp256k1_public_raw.as_slice()
+    );
+
+    let secp256k1_address = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Address,
+        false,
+    );
+    assert_eq!(
+        std::str::from_utf8(secp256k1_address.as_slice()).unwrap(),
+        checksum_address_from_uncompressed_secp256k1(secp256k1_public_raw.as_slice())
+    );
+
+    let secp256k1_message = b"derive output format matrix secp256k1 message";
+    let secp256k1_signature_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(
+            secp256k1_message.to_vec(),
+        ))),
+        Some(HashAlgorithm::Sha256),
+        DeriveFormat::Raw,
+        false,
+    );
+    let secp256k1_signature_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(
+            secp256k1_message.to_vec(),
+        ))),
+        Some(HashAlgorithm::Sha256),
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(secp256k1_signature_hex.as_slice()).unwrap(),
+        secp256k1_signature_raw.as_slice()
+    );
+    Secp256k1VerifyingKey::from_sec1_bytes(secp256k1_public_raw.as_slice())
+        .unwrap()
+        .verify_prehash(
+            HashAlgorithm::Sha256.digest(secp256k1_message).as_slice(),
+            &Secp256k1Signature::from_slice(secp256k1_signature_raw.as_slice()).unwrap(),
+        )
+        .unwrap();
+
+    let ed25519_label = b"simulator derive format matrix ed25519".to_vec();
+    let ed25519_secret_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(ed25519_label.clone()),
+        DeriveAlgorithm::Ed25519,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let ed25519_secret_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(ed25519_label.clone()),
+        DeriveAlgorithm::Ed25519,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(ed25519_secret_hex.as_slice()).unwrap(),
+        ed25519_secret_raw.as_slice()
+    );
+    let ed25519_secret_bytes: [u8; 32] = ed25519_secret_raw.as_slice().try_into().unwrap();
+    let ed25519_signing_key = Ed25519SigningKey::from_bytes(&ed25519_secret_bytes);
+
+    let ed25519_public_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(ed25519_label.clone()),
+        DeriveAlgorithm::Ed25519,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let ed25519_public_hex = derive_output(
+        &context,
+        material.clone(),
+        Some(ed25519_label.clone()),
+        DeriveAlgorithm::Ed25519,
+        DeriveUse::Pubkey,
+        None,
+        None,
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(ed25519_public_hex.as_slice()).unwrap(),
+        ed25519_public_raw.as_slice()
+    );
+    assert_eq!(
+        ed25519_public_raw.as_slice(),
+        &ed25519_signing_key.verifying_key().to_bytes()
+    );
+
+    let ed25519_message = b"derive output format matrix ed25519 message";
+    let ed25519_signature_raw = derive_output(
+        &context,
+        material.clone(),
+        Some(ed25519_label.clone()),
+        DeriveAlgorithm::Ed25519,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(
+            ed25519_message.to_vec(),
+        ))),
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let ed25519_signature_hex = derive_output(
+        &context,
+        material,
+        Some(ed25519_label),
+        DeriveAlgorithm::Ed25519,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(
+            ed25519_message.to_vec(),
+        ))),
+        None,
+        DeriveFormat::Hex,
+        false,
+    );
+    assert_eq!(
+        hex::decode(ed25519_signature_hex.as_slice()).unwrap(),
+        ed25519_signature_raw.as_slice()
+    );
+    Ed25519VerifyingKey::from_bytes(&ed25519_signing_key.verifying_key().to_bytes())
+        .unwrap()
+        .verify(
+            ed25519_message,
+            &Ed25519Signature::try_from(ed25519_signature_raw.as_slice()).unwrap(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn simulator_api_derive_supports_ecdsa_hash_and_signature_format_matrix() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let seed_id = RegistryId::new("sim/api/derive/hash-matrix/sealed-seed").unwrap();
+    let material = ObjectSelector::Id(seed_id.clone());
+
+    api::seal(
+        &context,
+        SealParams {
+            target: material.clone(),
+            input: Zeroizing::new(b"sealed derive hash matrix seed material".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let p256_label = b"simulator derive hash matrix p256".to_vec();
+    let p256_secret = derive_output(
+        &context,
+        material.clone(),
+        Some(p256_label.clone()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let p256_software_secret = SecretKey::from_slice(p256_secret.as_slice()).unwrap();
+    let p256_verifying_key = VerifyingKey::from_sec1_bytes(
+        derive_output(
+            &context,
+            material.clone(),
+            Some(p256_label.clone()),
+            DeriveAlgorithm::P256,
+            DeriveUse::Pubkey,
+            None,
+            None,
+            DeriveFormat::Raw,
+            false,
+        )
+        .as_slice(),
+    )
+    .unwrap();
+
+    for (hash, output_format, message) in [
+        (
+            None,
+            DeriveFormat::Raw,
+            b"derive hash matrix p256 default-sha256".as_slice(),
+        ),
+        (
+            Some(HashAlgorithm::Sha384),
+            DeriveFormat::Hex,
+            b"derive hash matrix p256 sha384".as_slice(),
+        ),
+        (
+            Some(HashAlgorithm::Sha512),
+            DeriveFormat::Der,
+            b"derive hash matrix p256 sha512".as_slice(),
+        ),
+    ] {
+        assert_p256_derive_sign_case(
+            &context,
+            material.clone(),
+            &p256_label,
+            &p256_software_secret,
+            &p256_verifying_key,
+            message,
+            hash,
+            output_format,
+        );
+    }
+
+    let secp256k1_label = b"simulator derive hash matrix secp256k1".to_vec();
+    let secp256k1_secret = derive_output(
+        &context,
+        material.clone(),
+        Some(secp256k1_label.clone()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Secret,
+        None,
+        None,
+        DeriveFormat::Raw,
+        false,
+    );
+    let secp256k1_software_secret =
+        k256::SecretKey::from_slice(secp256k1_secret.as_slice()).unwrap();
+    let secp256k1_verifying_key = Secp256k1VerifyingKey::from_sec1_bytes(
+        derive_output(
+            &context,
+            material,
+            Some(secp256k1_label.clone()),
+            DeriveAlgorithm::Secp256k1,
+            DeriveUse::Pubkey,
+            None,
+            None,
+            DeriveFormat::Raw,
+            false,
+        )
+        .as_slice(),
+    )
+    .unwrap();
+
+    for (hash, output_format, message) in [
+        (
+            None,
+            DeriveFormat::Raw,
+            b"derive hash matrix secp256k1 default-sha256".as_slice(),
+        ),
+        (
+            Some(HashAlgorithm::Sha384),
+            DeriveFormat::Hex,
+            b"derive hash matrix secp256k1 sha384".as_slice(),
+        ),
+        (
+            Some(HashAlgorithm::Sha512),
+            DeriveFormat::Der,
+            b"derive hash matrix secp256k1 sha512".as_slice(),
+        ),
+    ] {
+        assert_secp256k1_derive_sign_case(
+            &context,
+            ObjectSelector::Id(seed_id.clone()),
+            &secp256k1_label,
+            &secp256k1_software_secret,
+            &secp256k1_verifying_key,
+            message,
+            hash,
+            output_format,
+        );
+    }
+}
+
+#[test]
+fn simulator_api_seal_handle_selector_and_overwrite_preserve_then_replace_unsealed_bytes() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let handle = PersistentHandle::new(0x8101_0049).unwrap();
+    cleanup_persistent_handle(handle);
+
+    let first = Zeroizing::new(vec![
+        0x00, 0x10, 0x20, 0x30, b'h', b'a', b'n', b'd', b'l', b'e',
+    ]);
+    let first_result = api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Handle(handle),
+            input: first.clone(),
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(first_result.selector, ObjectSelector::Handle(handle));
+    assert_eq!(first_result.hash, None);
+    assert!(
+        !temp_store.path().join("sealed").exists(),
+        "sealing to a persistent handle should not create registry-backed sealed entries"
+    );
+
+    let first_unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Handle(handle),
+        },
+    )
+    .unwrap();
+    assert_eq!(first_unsealed.as_slice(), first.as_slice());
+
+    let duplicate_error = api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Handle(handle),
+            input: Zeroizing::new(b"second handle sealed bytes".to_vec()),
+            overwrite: false,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(duplicate_error.contains("already exists"));
+
+    let preserved_unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Handle(handle),
+        },
+    )
+    .unwrap();
+    assert_eq!(preserved_unsealed.as_slice(), first.as_slice());
+
+    api::seal(
+        &context,
+        SealParams {
+            target: ObjectSelector::Handle(handle),
+            input: Zeroizing::new(b"replacement handle sealed bytes".to_vec()),
+            overwrite: true,
+        },
+    )
+    .unwrap();
+
+    let reloaded_context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let replaced_unsealed = api::unseal(
+        &reloaded_context,
+        UnsealParams {
+            material: ObjectSelector::Handle(handle),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        replaced_unsealed.as_slice(),
+        b"replacement handle sealed bytes"
+    );
+    assert_ne!(replaced_unsealed.as_slice(), first.as_slice());
+    assert!(
+        !temp_store.path().join("sealed").exists(),
+        "overwriting a persistent sealed handle should not create registry-backed sealed entries"
+    );
+
+    cleanup_persistent_handle(handle);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_output(
+    context: &ApiContext,
+    material: ObjectSelector,
+    label: Option<Vec<u8>>,
+    algorithm: DeriveAlgorithm,
+    usage: DeriveUse,
+    payload: Option<DeriveSignPayload>,
+    hash: Option<HashAlgorithm>,
+    output_format: DeriveFormat,
+    compressed: bool,
+) -> Zeroizing<Vec<u8>> {
+    derive::derive(
+        context,
+        DeriveParams {
+            material,
+            label,
+            algorithm,
+            usage,
+            payload,
+            hash,
+            output_format,
+            compressed,
+            entropy: None,
+        },
+    )
+    .unwrap()
+}
+
+fn decode_derive_p256_signature(bytes: &[u8], format: DeriveFormat) -> P256Signature {
+    match format {
+        DeriveFormat::Raw => P256Signature::from_slice(bytes).unwrap(),
+        DeriveFormat::Hex => {
+            let decoded = hex::decode(bytes).unwrap();
+            P256Signature::from_slice(&decoded).unwrap()
+        }
+        DeriveFormat::Der => P256Signature::from_der(bytes).unwrap(),
+        DeriveFormat::Address => panic!("address is not a valid p256 signature format"),
+    }
+}
+
+fn decode_derive_secp256k1_signature(bytes: &[u8], format: DeriveFormat) -> Secp256k1Signature {
+    match format {
+        DeriveFormat::Raw => Secp256k1Signature::from_slice(bytes).unwrap(),
+        DeriveFormat::Hex => {
+            let decoded = hex::decode(bytes).unwrap();
+            Secp256k1Signature::from_slice(&decoded).unwrap()
+        }
+        DeriveFormat::Der => Secp256k1Signature::from_der(bytes).unwrap(),
+        DeriveFormat::Address => panic!("address is not a valid secp256k1 signature format"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_p256_derive_sign_case(
+    context: &ApiContext,
+    material: ObjectSelector,
+    label: &[u8],
+    software_secret: &SecretKey,
+    verifying_key: &VerifyingKey,
+    message: &[u8],
+    hash: Option<HashAlgorithm>,
+    output_format: DeriveFormat,
+) {
+    let message_signature = derive_output(
+        context,
+        material.clone(),
+        Some(label.to_vec()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(message.to_vec()))),
+        hash,
+        output_format,
+        false,
+    );
+    let effective_hash = hash.unwrap_or(HashAlgorithm::Sha256);
+    let digest = Zeroizing::new(effective_hash.digest(message));
+    let digest_signature = derive_output(
+        context,
+        material,
+        Some(label.to_vec()),
+        DeriveAlgorithm::P256,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Digest(digest.clone())),
+        hash,
+        DeriveFormat::Raw,
+        false,
+    );
+
+    let message_signature =
+        decode_derive_p256_signature(message_signature.as_slice(), output_format);
+    let digest_signature = P256Signature::from_slice(digest_signature.as_slice()).unwrap();
+    assert_eq!(message_signature, digest_signature);
+
+    let software_signature: P256Signature = P256SigningKey::from(software_secret.clone())
+        .sign_prehash(digest.as_slice())
+        .unwrap();
+    assert_eq!(message_signature, software_signature);
+    verifying_key
+        .verify_prehash(digest.as_slice(), &message_signature)
+        .unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_secp256k1_derive_sign_case(
+    context: &ApiContext,
+    material: ObjectSelector,
+    label: &[u8],
+    software_secret: &k256::SecretKey,
+    verifying_key: &Secp256k1VerifyingKey,
+    message: &[u8],
+    hash: Option<HashAlgorithm>,
+    output_format: DeriveFormat,
+) {
+    let message_signature = derive_output(
+        context,
+        material.clone(),
+        Some(label.to_vec()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Message(Zeroizing::new(message.to_vec()))),
+        hash,
+        output_format,
+        false,
+    );
+    let effective_hash = hash.unwrap_or(HashAlgorithm::Sha256);
+    let digest = Zeroizing::new(effective_hash.digest(message));
+    let digest_signature = derive_output(
+        context,
+        material,
+        Some(label.to_vec()),
+        DeriveAlgorithm::Secp256k1,
+        DeriveUse::Sign,
+        Some(DeriveSignPayload::Digest(digest.clone())),
+        hash,
+        DeriveFormat::Raw,
+        false,
+    );
+
+    let message_signature =
+        decode_derive_secp256k1_signature(message_signature.as_slice(), output_format);
+    let digest_signature = Secp256k1Signature::from_slice(digest_signature.as_slice()).unwrap();
+    assert_eq!(message_signature, digest_signature);
+
+    let software_signature: Secp256k1Signature = Secp256k1SigningKey::from(software_secret.clone())
+        .sign_prehash(digest.as_slice())
+        .unwrap();
+    assert_eq!(message_signature, software_signature);
+    verifying_key
+        .verify_prehash(digest.as_slice(), &message_signature)
+        .unwrap();
 }
 
 fn simulator_command_context(root: &Path) -> CommandContext {
