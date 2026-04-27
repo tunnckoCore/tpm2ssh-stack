@@ -1,11 +1,6 @@
 use super::support::*;
 
-#[test]
-fn simulator_api_hmac_seal_target_roundtrips_and_overwrite_controls_replacement() {
-    let _guard = simulator_test_lock().lock().unwrap();
-    let _tcti = require_simulator_tcti();
-    startup_and_get_random();
-
+fn api_hmac_context() -> (tempfile::TempDir, ApiContext, RegistryId, RegistryId) {
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
     let context = ApiContext {
         store: StoreOptions {
@@ -15,8 +10,6 @@ fn simulator_api_hmac_seal_target_roundtrips_and_overwrite_controls_replacement(
     };
     let hmac_id = RegistryId::new("sim/api/hmac-seal-target/key").unwrap();
     let sealed_id = RegistryId::new("sim/api/hmac-seal-target/prf").unwrap();
-    let first_input = b"first api sealed hmac input".to_vec();
-    let second_input = b"second api sealed hmac input".to_vec();
 
     api::keygen(
         &context,
@@ -29,11 +22,22 @@ fn simulator_api_hmac_seal_target_roundtrips_and_overwrite_controls_replacement(
     )
     .unwrap();
 
-    let first = api::hmac(
+    (temp_store, context, hmac_id, sealed_id)
+}
+
+#[test]
+fn simulator_api_hmac_seal_target_emits_and_roundtrips_output() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, context, hmac_id, sealed_id) = api_hmac_context();
+
+    let sealed = api::hmac(
         &context,
         HmacParams {
-            material: ObjectSelector::Id(hmac_id.clone()),
-            input: Zeroizing::new(first_input.clone()),
+            material: ObjectSelector::Id(hmac_id),
+            input: Zeroizing::new(b"api seal target integration input".to_vec()),
             hash: Some(HashAlgorithm::Sha256),
             output_format: BinaryFormat::Raw,
             seal_target: Some(SealTarget::Id(sealed_id.clone())),
@@ -45,28 +49,58 @@ fn simulator_api_hmac_seal_target_roundtrips_and_overwrite_controls_replacement(
     let HmacResult::SealedWithOutput {
         target,
         hash,
-        output: first_output,
-    } = first
+        output,
+    } = sealed
     else {
         panic!("expected sealed HMAC output")
     };
     assert_eq!(target, SealTarget::Id(sealed_id.clone()));
     assert_eq!(hash, HashAlgorithm::Sha256);
 
-    let first_unsealed = api::unseal(
+    let unsealed = api::unseal(
         &context,
         UnsealParams {
-            material: ObjectSelector::Id(sealed_id.clone()),
+            material: ObjectSelector::Id(sealed_id),
         },
     )
     .unwrap();
-    assert_eq!(first_unsealed.as_slice(), first_output.as_slice());
+    assert_eq!(unsealed.as_slice(), output.as_slice());
+}
+
+#[test]
+fn simulator_api_hmac_seal_target_preserves_existing_value_without_overwrite() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, context, hmac_id, sealed_id) = api_hmac_context();
+
+    let first = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(hmac_id.clone()),
+            input: Zeroizing::new(b"first api sealed hmac input".to_vec()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: Some(SealTarget::Id(sealed_id.clone())),
+            emit_prf_when_sealing: true,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let HmacResult::SealedWithOutput {
+        output: first_output,
+        ..
+    } = first
+    else {
+        panic!("expected sealed HMAC output")
+    };
 
     let duplicate_error = api::hmac(
         &context,
         HmacParams {
-            material: ObjectSelector::Id(hmac_id.clone()),
-            input: Zeroizing::new(second_input.clone()),
+            material: ObjectSelector::Id(hmac_id),
+            input: Zeroizing::new(b"second api sealed hmac input".to_vec()),
             hash: Some(HashAlgorithm::Sha256),
             output_format: BinaryFormat::Raw,
             seal_target: Some(SealTarget::Id(sealed_id.clone())),
@@ -80,21 +114,52 @@ fn simulator_api_hmac_seal_target_roundtrips_and_overwrite_controls_replacement(
         tpmctl_core::Error::AlreadyExists(_)
     ));
 
-    let preserved_unsealed = api::unseal(
+    let preserved = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id),
+        },
+    )
+    .unwrap();
+    assert_eq!(preserved.as_slice(), first_output.as_slice());
+}
+
+#[test]
+fn simulator_api_hmac_seal_target_overwrite_replaces_value() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, context, hmac_id, sealed_id) = api_hmac_context();
+
+    api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(hmac_id.clone()),
+            input: Zeroizing::new(b"first api sealed hmac input".to_vec()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: Some(SealTarget::Id(sealed_id.clone())),
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let first = api::unseal(
         &context,
         UnsealParams {
             material: ObjectSelector::Id(sealed_id.clone()),
         },
     )
     .unwrap();
-    assert_eq!(preserved_unsealed.as_slice(), first_output.as_slice());
 
     let second_expected = expect_hmac_output(
         api::hmac(
             &context,
             HmacParams {
-                material: ObjectSelector::Id(hmac_id),
-                input: Zeroizing::new(second_input),
+                material: ObjectSelector::Id(hmac_id.clone()),
+                input: Zeroizing::new(b"second api sealed hmac input".to_vec()),
                 hash: Some(HashAlgorithm::Sha256),
                 output_format: BinaryFormat::Raw,
                 seal_target: None,
@@ -108,7 +173,7 @@ fn simulator_api_hmac_seal_target_roundtrips_and_overwrite_controls_replacement(
     let replaced = api::hmac(
         &context,
         HmacParams {
-            material: ObjectSelector::Id(RegistryId::new("sim/api/hmac-seal-target/key").unwrap()),
+            material: ObjectSelector::Id(hmac_id),
             input: Zeroizing::new(b"second api sealed hmac input".to_vec()),
             hash: Some(HashAlgorithm::Sha256),
             output_format: BinaryFormat::Raw,
@@ -124,13 +189,13 @@ fn simulator_api_hmac_seal_target_roundtrips_and_overwrite_controls_replacement(
     assert_eq!(target, SealTarget::Id(sealed_id.clone()));
     assert_eq!(hash, HashAlgorithm::Sha256);
 
-    let replaced_unsealed = api::unseal(
+    let unsealed = api::unseal(
         &context,
         UnsealParams {
             material: ObjectSelector::Id(sealed_id),
         },
     )
     .unwrap();
-    assert_eq!(replaced_unsealed.as_slice(), second_expected.as_slice());
-    assert_ne!(replaced_unsealed.as_slice(), first_output.as_slice());
+    assert_eq!(unsealed.as_slice(), second_expected.as_slice());
+    assert_ne!(unsealed.as_slice(), first.as_slice());
 }

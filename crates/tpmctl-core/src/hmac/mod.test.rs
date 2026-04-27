@@ -1,5 +1,7 @@
 use super::*;
 use crate::PersistentHandle;
+use hmac_crate::{Hmac, Mac};
+use sha2::{Sha256, Sha384, Sha512};
 
 fn request() -> HmacRequest {
     HmacRequest {
@@ -14,52 +16,52 @@ fn request() -> HmacRequest {
 }
 
 #[test]
-fn hmac_validates_expected_key_usage() {
-    let descriptor = ObjectDescriptor {
+fn hmac_effective_hash_matrix_and_usage_validation() {
+    let hmac_with_hash = ObjectDescriptor {
         selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
         usage: KeyUsage::Hmac,
         curve: None,
         hash: Some(HashAlgorithm::Sha512),
         public_key: None,
     };
-    assert!(request().validate_descriptor(&descriptor).is_ok());
-    assert_eq!(
-        request().effective_hash(Some(&descriptor)),
-        HashAlgorithm::Sha512
-    );
-}
-
-#[test]
-fn hmac_effective_hash_prefers_request_override_and_otherwise_defaults() {
-    let descriptor = ObjectDescriptor {
-        selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
+    let hmac_without_hash = ObjectDescriptor {
+        selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0011).unwrap()),
         usage: KeyUsage::Hmac,
         curve: None,
-        hash: Some(HashAlgorithm::Sha256),
+        hash: None,
+        public_key: None,
+    };
+    let sign_descriptor = ObjectDescriptor {
+        selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0012).unwrap()),
+        usage: KeyUsage::Sign,
+        curve: None,
+        hash: None,
         public_key: None,
     };
 
     let mut override_request = request();
     override_request.hash = Some(HashAlgorithm::Sha384);
     assert_eq!(
-        override_request.effective_hash(Some(&descriptor)),
+        override_request.effective_hash(Some(&hmac_with_hash)),
         HashAlgorithm::Sha384
     );
 
     let default_request = request();
+    assert!(default_request.validate_descriptor(&hmac_with_hash).is_ok());
+    assert_eq!(
+        default_request.effective_hash(Some(&hmac_with_hash)),
+        HashAlgorithm::Sha512
+    );
+    assert_eq!(
+        default_request.effective_hash(Some(&hmac_without_hash)),
+        HashAlgorithm::Sha256
+    );
     assert_eq!(default_request.effective_hash(None), HashAlgorithm::Sha256);
-}
-
-#[test]
-fn hmac_rejects_non_hmac_usage() {
-    let descriptor = ObjectDescriptor {
-        selector: ObjectSelector::Handle(PersistentHandle::new(0x8101_0010).unwrap()),
-        usage: KeyUsage::Sign,
-        curve: None,
-        hash: None,
-        public_key: None,
-    };
-    assert!(request().validate_descriptor(&descriptor).is_err());
+    assert!(
+        default_request
+            .validate_descriptor(&sign_descriptor)
+            .is_err()
+    );
 }
 
 #[test]
@@ -74,27 +76,52 @@ fn hmac_encodes_raw_and_hex_output() {
     );
 }
 
-#[test]
-fn hmac_one_shot_helper_is_testable() {
-    let out = compute_software_hmac_for_tests(b"key", b"input", HashAlgorithm::Sha256).unwrap();
-    assert_eq!(out.len(), 32);
+fn reference_hmac<M>(key: &[u8], input: &[u8]) -> Vec<u8>
+where
+    M: Mac + hmac_crate::digest::KeyInit,
+{
+    let mut mac = <M as hmac_crate::digest::KeyInit>::new_from_slice(key).unwrap();
+    mac.update(input);
+    mac.finalize().into_bytes().to_vec()
 }
 
 #[test]
-fn hmac_does_not_emit_prf_when_sealing_by_default() {
-    let mut request = request();
-    request.seal_target = Some(SealTarget::Handle(
+fn hmac_software_helper_dispatches_all_supported_hashes() {
+    let key = b"key";
+    let input = b"input";
+
+    for (hash, expected) in [
+        (
+            HashAlgorithm::Sha256,
+            reference_hmac::<Hmac<Sha256>>(key, input),
+        ),
+        (
+            HashAlgorithm::Sha384,
+            reference_hmac::<Hmac<Sha384>>(key, input),
+        ),
+        (
+            HashAlgorithm::Sha512,
+            reference_hmac::<Hmac<Sha512>>(key, input),
+        ),
+    ] {
+        let out = compute_software_hmac_for_tests(key, input, hash).unwrap();
+        assert_eq!(out.as_slice(), expected.as_slice());
+        assert_eq!(out.len(), hash.digest_len());
+    }
+}
+
+#[test]
+fn hmac_should_emit_prf_bytes_matrix() {
+    let default_request = request();
+    assert!(default_request.should_emit_prf_bytes());
+
+    let mut sealed_request = request();
+    sealed_request.seal_target = Some(SealTarget::Handle(
         PersistentHandle::new(0x8101_0020).unwrap(),
     ));
-    assert!(!request.should_emit_prf_bytes());
-    request.emit_prf_when_sealing = true;
-    assert!(request.should_emit_prf_bytes());
-}
-
-#[test]
-fn hmac_result_can_carry_zeroizing_output() {
-    let result = HmacResult::Output(Zeroizing::new(vec![1, 2, 3]));
-    assert!(matches!(result, HmacResult::Output(_)));
+    assert!(!sealed_request.should_emit_prf_bytes());
+    sealed_request.emit_prf_when_sealing = true;
+    assert!(sealed_request.should_emit_prf_bytes());
 }
 
 #[test]

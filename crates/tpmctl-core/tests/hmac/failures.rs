@@ -1,11 +1,14 @@
 use super::support::*;
 
-#[test]
-fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_overwrite() {
-    let _guard = simulator_test_lock().lock().unwrap();
-    let _tcti = require_simulator_tcti();
-    startup_and_get_random();
-
+fn handle_target_case() -> (
+    tempfile::TempDir,
+    ApiContext,
+    CommandContext,
+    RegistryId,
+    PersistentHandle,
+    PersistentHandle,
+    PersistentHandle,
+) {
     let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
     let context = ApiContext {
         store: StoreOptions {
@@ -19,8 +22,6 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
     let hmac_handle = PersistentHandle::new(0x8101_0055).unwrap();
     let sign_handle = PersistentHandle::new(0x8101_0056).unwrap();
     let sealed_handle = PersistentHandle::new(0x8101_0057).unwrap();
-    let first_input = b"first sealed handle hmac input".to_vec();
-    let second_input = b"second sealed handle hmac input".to_vec();
 
     api::keygen(
         &context,
@@ -43,7 +44,27 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
     )
     .unwrap();
 
-    let sign_handle_error = HmacRequest {
+    (
+        temp_store,
+        context,
+        command,
+        hmac_id,
+        hmac_handle,
+        sign_handle,
+        sealed_handle,
+    )
+}
+
+#[test]
+fn simulator_hmac_by_handle_rejects_sign_key_handles() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, _context, command, _hmac_id, _hmac_handle, sign_handle, _sealed_handle) =
+        handle_target_case();
+
+    let error = HmacRequest {
         selector: ObjectSelector::Handle(sign_handle),
         input: Zeroizing::new(b"sign handle should not hmac".to_vec()),
         hash: Some(HashAlgorithm::Sha256),
@@ -53,15 +74,114 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
         force: false,
     }
     .execute_with_context(&command)
-    .unwrap_err()
-    .to_string();
-    assert!(
-        sign_handle_error.contains("object is not a keyed-hash HMAC key or sealed data object")
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        tpmctl_core::Error::InvalidInput { field: "usage", .. }
+    ));
+}
+
+#[test]
+fn simulator_hmac_seal_target_handle_roundtrips_output() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, _context, command, hmac_id, _hmac_handle, _sign_handle, sealed_handle) =
+        handle_target_case();
+    let input = b"first sealed handle hmac input".to_vec();
+
+    let expected = expect_hmac_output(
+        HmacRequest {
+            selector: ObjectSelector::Id(hmac_id.clone()),
+            input: Zeroizing::new(input.clone()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            force: false,
+        }
+        .execute_with_context(&command)
+        .unwrap(),
     );
+
+    let sealed = HmacRequest {
+        selector: ObjectSelector::Id(hmac_id),
+        input: Zeroizing::new(input),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: BinaryFormat::Raw,
+        seal_target: Some(SealTarget::Handle(sealed_handle)),
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+    let HmacResult::Sealed { target, hash } = sealed else {
+        panic!("expected sealed result for handle target")
+    };
+    assert_eq!(target, SealTarget::Handle(sealed_handle));
+    assert_eq!(hash, HashAlgorithm::Sha256);
+
+    let unsealed = UnsealRequest {
+        selector: ObjectSelector::Handle(sealed_handle),
+        force_binary_stdout: true,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+    assert_eq!(unsealed.as_slice(), expected.as_slice());
+}
+
+#[test]
+fn simulator_hmac_rejects_using_sealed_handle_as_hmac_source() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, _context, command, hmac_id, _hmac_handle, _sign_handle, sealed_handle) =
+        handle_target_case();
+
+    HmacRequest {
+        selector: ObjectSelector::Id(hmac_id),
+        input: Zeroizing::new(b"first sealed handle hmac input".to_vec()),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: BinaryFormat::Raw,
+        seal_target: Some(SealTarget::Handle(sealed_handle)),
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+
+    let error = HmacRequest {
+        selector: ObjectSelector::Handle(sealed_handle),
+        input: Zeroizing::new(b"sealed handle should not hmac".to_vec()),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: BinaryFormat::Raw,
+        seal_target: None,
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        tpmctl_core::Error::InvalidInput { field: "usage", .. }
+    ));
+}
+
+#[test]
+fn simulator_hmac_seal_target_handle_preserves_existing_value_without_force() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, _context, command, hmac_id, _hmac_handle, _sign_handle, sealed_handle) =
+        handle_target_case();
+    let first_input = b"first sealed handle hmac input".to_vec();
 
     let first_expected = expect_hmac_output(
         HmacRequest {
-            selector: ObjectSelector::Handle(hmac_handle),
+            selector: ObjectSelector::Id(hmac_id.clone()),
             input: Zeroizing::new(first_input.clone()),
             hash: Some(HashAlgorithm::Sha256),
             output_format: BinaryFormat::Raw,
@@ -73,9 +193,9 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
         .unwrap(),
     );
 
-    let first_sealed = HmacRequest {
+    HmacRequest {
         selector: ObjectSelector::Id(hmac_id.clone()),
-        input: Zeroizing::new(first_input.clone()),
+        input: Zeroizing::new(first_input),
         hash: Some(HashAlgorithm::Sha256),
         output_format: BinaryFormat::Raw,
         seal_target: Some(SealTarget::Handle(sealed_handle)),
@@ -84,37 +204,10 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
     }
     .execute_with_context(&command)
     .unwrap();
-    let HmacResult::Sealed { target, hash } = first_sealed else {
-        panic!("expected sealed result for handle target")
-    };
-    assert_eq!(target, SealTarget::Handle(sealed_handle));
-    assert_eq!(hash, HashAlgorithm::Sha256);
 
-    let unsealed_first = UnsealRequest {
-        selector: ObjectSelector::Handle(sealed_handle),
-        force_binary_stdout: true,
-    }
-    .execute_with_context(&command)
-    .unwrap();
-    assert_eq!(unsealed_first.as_slice(), first_expected.as_slice());
-
-    let sealed_handle_error = HmacRequest {
-        selector: ObjectSelector::Handle(sealed_handle),
-        input: Zeroizing::new(b"sealed handle should not hmac".to_vec()),
-        hash: Some(HashAlgorithm::Sha256),
-        output_format: BinaryFormat::Raw,
-        seal_target: None,
-        emit_prf_when_sealing: false,
-        force: false,
-    }
-    .execute_with_context(&command)
-    .unwrap_err()
-    .to_string();
-    assert!(sealed_handle_error.contains("expected hmac object, got sealed"));
-
-    let overwrite_error = HmacRequest {
-        selector: ObjectSelector::Id(hmac_id.clone()),
-        input: Zeroizing::new(second_input.clone()),
+    let duplicate_error = HmacRequest {
+        selector: ObjectSelector::Id(hmac_id),
+        input: Zeroizing::new(b"second sealed handle hmac input".to_vec()),
         hash: Some(HashAlgorithm::Sha256),
         output_format: BinaryFormat::Raw,
         seal_target: Some(SealTarget::Handle(sealed_handle)),
@@ -124,15 +217,39 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
     .execute_with_context(&command)
     .unwrap_err()
     .to_string();
-    assert!(overwrite_error.contains("already exists"));
+    assert!(duplicate_error.contains("already exists"));
 
-    let still_unsealed_first = UnsealRequest {
+    let preserved = UnsealRequest {
         selector: ObjectSelector::Handle(sealed_handle),
         force_binary_stdout: true,
     }
     .execute_with_context(&command)
     .unwrap();
-    assert_eq!(still_unsealed_first.as_slice(), first_expected.as_slice());
+    assert_eq!(preserved.as_slice(), first_expected.as_slice());
+}
+
+#[test]
+fn simulator_hmac_seal_target_handle_force_replaces_and_emits_output() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let (_temp_store, _context, command, hmac_id, hmac_handle, _sign_handle, sealed_handle) =
+        handle_target_case();
+    let first_input = b"first sealed handle hmac input".to_vec();
+    let second_input = b"second sealed handle hmac input".to_vec();
+
+    HmacRequest {
+        selector: ObjectSelector::Id(hmac_id.clone()),
+        input: Zeroizing::new(first_input),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: BinaryFormat::Raw,
+        seal_target: Some(SealTarget::Handle(sealed_handle)),
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap();
 
     let second_expected = expect_hmac_output(
         HmacRequest {
@@ -171,13 +288,13 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
     assert_eq!(hash, HashAlgorithm::Sha256);
     assert_eq!(hex::decode(&output).unwrap(), second_expected.as_slice());
 
-    let unsealed_second = UnsealRequest {
+    let unsealed = UnsealRequest {
         selector: ObjectSelector::Handle(sealed_handle),
         force_binary_stdout: true,
     }
     .execute_with_context(&command)
     .unwrap();
-    assert_eq!(unsealed_second.as_slice(), second_expected.as_slice());
+    assert_eq!(unsealed.as_slice(), second_expected.as_slice());
 }
 
 #[test]
@@ -364,9 +481,11 @@ fn simulator_native_hmac_by_id_rejects_non_hmac_registry_entries() {
         force: false,
     }
     .execute_with_context(&command)
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("expected hmac object, got sign"));
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        tpmctl_core::Error::InvalidInput { field: "usage", .. }
+    ));
 }
 
 #[test]
