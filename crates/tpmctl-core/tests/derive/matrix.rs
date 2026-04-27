@@ -1,6 +1,4 @@
-mod support;
-
-use support::*;
+use super::support::*;
 
 #[test]
 fn simulator_api_derive_uses_hmac_identity_seed_fallback_deterministically() {

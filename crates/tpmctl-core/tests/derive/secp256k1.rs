@@ -1,6 +1,4 @@
-mod support;
-
-use support::*;
+use super::support::*;
 
 #[test]
 fn simulator_api_derive_from_sealed_seed_emits_secp256k1_pubkey_address_and_signature() {
