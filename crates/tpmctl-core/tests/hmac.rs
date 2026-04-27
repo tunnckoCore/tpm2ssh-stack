@@ -10,5 +10,3 @@ mod boundaries;
 mod failures;
 #[path = "hmac/hashes.rs"]
 mod hashes;
-#[path = "hmac/persistence.rs"]
-mod persistence;

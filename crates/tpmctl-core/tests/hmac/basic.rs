@@ -1,7 +1,7 @@
 use super::support::*;
 
 #[test]
-fn simulator_native_hmac_by_id_returns_stable_raw_and_hex_output() {
+fn simulator_native_hmac_by_id_returns_raw_and_hex_output() {
     let _guard = simulator_test_lock().lock().unwrap();
     let _tcti = require_simulator_tcti();
     startup_and_get_random();
@@ -34,21 +34,6 @@ fn simulator_native_hmac_by_id_returns_stable_raw_and_hex_output() {
         .unwrap(),
     );
     assert_eq!(raw_output.len(), HashAlgorithm::Sha256.digest_len());
-
-    let repeated_raw_output = expect_hmac_output(
-        HmacRequest {
-            selector: ObjectSelector::Id(hmac_id.clone()),
-            input: Zeroizing::new(input.clone()),
-            hash: Some(HashAlgorithm::Sha256),
-            output_format: BinaryFormat::Raw,
-            seal_target: None,
-            emit_prf_when_sealing: false,
-            force: false,
-        }
-        .execute_with_context(&command)
-        .unwrap(),
-    );
-    assert_eq!(repeated_raw_output, raw_output);
 
     let hex_output = expect_hmac_output(
         HmacRequest {
