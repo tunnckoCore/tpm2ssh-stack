@@ -66,6 +66,150 @@ fn simulator_api_hmac_seal_target_seals_and_emits_prf() {
 }
 
 #[test]
+fn simulator_api_transient_hmac_id_seal_target_preserves_and_replaces_registry_entry() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let context = ApiContext {
+        store: StoreOptions {
+            root: Some(temp_store.path().to_path_buf()),
+        },
+        tcti: None,
+    };
+    let hmac_id = RegistryId::new("sim/api/hmac/transient-id-overwrite/key").unwrap();
+    let sealed_id = RegistryId::new("sim/api/hmac/transient-id-overwrite/sealed").unwrap();
+    let first_input = b"first transient id sealed hmac".to_vec();
+    let second_input = b"second transient id sealed hmac".to_vec();
+
+    api::keygen(
+        &context,
+        KeygenParams {
+            usage: KeygenUsage::Hmac,
+            id: hmac_id.clone(),
+            persist_at: None,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+
+    let first_expected = expect_hmac_output(
+        api::hmac(
+            &context,
+            HmacParams {
+                material: ObjectSelector::Id(hmac_id.clone()),
+                input: Zeroizing::new(first_input.clone()),
+                hash: Some(HashAlgorithm::Sha256),
+                output_format: BinaryFormat::Raw,
+                seal_target: None,
+                emit_prf_when_sealing: false,
+                overwrite: false,
+            },
+        )
+        .unwrap(),
+    );
+
+    let first_sealed = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(hmac_id.clone()),
+            input: Zeroizing::new(first_input.clone()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Hex,
+            seal_target: Some(SealTarget::Id(sealed_id.clone())),
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap();
+    let HmacResult::Sealed { target, hash } = first_sealed else {
+        panic!("expected sealed result without emitted PRF bytes")
+    };
+    assert_eq!(target, SealTarget::Id(sealed_id.clone()));
+    assert_eq!(hash, HashAlgorithm::Sha256);
+
+    let first_unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(first_unsealed.as_slice(), first_expected.as_slice());
+
+    let duplicate_error = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(hmac_id.clone()),
+            input: Zeroizing::new(second_input.clone()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: Some(SealTarget::Id(sealed_id.clone())),
+            emit_prf_when_sealing: false,
+            overwrite: false,
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(duplicate_error.contains("already exists"));
+
+    let preserved_unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(preserved_unsealed.as_slice(), first_expected.as_slice());
+
+    let second_expected = expect_hmac_output(
+        api::hmac(
+            &context,
+            HmacParams {
+                material: ObjectSelector::Id(hmac_id.clone()),
+                input: Zeroizing::new(second_input.clone()),
+                hash: Some(HashAlgorithm::Sha256),
+                output_format: BinaryFormat::Raw,
+                seal_target: None,
+                emit_prf_when_sealing: false,
+                overwrite: false,
+            },
+        )
+        .unwrap(),
+    );
+
+    let replaced = api::hmac(
+        &context,
+        HmacParams {
+            material: ObjectSelector::Id(hmac_id),
+            input: Zeroizing::new(second_input),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: Some(SealTarget::Id(sealed_id.clone())),
+            emit_prf_when_sealing: false,
+            overwrite: true,
+        },
+    )
+    .unwrap();
+    let HmacResult::Sealed { target, hash } = replaced else {
+        panic!("expected replaced sealed result without emitted PRF bytes")
+    };
+    assert_eq!(target, SealTarget::Id(sealed_id.clone()));
+    assert_eq!(hash, HashAlgorithm::Sha256);
+
+    let replaced_unsealed = api::unseal(
+        &context,
+        UnsealParams {
+            material: ObjectSelector::Id(sealed_id),
+        },
+    )
+    .unwrap();
+    assert_eq!(replaced_unsealed.as_slice(), second_expected.as_slice());
+    assert_ne!(replaced_unsealed.as_slice(), first_expected.as_slice());
+}
+
+#[test]
 fn simulator_persistent_hmac_handle_survives_reload_and_force_replaces_handle_binding_only() {
     let _guard = simulator_test_lock().lock().unwrap();
     let _tcti = require_simulator_tcti();
@@ -320,6 +464,42 @@ fn simulator_hmac_supports_cross_context_reload_hex_output_and_sealed_roundtrip(
 }
 
 #[test]
+fn simulator_hmac_accepts_input_at_tpm_one_shot_limit() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let command = simulator_command_context(temp_store.path());
+    let hmac_id = RegistryId::new("sim/native/hmac/max-input").unwrap();
+
+    KeygenRequest {
+        usage: KeygenUsage::Hmac,
+        id: hmac_id.clone(),
+        persist_at: None,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+
+    let max_sized_input = vec![0x5a; tss_esapi::structures::MaxBuffer::MAX_SIZE];
+    let output = expect_hmac_output(
+        HmacRequest {
+            selector: ObjectSelector::Id(hmac_id),
+            input: Zeroizing::new(max_sized_input),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            force: false,
+        }
+        .execute_with_context(&command)
+        .unwrap(),
+    );
+    assert_eq!(output.len(), HashAlgorithm::Sha256.digest_len());
+}
+
+#[test]
 fn simulator_hmac_rejects_input_larger_than_tpm_one_shot_limit() {
     let _guard = simulator_test_lock().lock().unwrap();
     let _tcti = require_simulator_tcti();
@@ -532,6 +712,152 @@ fn simulator_hmac_handle_targets_reject_wrong_usage_and_support_sealed_handle_ov
     .execute_with_context(&command)
     .unwrap();
     assert_eq!(unsealed_second.as_slice(), second_expected.as_slice());
+}
+
+#[test]
+fn simulator_native_hmac_by_handle_rejects_vacant_persistent_handle() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let command = simulator_command_context(temp_store.path());
+    let vacant_handle = PersistentHandle::new(0x8101_0058).unwrap();
+    cleanup_persistent_handle(vacant_handle);
+
+    let error = HmacRequest {
+        selector: ObjectSelector::Handle(vacant_handle),
+        input: Zeroizing::new(b"vacant handle should not hmac".to_vec()),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: BinaryFormat::Raw,
+        seal_target: None,
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("TR_FromTPMPublic"));
+}
+
+#[test]
+fn simulator_native_hmac_by_id_rejects_non_hmac_registry_entries() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let command = simulator_command_context(temp_store.path());
+    let sign_id = RegistryId::new("sim/native/hmac/wrong-id-kind/sign").unwrap();
+
+    KeygenRequest {
+        usage: KeygenUsage::Sign,
+        id: sign_id.clone(),
+        persist_at: None,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+
+    let error = HmacRequest {
+        selector: ObjectSelector::Id(sign_id),
+        input: Zeroizing::new(b"sign id should not hmac".to_vec()),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: BinaryFormat::Raw,
+        seal_target: None,
+        emit_prf_when_sealing: false,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("expected hmac object, got sign"));
+}
+
+#[test]
+fn simulator_native_hmac_failure_does_not_create_or_replace_sealed_output() {
+    let _guard = simulator_test_lock().lock().unwrap();
+    let _tcti = require_simulator_tcti();
+    startup_and_get_random();
+
+    let temp_store = tempfile::tempdir().expect("create temp tpmctl store");
+    let command = simulator_command_context(temp_store.path());
+    let hmac_id = RegistryId::new("sim/native/hmac/failure-does-not-seal/key").unwrap();
+    let sealed_id = RegistryId::new("sim/native/hmac/failure-does-not-seal/output").unwrap();
+    let baseline_input = b"baseline sealed hmac bytes".to_vec();
+
+    KeygenRequest {
+        usage: KeygenUsage::Hmac,
+        id: hmac_id.clone(),
+        persist_at: None,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+
+    let baseline = expect_hmac_output(
+        HmacRequest {
+            selector: ObjectSelector::Id(hmac_id.clone()),
+            input: Zeroizing::new(baseline_input.clone()),
+            hash: Some(HashAlgorithm::Sha256),
+            output_format: BinaryFormat::Raw,
+            seal_target: None,
+            emit_prf_when_sealing: false,
+            force: false,
+        }
+        .execute_with_context(&command)
+        .unwrap(),
+    );
+
+    let initial_sealed = HmacRequest {
+        selector: ObjectSelector::Id(hmac_id.clone()),
+        input: Zeroizing::new(baseline_input),
+        hash: Some(HashAlgorithm::Sha256),
+        output_format: BinaryFormat::Hex,
+        seal_target: Some(SealTarget::Id(sealed_id.clone())),
+        emit_prf_when_sealing: true,
+        force: false,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+    let HmacResult::SealedWithOutput {
+        target,
+        hash,
+        output,
+    } = initial_sealed
+    else {
+        panic!("expected sealed baseline output")
+    };
+    assert_eq!(target, SealTarget::Id(sealed_id.clone()));
+    assert_eq!(hash, HashAlgorithm::Sha256);
+    assert_eq!(hex::decode(&output).unwrap(), baseline.as_slice());
+
+    let failing_error = HmacRequest {
+        selector: ObjectSelector::Id(hmac_id),
+        input: Zeroizing::new(b"sha384 hmac should fail before sealing".to_vec()),
+        hash: Some(HashAlgorithm::Sha384),
+        output_format: BinaryFormat::Raw,
+        seal_target: Some(SealTarget::Id(sealed_id.clone())),
+        emit_prf_when_sealing: true,
+        force: true,
+    }
+    .execute_with_context(&command)
+    .unwrap_err();
+    assert!(matches!(
+        failing_error,
+        tpmctl_core::Error::Tpm {
+            operation: "HMAC",
+            ..
+        }
+    ));
+
+    let preserved = UnsealRequest {
+        selector: ObjectSelector::Id(sealed_id),
+        force_binary_stdout: true,
+    }
+    .execute_with_context(&command)
+    .unwrap();
+    assert_eq!(preserved.as_slice(), baseline.as_slice());
 }
 
 #[test]
